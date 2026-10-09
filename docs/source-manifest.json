@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "baseline": "Installed and verified source snapshot; 2026-10-10 KST",
+  "scope": "Source/tests and component README only; no runtime data",
+  "files": [
+    {
+      "path": "desktop-plugins/session-complete-telegram/followup.test.mjs",
+      "bytes": 4169,
+      "sha256": "8fc51a4a90fac2164a35e194bfcccc8772c86a055540083115077e5d573fb220"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/followup_bridge.py",
+      "bytes": 26674,
+      "sha256": "1440f4b1678e2d9b3285301508d1f2192887ad115315a05e7d255b49732a332e"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/launch.py",
+      "bytes": 1282,
+      "sha256": "9092607d996f6990579feda6a2d2af4add8671ea1fd6fcf130f91fa0bc106fca"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/notifier.py",
+      "bytes": 30295,
+      "sha256": "72a7e9736f30214dec6c323fef4f39570f007108947dd4726a4f832205ae933c"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/plugin.js",
+      "bytes": 31864,
+      "sha256": "cc2e545665ceb74699f6e47c297fe10659d20264b4dea23832a2ea8d1575e9e8"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/plugin.test.mjs",
+      "bytes": 12532,
+      "sha256": "9c5af582373962212f52861da5872354660de70ee387e80e58ea311b628cbf39"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/README.md",
+      "bytes": 13713,
+      "sha256": "d24cf261a54453e158a3a1ca72bf3bec6d47857dfad252c4f338ab703c2cda72"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/reply.test.mjs",
+      "bytes": 13078,
+      "sha256": "f8142e64d3f00c0401834e769ffcf191f03fd663a7dd655a115c1aabc817cf91"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/reply_bridge.py",
+      "bytes": 32625,
+      "sha256": "76227f4e710482360175aa3ddb9a34de7c3f8956e75526c0b60e20dc59387aac"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/test_followup_bridge.py",
+      "bytes": 14104,
+      "sha256": "9613e79d6673e5fa497ab98f5d56cb11a6115ee8f1725d1e869681e376a979dd"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/test_notifier.py",
+      "bytes": 23593,
+      "sha256": "98e32140613ee27818e43ba1d19c8029061c26011c5cce9480b857d920fca576"
+    },
+    {
+      "path": "desktop-plugins/session-complete-telegram/test_reply_bridge.py",
+      "bytes": 37477,
+      "sha256": "50c6f1d10f55eae6c9ad69dcab96e016cbf7a51f5b01c9e6a8be834da86ebfed"
+    },
+    {
+      "path": "plugins/desktop-clarify-telegram/__init__.py",
+      "bytes": 1088,
+      "sha256": "78b660d3d2b64b9a7939b3e2a51a6c3e5bd5e7debb44531b17ebdaaeb3b8ae5c"
+    },
+    {
+      "path": "plugins/desktop-clarify-telegram/plugin.yaml",
+      "bytes": 158,
+      "sha256": "84c803d2bd69c4890118d539ac3fb2db08a518c6aff11aa37cf0b834f0297034"
+    }
+  ]
+}

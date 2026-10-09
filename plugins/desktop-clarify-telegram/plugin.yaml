@@ -1,0 +1,3 @@
+name: desktop-clarify-telegram
+version: '1.5.0'
+description: Reply to Desktop clarify questions and completion notices through the existing Telegram gateway.
