@@ -417,13 +417,16 @@ def poll(owner, observations, *, state=STATE, now=None, unverified=None, result_
             if row['status']!='applying':
                 c.execute('UPDATE forms SET seen=? WHERE id=?',(now,row['id']))
             if row['status']=='queued':
+                # The claim limit never skips another form's observation gate.
+                if result_budget is not None and len(result)>=MAX_NATIVE_POLL_ITEMS:
+                    continue
                 claim=secrets.token_hex(12)
                 deadline=min(row['expires'],now+LEASE)
                 descriptor=json.loads(row['descriptor'])
                 answer=json.loads(row['answer'])
                 ordinary={'id':row['id'],'claim':claim,'deadline':deadline,'descriptor':descriptor,'result':answer}
                 selected=ordinary
-                fragmented=False
+
                 if result_budget is not None:
                     if len(_wire_json_bytes({'ok':True,'items':result+[ordinary]})) > result_budget:
                         if result or len(_wire_json_bytes({'ok':True,'items':[ordinary]})) <= result_budget:
@@ -440,11 +443,8 @@ def poll(owner, observations, *, state=STATE, now=None, unverified=None, result_
                                               'chunk_bytes':FRAGMENT_CHUNK_BYTES}}
                         if len(_wire_json_bytes({'ok':True,'items':result+[selected]})) > result_budget:
                             continue
-                        fragmented=True
                 c.execute("UPDATE forms SET status='applying',claim=? WHERE id=?",(claim,row['id']))
                 result.append(selected)
-                if fragmented or (result_budget is not None and len(result)>=MAX_NATIVE_POLL_ITEMS):
-                    break
         c.commit();return {'ok':True,'items':result}
     finally:c.close()
 

@@ -39,6 +39,70 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(self.claim()['items'])
         self.assertTrue(b.settle(self.fid,item['claim'],'applied',state=self.state)['ok'])
         row=b.read_form(self.fid,self.state);self.assertIsNone(row['answer']);self.assertEqual(row['answers'],'{}')
+    def test_native_one_claim_still_observes_every_later_form(self):
+        for fragmented in (False,True):
+            for mode in ('unverified','absent','observed','queued','applying'):
+                with self.subTest(fragmented=fragmented,mode=mode):
+                    state=self.state/f'{fragmented}-{mode}'
+                    b.bind_receiver(77,99,None,'boot',state=state,now=self.now)
+                    def make(tag,count,created,mid):
+                        ask=copy.deepcopy(self.ask);ask['id']='srq-'+('a'*12 if tag=='A' else 'b'*12)
+                        ask['params']['questions']=[{'qid':f'q{i}','question':f'{tag} question {i}?','choices':[],'multi_select':False} for i in range(count)]
+                        d={**self.d,'request_id':ask['id'],'fingerprint':b.canonical(ask)}
+                        fid=b.register({'descriptor':d,'ask':ask},state=state,now=created,ttl=3600)['id']
+                        c=b.connect(state)
+                        with c:c.execute("UPDATE forms SET status='open',mids=?,texts=? WHERE id=?",(b.canonical({str(i):mid+i for i in range(count)}),b.canonical({str(i):'fixture' for i in range(count)}),fid))
+                        c.close();return fid
+                    def answer(fid,index,value,mid,when):
+                        identity=self.ident();identity['mid']=mid
+                        return b.intake(fid,index,'text',value,identity,state=state,now=when)
+                    first=make('A',5 if fragmented else 1,self.now,100)
+                    later=make('B',1,self.now+1,200)
+                    applying_before=None
+                    if mode in ('queued','applying'):
+                        self.assertTrue(answer(later,0,'B answer',200,self.now+1.1)['ok'])
+                    observations=[{'id':first},{'id':later}]
+                    if mode=='applying':
+                        prior=b.poll('desktop1',observations,state=state,now=self.now+1.2,result_budget=24*1024)
+                        self.assertEqual(prior['items'][0]['id'],later)
+                        applying_before=b.read_form(later,state)
+                    for index in range(5 if fragmented else 1):
+                        self.assertTrue(answer(first,index,'😊'*2000 if fragmented else 'A answer',100+index,self.now+1.5)['ok'])
+                    if mode in ('unverified','absent'):observations=[{'id':first}]
+                    result=b.poll('desktop1',observations,state=state,now=self.now+2,
+                                  unverified=[later] if mode=='unverified' else [],result_budget=24*1024)
+                    self.assertEqual(len(result['items']),1)
+                    self.assertEqual(result['items'][0]['id'],first)
+                    self.assertEqual('fragment' in result['items'][0],fragmented)
+                    row=b.read_form(later,state)
+                    if mode in ('unverified','absent'):
+                        self.assertEqual(row['seen'],b.STALE_SEEN) if mode=='unverified' else self.assertEqual(row['status'],'expired')
+                        identity=self.ident();identity['mid']=200
+                        before=(row['answers'],row['selected'])
+                        self.assertFalse(b.intake(later,0,'text','must not consume',identity,state=state,now=self.now+2.1)['ok'])
+                        after=b.read_form(later,state)
+                        self.assertEqual((after['answers'],after['selected']),before)
+                        c=b.connect(state)
+                        self.assertEqual(c.execute('SELECT count(*) FROM receipts WHERE event=?',(identity['event'],)).fetchone()[0],0)
+                        c.close()
+                    elif mode=='observed':
+                        self.assertEqual(row['seen'],self.now+2)
+                        self.assertTrue(answer(later,0,'observed answer',200,self.now+2.1)['ok'])
+                    elif mode=='queued':
+                        self.assertEqual(row['seen'],self.now+2)
+                        self.assertEqual(row['status'],'queued');self.assertIsNone(row['claim'])
+                    else:
+                        self.assertEqual((row['status'],row['seen'],row['expires'],row['claim']),
+                                         (applying_before['status'],applying_before['seen'],applying_before['expires'],applying_before['claim']))
+                        first_before=b.read_form(first,state)
+                        def race(_):return b.poll('desktop1',observations,state=state,now=self.now+2.2,result_budget=24*1024)
+                        with ThreadPoolExecutor(max_workers=2) as pool:
+                            raced=list(pool.map(race,range(2)))
+                        self.assertTrue(all(not item['items'] for item in raced))
+                        for fid,prior_row in ((first,first_before),(later,applying_before)):
+                            current=b.read_form(fid,state)
+                            self.assertEqual((current['seen'],current['expires'],current['claim']),
+                                             (prior_row['seen'],prior_row['expires'],prior_row['claim']))
     def test_legacy_single_free_text(self):
         ask=copy.deepcopy(self.ask);ask['params']={'session_id':'runtime1','question':'내용?','choices':[]}
         self.create(ask);self.take('text','답장 내용');self.assertEqual(self.claim()['items'][0]['result'],{'answer':'답장 내용'})
