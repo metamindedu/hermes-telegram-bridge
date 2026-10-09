@@ -44,6 +44,33 @@ test('registers clarify and applies exact all-question response on captured rout
   const f=fixture();await f.register();f.queue();await f.mon.pumpReplies()
   assert.equal(f.writes.length,1);assert.deepEqual(f.writes[0].params,{id:f.ask.id,result:{answers:{q1:'B'}}});assert.equal(f.settles[0].status,'applied')
 })
+for (const mode of ['multi-select canonical result','existing locked answer']) test(`preserves supported ${mode} beyond the free-text intake limit`, async()=>{
+  const f=fixture()
+  let answer
+  if(mode==='multi-select canonical result'){
+    const choices=['가','나','다','라'].map(char=>char.repeat(500))
+    f.ask.params.questions[0].choices=choices
+    f.ask.params.questions[0].multi_select=true
+    answer=JSON.stringify(choices)
+  }else{
+    answer='기존'.repeat(1200)
+    f.ask.params.answers={q1:answer}
+    f.ask.params.questions.push({qid:'q2',question:'Remaining question?',choices:['A','B'],multi_select:false})
+  }
+  const expected={answers:{q1:answer,...(mode==='existing locked answer'?{q2:'B'}:{})}}
+  assert.ok(Array.from(answer).length>2000)
+  await f.register();f.queue()
+  const original=f.mon.helper
+  f.mon.helper=async request=>{
+    const result=await original(request)
+    if(request.action==='reply_poll') for(const item of result.items) item.result=expected
+    return result
+  }
+  await f.mon.pumpReplies()
+  assert.equal(f.writes.length,1)
+  assert.deepEqual(f.writes[0].params.result,expected)
+  assert.equal(f.settles[0].status,'applied')
+})
 for(const mutation of ['epoch','method','sid','stored','route','locks','choices','closed'])test('fails closed on changed '+mutation,async()=>{
   const f=fixture();await f.register();f.queue()
   if(mutation==='epoch')f.snapshot.epoch='new'
@@ -75,7 +102,74 @@ test('approval requests remain notification-only',async()=>{
 test('expired claim never starts a write after slow snapshot',async()=>{
   const f=fixture();await f.register();f.queue();const original=f.mon.helper
   f.mon.helper=async r=>{const out=await original(r);if(r.action==='reply_poll')for(const i of out.items)i.deadline=Date.now()/1000-1;return out}
-  await f.mon.pumpReplies();assert.equal(f.writes.length,0);assert.equal(f.settles[0].status,'rejected')
+  await f.mon.pumpReplies();assert.equal(f.writes.length,0);assert.equal(f.settles[0].status,'expired')
+})
+test('assembles a bounded UTF-8 fragment, checks digest and identity, then answers once',async()=>{
+  const f=fixture()
+  f.ask.params.questions=Array.from({length:5},(_,i)=>({qid:`q${i+1}`,question:`Question ${i+1}?`,choices:[],multi_select:false}))
+  await f.register()
+  const result={answers:Object.fromEntries(f.ask.params.questions.map(q=>[q.qid,'😊'.repeat(2000)]))}
+  const payload=Buffer.from(stableJSON({descriptor:f.record.reply.descriptor,result}),'utf8')
+  const digestBytes=new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256',payload))
+  const sha256=Array.from(digestBytes,b=>b.toString(16).padStart(2,'0')).join('')
+  const chunkBytes=16*1024,chunks=Math.ceil(payload.byteLength/chunkBytes)
+  const meta={sha256,bytes:payload.byteLength,chunks,chunk_bytes:chunkBytes}
+  const claim='fragment-claim';let offered=true;const requests=[]
+  f.mon.helper=async request=>{
+    requests.push(structuredClone(request))
+    if(request.action==='reply_poll'){
+      if(!offered)return {ok:true,items:[]}
+      offered=false
+      return {ok:true,items:[{id:'form1',claim,deadline:Date.now()/1000+40,fragment:meta}]}
+    }
+    if(request.action==='reply_fragment'){
+      const start=request.index*chunkBytes
+      return {ok:true,id:'form1',claim,sha256,index:request.index,bytes:payload.byteLength,chunks,chunk_bytes:chunkBytes,
+        data:payload.subarray(start,start+chunkBytes).toString('base64url')}
+    }
+    if(request.action==='reply_settle'){f.settles.push(request);return {ok:true}}
+    return {ok:true}
+  }
+  await f.mon.pumpReplies()
+  assert.equal(f.writes.length,1)
+  assert.deepEqual(f.writes[0].params,{id:f.ask.id,result})
+  assert.equal(f.settles[0].status,'applied')
+  const fragments=requests.filter(request=>request.action==='reply_fragment')
+  assert.equal(fragments.length,chunks)
+  assert.ok(fragments.every(request=>request.owner===f.mon.replyOwner&&request.id==='form1'&&request.claim===claim))
+  assert.deepEqual(fragments.map(request=>request.index),Array.from({length:chunks},(_,i)=>i))
+  await f.mon.pumpReplies()
+  assert.equal(f.writes.length,1)
+  assert.equal(f.settles.length,1)
+})
+
+for(const failure of ['missing','corrupt','expired','malformed shape'])test(`${failure} fragment is terminal without request.answer`,async()=>{
+  const f=fixture();await f.register()
+  const valid={descriptor:f.record.reply.descriptor,result:{answers:{q1:'응답'}}}
+  const frozen=Buffer.from(stableJSON(failure==='malformed shape'?{...valid,extra:true}:valid),'utf8')
+  const digestBytes=new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256',frozen))
+  const sha256=Array.from(digestBytes,b=>b.toString(16).padStart(2,'0')).join('')
+  const meta={sha256,bytes:frozen.byteLength,chunks:1,chunk_bytes:16*1024}
+  let settled
+  f.mon.helper=async request=>{
+    if(request.action==='reply_poll')return {ok:true,items:[{id:'form1',claim:'claim-'+failure,
+      deadline:failure==='expired'?Date.now()/1000-1:Date.now()/1000+40,fragment:meta}]}
+    if(request.action==='reply_fragment'){
+      if(failure==='missing')return {ok:false,reason:'fragment_unavailable'}
+      if(failure==='corrupt'){
+        const altered=Buffer.from(frozen);altered[0]^=1
+        return {ok:true,id:'form1',claim:'claim-'+failure,sha256,index:0,bytes:frozen.byteLength,chunks:1,
+          chunk_bytes:16*1024,data:altered.toString('base64url')}
+      }
+      return {ok:true,id:'form1',claim:'claim-'+failure,sha256,index:0,bytes:frozen.byteLength,chunks:1,
+        chunk_bytes:16*1024,data:frozen.toString('base64url')}
+    }
+    if(request.action==='reply_settle'){settled=request.status;f.settles.push(request);return {ok:true}}
+    return {ok:true}
+  }
+  await f.mon.pumpReplies()
+  assert.equal(f.writes.length,0)
+  assert.equal(settled,failure==='expired'?'expired':'unknown')
 })
 test('poll uses compact identities rather than aggregate question bodies',async()=>{
   const f=fixture();f.ask.params.questions[0].question='가'.repeat(2000);await f.register()

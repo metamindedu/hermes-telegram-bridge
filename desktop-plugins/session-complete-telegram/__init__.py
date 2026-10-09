@@ -12,8 +12,8 @@ from typing import Any
 
 from .runtime import PLUGIN_ID, resolve_package_home
 
-MAX_REQUEST_BYTES = 16 * 1024
-MAX_REQUEST_TOKEN_CHARS = (MAX_REQUEST_BYTES * 4 + 2) // 3
+MAX_REQUEST_BYTES = 22_500
+MAX_REQUEST_TOKEN_CHARS = 30_000
 MAX_RESULT_BYTES = 24 * 1024
 FRAME_BEGIN = "HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN"
 FRAME_END = "HERMES_TELEGRAM_BRIDGE_RESULT_V1_END"
@@ -76,7 +76,7 @@ def _safe_result(result: object) -> dict[str, Any]:
         return {"ok": False, "reason": "invalid_helper_result"}
     try:
         _validate_json_value(result)
-        raw = json.dumps(result, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        raw = json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except (TypeError, ValueError, RecursionError):
         return {"ok": False, "reason": "invalid_helper_result"}
     if len(raw) > MAX_RESULT_BYTES:
@@ -86,7 +86,7 @@ def _safe_result(result: object) -> dict[str, Any]:
 
 def _write_frame(result: object) -> None:
     value = _safe_result(result)
-    raw = json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
     sys.stdout.write(f"{FRAME_BEGIN}\n{encoded}\n{FRAME_END}\n")
     sys.stdout.flush()
@@ -102,7 +102,7 @@ def _run_cli(args: argparse.Namespace) -> None:
         request = _parse_request(getattr(args, "request", None))
         from . import notifier
 
-        result = notifier.dispatch_request(request, root=home)
+        result = notifier.dispatch_request(request, root=home, native=True, result_budget=MAX_RESULT_BYTES)
     except Exception as exc:
         # Exception text is never returned: it may include URLs or credentials.
         result = {"ok": False, "reason": type(exc).__name__}

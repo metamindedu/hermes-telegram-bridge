@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import copy
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 import unittest
@@ -236,6 +238,36 @@ class BridgeTests(unittest.TestCase):
         c=b.connect(self.state)
         self.assertEqual(c.execute('SELECT count(*) FROM receipts').fetchone()[0],0)
         c.close()
+    def test_applying_poll_does_not_extend_claim_lease(self):
+        self.create(ttl=3600);self.take()
+        item=self.claim(now=self.now+1)['items'][0]
+        claimed=b.read_form(self.fid,self.state)
+        self.assertEqual(claimed['status'],'applying')
+        self.assertEqual(self.claim(now=self.now+10)['items'],[])
+        observed=b.read_form(self.fid,self.state)
+        self.assertEqual(observed['seen'],claimed['seen'])
+        self.assertEqual(observed['claim'],item['claim'])
+        self.assertEqual(self.claim(now=self.now+b.LEASE+2)['items'],[])
+        self.assertEqual(b.read_form(self.fid,self.state)['status'],'unknown')
+        self.assertFalse(b.settle(self.fid,item['claim'],'applied',state=self.state)['ok'])
+    def test_native_fragment_read_requires_exact_live_claim_and_never_renews_it(self):
+        self.create(ttl=3600);self.take()
+        item=self.claim(now=self.now+1)['items'][0]
+        before=b.read_form(self.fid,self.state)
+        raw=b._frozen_reply_bytes(json.loads(before['descriptor']),json.loads(before['answer']))
+        digest=hashlib.sha256(raw).hexdigest()
+        part=b.read_fragment('desktop1',self.fid,item['claim'],digest,0,state=self.state,now=self.now+1)
+        self.assertTrue(part['ok'],part)
+        self.assertEqual(base64.urlsafe_b64decode(part['data']+'='*((4-len(part['data'])%4)%4)),raw)
+        self.assertFalse(b.read_fragment('other-owner',self.fid,item['claim'],digest,0,state=self.state,now=self.now+1)['ok'])
+        self.assertEqual(b.read_fragment('desktop1',self.fid,item['claim'],digest,True,state=self.state,now=self.now+1)['reason'],'invalid_fragment')
+        expired=b.read_fragment('desktop1',self.fid,item['claim'],digest,0,state=self.state,now=self.now+b.LEASE+2)
+        self.assertEqual(expired['reason'],'claim_expired')
+        after=b.read_form(self.fid,self.state)
+        self.assertEqual((after['status'],after['claim'],after['seen'],after['expires']),
+                         (before['status'],before['claim'],before['seen'],before['expires']))
+        self.assertFalse(self.claim(now=self.now+b.LEASE+2)['items'])
+        self.assertEqual(b.read_form(self.fid,self.state)['status'],'unknown')
     def test_applying_lease_lapse_is_terminal_unknown_no_replay(self):
         self.create(ttl=3600);self.take()
         item=self.claim(now=self.now+1)['items'][0]

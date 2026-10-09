@@ -12,6 +12,8 @@ Phase 2 separates the bridge into two native directory packages inside one repos
 
 The completion package owns the fixed local CLI helper under the verified default Hermes home. The renderer observes local profile routes, but helper execution is always routed through the default local home. Named/foreign homes fail closed. The ingress loader binds the sibling helper modules to the same home in a per-home namespace; it does not add a polling consumer or a cross-home module alias.
 
+The native request preserves the original 22,500-byte UTF-8 / 30,000-character base64url argv envelope. Results remain an ASCII outer base64 frame around at most 24 KiB of UTF-8 JSON (48,000 stdout characters including framing/logs). Native reply polling budgets the whole response before claiming; oversized frozen reply data uses bounded, digest-checked, read-only fragments with no schema change or claim/TTL renewal. See [[../operations|operations]] for exact limits and gates.
+
 The exact install/update/rollback syntax and separate enablement/restart gates live in [[../operations|operations]]. Candidate install, Doctor, fake-home upgrade and rollback tests are local evidence only; no production package was installed or enabled in this phase.
 
 Ingress callbacks still run on the Gateway's existing Telegram `Application`; factory registration alone is not activation evidence. The native package ID `desktop-clarify-telegram` remains separate from the Desktop/CLI package ID `session-complete-telegram`, and their enablement must not be conflated.

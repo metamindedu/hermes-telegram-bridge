@@ -96,6 +96,44 @@ export function validReplySnapshot(bridge, route, row, snapshot) {
     row?.status === 'waiting' && String(snapshot.epoch) === d.epoch && ask?.method === 'clarify' &&
     ask.params?.session_id === d.sid && stableJSON(ask) === d.fingerprint
 }
+
+function exactKeys(value, keys) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
+}
+
+function validReplyResult(bridge, result) {
+  const questions = bridge.ask.params.questions
+  if (Array.isArray(questions) && questions.length) {
+    if (!exactKeys(result, ['answers']) || !exactKeys(result.answers, questions.map(q => q.qid).sort())) return false
+    // The backend enforces the direct-text limit. Canonical multi-select
+    // strings and existing locked answers have distinct supported semantics.
+    return questions.every(q => typeof result.answers[q.qid] === 'string' && result.answers[q.qid].trim())
+  }
+  return exactKeys(result, ['answer']) && typeof result.answer === 'string' && result.answer.trim()
+}
+
+function fragmentError(message, claimExpired = false) {
+  const error = new Error(message)
+  error.claimExpired = claimExpired
+  return error
+}
+
+function decodeFragmentChunk(value, expectedBytes) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(value) || value.length > Math.ceil(FRAGMENT_CHUNK_BYTES * 4 / 3)) {
+    throw fragmentError('invalid_fragment_chunk')
+  }
+  const base64 = value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)
+  const binary = atob(base64)
+  if (binary.length !== expectedBytes) throw fragmentError('invalid_fragment_chunk')
+  const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+  let canonical = ''
+  for (const byte of bytes) canonical += String.fromCharCode(byte)
+  if (btoa(canonical).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '') !== value) {
+    throw fragmentError('invalid_fragment_chunk')
+  }
+  return bytes
+}
 export const QUIET_MS = 60_000
 export const ATTENTION_POLL_MS = 8_000
 // Server→client requests that block the agent on a HUMAN decision. GUI bridges
@@ -103,8 +141,11 @@ export const ATTENTION_POLL_MS = 8_000
 // automation and must never raise "input needed".
 export const HUMAN_ASK_METHODS = new Set(['clarify', 'approval', 'sudo', 'secret', 'vault.unlock_prompt', 'vault.save_login', 'vault.code'])
 const ID = 'session-complete-telegram'
-const MAX_REQUEST_BYTES = 16 * 1024
+const MAX_REQUEST_BYTES = 22_500
 const MAX_RESULT_BYTES = 24 * 1024
+const MAX_FRAGMENT_BYTES = 256 * 1024
+const FRAGMENT_CHUNK_BYTES = 16 * 1024
+const MAX_FRAGMENT_CHUNKS = MAX_FRAGMENT_BYTES / FRAGMENT_CHUNK_BYTES
 const RESULT_FRAME_BEGIN = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN'
 const RESULT_FRAME_END = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END'
 const HELPER_WRITE_ACTIONS = new Set([
@@ -114,16 +155,48 @@ const HELPER_WRITE_ACTIONS = new Set([
 ])
 
 export class NativeHelperError extends Error {
-  constructor(message, ambiguousWrite = false) {
+  constructor(message, ambiguousWrite = false, permanent = false) {
     super(message)
     this.name = 'NativeHelperError'
     this.ambiguousWrite = ambiguousWrite
+    this.permanent = permanent
   }
 }
 
+function validateRequestJSON(value, seen = new Set()) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('non_finite_number')
+    return
+  }
+  if (!value || typeof value !== 'object' || seen.has(value)) throw new TypeError('unsupported_json_value')
+  if (!Array.isArray(value)) {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError('unsupported_json_object')
+  }
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) throw new TypeError('sparse_json_array')
+      validateRequestJSON(value[index], seen)
+    }
+  } else {
+    for (const key of Object.keys(value)) validateRequestJSON(value[key], seen)
+  }
+  seen.delete(value)
+}
+
 export function encodeRequest(value) {
-  const bytes = new TextEncoder().encode(JSON.stringify(value))
-  if (bytes.byteLength > MAX_REQUEST_BYTES) throw new NativeHelperError('Helper request is too large')
+  let bytes
+  try {
+    validateRequestJSON(value)
+    const json = JSON.stringify(value)
+    if (typeof json !== 'string') throw new TypeError('not_json')
+    bytes = new TextEncoder().encode(json)
+  } catch {
+    throw new NativeHelperError('Helper request could not be encoded', false, true)
+  }
+  if (bytes.byteLength > MAX_REQUEST_BYTES) throw new NativeHelperError('Helper request is too large', false, true)
   let binary = ''
   for (const byte of bytes) binary += String.fromCharCode(byte)
   return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
@@ -526,6 +599,7 @@ export class CompletionMonitor {
     if (this.stopped || r.askChecking) return
     r.askChecking = true
     let currentAskId = null
+    let currentAskFingerprint = null
     try {
       validateSessionRow(row)
       if (row.id !== r.sid) throw new Error('Clarify session identity changed')
@@ -541,11 +615,14 @@ export class CompletionMonitor {
       currentAskId = ask?.id || null
       if (ask?.method === 'clarify' && route.connectionId && ask.params?.session_id === r.sid) {
         validateReplySnapshot(since)
+        currentAskFingerprint = stableJSON(ask)
+        if (r.helperWriteBlockedFingerprint === currentAskFingerprint) { r.ask = {id: ask.id}; return }
+        if (r.helperWriteBlockedFingerprint) r.helperWriteBlockedFingerprint = null
         if (r.helperWriteBlockedAskId === ask.id) { r.ask = {id: ask.id}; return }
         if (r.reply && validReplySnapshot(r.reply, route, row, since)) return
         const descriptor = { owner: this.replyOwner, connectionId: route.connectionId, profile: route.profile,
           targetProfile: route.targetProfile, sid: r.sid, session_key: row.session_key,
-          epoch: String(since.epoch), request_id: ask.id, fingerprint: stableJSON(ask) }
+          epoch: String(since.epoch), request_id: ask.id, fingerprint: currentAskFingerprint }
         const previous = r.reply
         if (previous && !['connectionId','profile','targetProfile','sid','session_key','epoch','request_id']
           .every(key => previous.descriptor[key] === descriptor[key])) {
@@ -604,7 +681,11 @@ export class CompletionMonitor {
         this.api.notify({ kind: 'warning', title: '입력 대기 알림', message: '텔레그램 전송을 확인하지 못했습니다. 중복 방지를 위해 자동 재전송하지 않습니다.' })
       }
     } catch (error) {
-      if (currentAskId && error instanceof NativeHelperError && error.ambiguousWrite) {
+      if (currentAskId && error instanceof NativeHelperError && error.permanent) {
+        r.helperWriteBlockedFingerprint = currentAskFingerprint
+        r.ask = {id: currentAskId}
+        this.api.notify({kind: 'warning', title: '질문 응답 전송 제한', message: '질문이 로컬 전송 크기 제한을 초과해 텔레그램 연결을 시작하지 않았습니다. 질문을 짧게 줄여 다시 요청해 주세요.'})
+      } else if (currentAskId && error instanceof NativeHelperError && error.ambiguousWrite) {
         r.helperWriteBlockedAskId = currentAskId
         r.ask = {id: currentAskId}
         this.api.notify({kind: 'warning', title: '입력 대기 알림', message: '결과를 확인하지 못했습니다. 중복 방지를 위해 다시 시도하지 않습니다.'})
@@ -625,6 +706,53 @@ export class CompletionMonitor {
     const row = rows.find(x => x.id === bridge.descriptor.sid)
     const snapshot = await this.api.requestProfile(route, 'session.events.since', {session_id:bridge.descriptor.sid, last_seen:0})
     return validReplySnapshot(bridge, route, row, snapshot)
+  }
+
+  async replyFragment(item, bridge) {
+    const meta = item.fragment
+    if (!exactKeys(meta, ['sha256','bytes','chunks','chunk_bytes']) || !/^[0-9a-f]{64}$/u.test(meta.sha256) ||
+        !Number.isSafeInteger(meta.bytes) || meta.bytes < 1 || meta.bytes > MAX_FRAGMENT_BYTES ||
+        meta.chunk_bytes !== FRAGMENT_CHUNK_BYTES || !Number.isSafeInteger(meta.chunks) ||
+        meta.chunks !== Math.ceil(meta.bytes / FRAGMENT_CHUNK_BYTES) || meta.chunks < 1 || meta.chunks > MAX_FRAGMENT_CHUNKS ||
+        typeof item.id !== 'string' || typeof item.claim !== 'string' || !Number.isFinite(item.deadline)) {
+      throw fragmentError('invalid_fragment_metadata')
+    }
+    if (Date.now() >= item.deadline * 1000) throw fragmentError('fragment_claim_expired', true)
+    const chunks = []
+    let total = 0
+    for (let index = 0; index < meta.chunks; index++) {
+      if (this.stopped) throw fragmentError('fragment_aborted')
+      if (Date.now() >= item.deadline * 1000) throw fragmentError('fragment_claim_expired', true)
+      const response = await this.helper({action:'reply_fragment', owner:this.replyOwner, id:item.id,
+        claim:item.claim, sha256:meta.sha256, index})
+      if (response?.ok !== true) {
+        throw fragmentError('fragment_unavailable', response?.reason === 'claim_expired' || Date.now() >= item.deadline * 1000)
+      }
+      if (!exactKeys(response, ['ok','id','claim','sha256','index','bytes','chunks','chunk_bytes','data']) ||
+          response.id !== item.id || response.claim !== item.claim || response.sha256 !== meta.sha256 ||
+          response.index !== index || response.bytes !== meta.bytes || response.chunks !== meta.chunks ||
+          response.chunk_bytes !== FRAGMENT_CHUNK_BYTES) throw fragmentError('fragment_metadata_mismatch')
+      const expectedBytes = Math.min(FRAGMENT_CHUNK_BYTES, meta.bytes - index * FRAGMENT_CHUNK_BYTES)
+      const bytes = decodeFragmentChunk(response.data, expectedBytes)
+      total += bytes.byteLength
+      if (total > meta.bytes || total > MAX_FRAGMENT_BYTES) throw fragmentError('fragment_size_mismatch')
+      chunks.push(bytes)
+      if (Date.now() >= item.deadline * 1000) throw fragmentError('fragment_claim_expired', true)
+    }
+    if (total !== meta.bytes) throw fragmentError('fragment_size_mismatch')
+    const joined = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.byteLength }
+    if (!globalThis.crypto?.subtle) throw fragmentError('fragment_digest_unavailable')
+    const digestBytes = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', joined))
+    const digest = Array.from(digestBytes, byte => byte.toString(16).padStart(2, '0')).join('')
+    if (digest !== meta.sha256) throw fragmentError('fragment_digest_mismatch')
+    let payload
+    try { payload = JSON.parse(new TextDecoder('utf-8', {fatal:true}).decode(joined)) }
+    catch { throw fragmentError('fragment_json_invalid') }
+    if (!exactKeys(payload, ['descriptor','result']) || stableJSON(payload.descriptor) !== stableJSON(bridge.descriptor) ||
+        !validReplyResult(bridge, payload.result)) throw fragmentError('fragment_payload_invalid')
+    return payload.result
   }
 
   async pumpReplies() {
@@ -649,22 +777,27 @@ export class CompletionMonitor {
     this.lastReplyPollSucceeded = true
     for (const item of polled.items || []) {
       const bridge = bridges.get(item.id)
+      const isFragment = Boolean(item.fragment)
       let status = 'rejected'
       try {
-        if (!this.stopped && bridge && stableJSON(item.descriptor) === stableJSON(bridge.descriptor) && await this.replySnapshot(bridge)) {
-          const result = item.result
-          const questions = bridge.ask.params.questions
-          const valid = Array.isArray(questions) && questions.length
-            ? result && Object.keys(result).length === 1 && result.answers && Object.keys(result.answers).length === questions.length && questions.every(q => typeof result.answers[q.qid] === 'string' && result.answers[q.qid].trim())
-            : result && Object.keys(result).length === 1 && typeof result.answer === 'string' && result.answer.trim()
-          if (valid && Number.isFinite(item.deadline) && Date.now() < item.deadline * 1000) {
-            // Set unknown BEFORE a write: a timeout can mean the response was applied.
-            status = 'unknown'
-            const receipt = await this.api.requestProfile(bridge.route, 'request.answer', {id:bridge.descriptor.request_id, result}, 15_000)
-            status = receipt.status === 'ok' ? 'applied' : receipt.status === 'expired' ? 'expired' : 'unknown'
+        if (!this.stopped && bridge) {
+          const result = isFragment ? await this.replyFragment(item, bridge) : item.result
+          const identityMatches = isFragment || stableJSON(item.descriptor) === stableJSON(bridge.descriptor)
+          if (identityMatches && await this.replySnapshot(bridge)) {
+            if (validReplyResult(bridge, result) && Number.isFinite(item.deadline) && Date.now() < item.deadline * 1000) {
+              // Set unknown BEFORE a write: a timeout can mean the response was applied.
+              status = 'unknown'
+              const receipt = await this.api.requestProfile(bridge.route, 'request.answer', {id:bridge.descriptor.request_id, result}, 15_000)
+              status = receipt.status === 'ok' ? 'applied' : receipt.status === 'expired' ? 'expired' : 'unknown'
+            } else if (Number.isFinite(item.deadline) && Date.now() >= item.deadline * 1000) {
+              status = 'expired'
+            }
           }
         }
-      } catch { /* keep unknown after any attempted write */ }
+      } catch (error) {
+        if (isFragment) status = error?.claimExpired || (Number.isFinite(item.deadline) && Date.now() >= item.deadline * 1000) ? 'expired' : 'unknown'
+        // Keep unknown after any attempted write; fragment failures are terminal too.
+      }
       try { await this.helper({action:'reply_settle', id:item.id, claim:item.claim, status}) } catch { /* never resubmit */ }
     }
     for (const r of this.records.values()) {

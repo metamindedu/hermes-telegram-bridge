@@ -3,6 +3,7 @@ Credentials stay in the local helper; exact live request validation stays in Des
 """
 from __future__ import annotations
 import asyncio
+import base64
 import hashlib
 import importlib
 import json
@@ -21,6 +22,11 @@ DEFAULT_TTL = 3600
 MIN_TTL = 3600
 MAX_TTL = 86400
 LEASE = 45
+FRAGMENT_CHUNK_BYTES = 16 * 1024
+MAX_FRAGMENT_BYTES = 256 * 1024
+MAX_FRAGMENT_CHUNKS = MAX_FRAGMENT_BYTES // FRAGMENT_CHUNK_BYTES
+# One native apply claim per poll keeps fragment reads from aging sibling claims.
+MAX_NATIVE_POLL_ITEMS = 1
 ACTIVE = ('posting', 'open', 'queued', 'applying')
 STALE_SEEN = -1e30
 
@@ -360,11 +366,21 @@ def lookup_reply(bot,chat,mid,state=STATE):
     finally:c.close()
 
 
-def poll(owner, observations, *, state=STATE, now=None, unverified=None):
+def _wire_json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+
+
+def _frozen_reply_bytes(descriptor, result):
+    return canonical({'descriptor': descriptor, 'result': result}).encode('utf-8')
+
+
+def poll(owner, observations, *, state=STATE, now=None, unverified=None, result_budget=None):
     now=time.time() if now is None else now
     if not isinstance(owner,str) or not owner or not isinstance(observations,list) or len(observations)>50:
         raise ValueError('invalid_poll')
     if unverified is not None and (not isinstance(unverified,list) or len(unverified)>50):
+        raise ValueError('invalid_poll')
+    if result_budget is not None and (type(result_budget) is not int or result_budget <= 0):
         raise ValueError('invalid_poll')
     allowed={x['id'] for x in observations if isinstance(x,dict) and isinstance(x.get('id'),str)}
     unverifiable={x for x in (unverified or []) if isinstance(x,str)}
@@ -378,7 +394,7 @@ def poll(owner, observations, *, state=STATE, now=None, unverified=None):
             receiver_value=None
         receiver_boot=receiver_value.get('boot') if isinstance(receiver_value,dict) and isinstance(receiver_value.get('boot'),str) else None
         result=[]
-        for row in c.execute("SELECT * FROM forms WHERE owner=? AND status IN ('posting','open','queued','applying')",(owner,)).fetchall():
+        for row in c.execute("SELECT * FROM forms WHERE owner=? AND status IN ('posting','open','queued','applying') ORDER BY created,id",(owner,)).fetchall():
             # An explicitly unverifiable transport observation revokes ingress
             # freshness immediately without consuming queued work or extending
             # TTL. In-flight attempts retain their terminal lapse semantics.
@@ -398,13 +414,83 @@ def poll(owner, observations, *, state=STATE, now=None, unverified=None):
                 continue
             if row['boot']!=live['boot']:
                 _retire(c,row['id'],'unknown' if row['status']=='applying' else 'expired');continue
-            c.execute('UPDATE forms SET seen=? WHERE id=?',(now,row['id']))
+            if row['status']!='applying':
+                c.execute('UPDATE forms SET seen=? WHERE id=?',(now,row['id']))
             if row['status']=='queued':
                 claim=secrets.token_hex(12)
+                deadline=min(row['expires'],now+LEASE)
+                descriptor=json.loads(row['descriptor'])
+                answer=json.loads(row['answer'])
+                ordinary={'id':row['id'],'claim':claim,'deadline':deadline,'descriptor':descriptor,'result':answer}
+                selected=ordinary
+                fragmented=False
+                if result_budget is not None:
+                    if len(_wire_json_bytes({'ok':True,'items':result+[ordinary]})) > result_budget:
+                        if result or len(_wire_json_bytes({'ok':True,'items':[ordinary]})) <= result_budget:
+                            continue
+                        frozen=_frozen_reply_bytes(descriptor,answer)
+                        if len(frozen)>MAX_FRAGMENT_BYTES:
+                            continue
+                        chunks=(len(frozen)+FRAGMENT_CHUNK_BYTES-1)//FRAGMENT_CHUNK_BYTES
+                        if not chunks or chunks>MAX_FRAGMENT_CHUNKS:
+                            continue
+                        digest=hashlib.sha256(frozen).hexdigest()
+                        selected={'id':row['id'],'claim':claim,'deadline':deadline,
+                                  'fragment':{'sha256':digest,'bytes':len(frozen),'chunks':chunks,
+                                              'chunk_bytes':FRAGMENT_CHUNK_BYTES}}
+                        if len(_wire_json_bytes({'ok':True,'items':result+[selected]})) > result_budget:
+                            continue
+                        fragmented=True
                 c.execute("UPDATE forms SET status='applying',claim=? WHERE id=?",(claim,row['id']))
-                result.append({'id':row['id'],'claim':claim,'deadline':min(row['expires'],now+LEASE),'descriptor':json.loads(row['descriptor']),'result':json.loads(row['answer'])})
+                result.append(selected)
+                if fragmented or (result_budget is not None and len(result)>=MAX_NATIVE_POLL_ITEMS):
+                    break
         c.commit();return {'ok':True,'items':result}
     finally:c.close()
+
+
+def read_fragment(owner, fid, claim, digest, index, *, state=STATE, now=None):
+    """Read one bounded chunk of an existing frozen applying claim; never renew it."""
+    now=time.time() if now is None else now
+    if (not isinstance(owner,str) or not owner or not isinstance(fid,str) or not fid or
+        not isinstance(claim,str) or not claim or not isinstance(digest,str) or len(digest)!=64 or
+        any(ch not in '0123456789abcdef' for ch in digest) or type(index) is not int or index<0):
+        return {'ok':False,'reason':'invalid_fragment'}
+    path=Path(state)/'reply-inbox'/'replies.sqlite3'
+    if not path.is_file():
+        return {'ok':False,'reason':'fragment_unavailable'}
+    c=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=5)
+    c.row_factory=sqlite3.Row
+    try:
+        c.execute('PRAGMA query_only=ON')
+        row=c.execute("SELECT id,owner,descriptor,answer,boot,status,claim,seen,expires FROM forms WHERE id=? AND owner=? AND claim=? AND status='applying'",(fid,owner,claim)).fetchone()
+        receiver_row=c.execute("SELECT value FROM receiver WHERE key='live'").fetchone()
+        if not row or not receiver_row:
+            return {'ok':False,'reason':'fragment_unavailable'}
+        try:
+            live=json.loads(receiver_row['value'])
+            receiver_age=now-float(live['at'])
+            deadline=min(float(row['expires']),float(row['seen'])+LEASE)
+        except (TypeError,ValueError,KeyError,AttributeError):
+            return {'ok':False,'reason':'fragment_unavailable'}
+        if (float(row['expires'])<=now or deadline<=now or receiver_age<0 or receiver_age>LEASE or
+                not isinstance(live,dict) or live.get('boot')!=row['boot']):
+            return {'ok':False,'reason':'claim_expired'}
+        try:
+            frozen=_frozen_reply_bytes(json.loads(row['descriptor']),json.loads(row['answer']))
+        except (TypeError,ValueError,RecursionError):
+            return {'ok':False,'reason':'fragment_corrupt'}
+        if len(frozen)>MAX_FRAGMENT_BYTES or hashlib.sha256(frozen).hexdigest()!=digest:
+            return {'ok':False,'reason':'fragment_corrupt'}
+        chunks=(len(frozen)+FRAGMENT_CHUNK_BYTES-1)//FRAGMENT_CHUNK_BYTES
+        if not chunks or chunks>MAX_FRAGMENT_CHUNKS or index>=chunks:
+            return {'ok':False,'reason':'invalid_fragment'}
+        start=index*FRAGMENT_CHUNK_BYTES
+        data=base64.urlsafe_b64encode(frozen[start:start+FRAGMENT_CHUNK_BYTES]).rstrip(b'=').decode('ascii')
+        return {'ok':True,'id':fid,'claim':claim,'sha256':digest,'index':index,
+                'bytes':len(frozen),'chunks':chunks,'chunk_bytes':FRAGMENT_CHUNK_BYTES,'data':data}
+    finally:
+        c.close()
 
 
 def settle(fid,claim,status,*,state=STATE):
@@ -484,7 +570,7 @@ def flush(notifier,*,state=STATE):
             c.close()
 
 
-def helper(req, notifier, *, root=ROOT, state=STATE):
+def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     global _NOTIFIER
     _NOTIFIER = notifier
     if not enabled(root=root):return {'ok':False,'reason':'bridge_disabled'}
@@ -494,7 +580,9 @@ def helper(req, notifier, *, root=ROOT, state=STATE):
         if not checked.get('ok'):return checked
         result=register(req,state=state,root=root)
         if result.get('new'):publish(result['id'],notifier,state=state)
-    elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'),state=state)
+    elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'),state=state,result_budget=result_budget)
+    elif action=='reply_fragment':
+        return read_fragment(req.get('owner'),req.get('id'),req.get('claim'),req.get('sha256'),req.get('index'),state=state)
     elif action=='reply_settle':result=settle(req.get('id'),req.get('claim'),req.get('status'),state=state)
     else:return {'ok':False,'reason':'unknown_reply_action'}
     flush(notifier,state=state)

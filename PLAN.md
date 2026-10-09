@@ -15,10 +15,10 @@ Implement and verify two native Hermes directory packages; finish the authorized
 
 ## Native CLI transport
 
-- The Desktop sends fixed `argv`: `--profile default desktop-telegram-bridge --request <bounded-base64url-json>` through `cli.exec` with numeric inner and outer deadlines.
+- The Desktop sends fixed `argv`: `--profile default desktop-telegram-bridge --request <bounded-base64url-json>` through `cli.exec` with numeric inner and outer deadlines. The original Windows argv envelope is preserved at UTF-8 JSON ≤22,500 bytes / base64url token ≤30,000 characters; permanent local encoding/size failures are not truncated or launched and produce one user notice per ask fingerprint.
 - No renderer-provided executable, path, raw command, or environment is accepted.
 - The native handler calls the existing notifier action dispatcher; it does not implement a second action layer.
-- Results use one bounded strict frame. Startup logging may surround it; duplicate/malformed frames fail closed. Ambiguous writes are not retried and credential-bearing exception text is not returned.
+- Results use one bounded strict frame: UTF-8 JSON ≤24 KiB serialized with `ensure_ascii=False` inside the existing ASCII base64 frame, within the 48,000-character stdout ceiling. Startup logging may surround it; duplicate/malformed frames fail closed. Native `reply_poll` budgets the entire response before claiming; oversized frozen descriptor/result data uses bounded SHA-256-verified read-only chunks without a schema change or claim/TTL renewal. Unselected forms remain queued. Ambiguous writes are not retried and credential-bearing exception text is not returned.
 
 ## Verification and CI
 

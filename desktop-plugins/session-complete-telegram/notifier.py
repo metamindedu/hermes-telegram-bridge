@@ -16,6 +16,7 @@ import importlib
 import json
 import re
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -538,7 +539,7 @@ def deliver_attention(req, *, root=ROOT, state=STATE, api=telegram):
     return {**result, "kind": kind}
 
 
-def dispatch_request(req, *, root=ROOT, state=STATE):
+def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget=None):
     """Dispatch one bounded native or direct-launch request through existing actions."""
     try:
         if not isinstance(req, dict):
@@ -552,9 +553,10 @@ def dispatch_request(req, *, root=ROOT, state=STATE):
             result = deliver(req, root=root, state=state)
         elif action == "attention":
             result = deliver_attention(req, root=root, state=state)
-        elif action in ("reply_register", "reply_poll", "reply_settle"):
+        elif action in ("reply_register", "reply_poll", "reply_settle", "reply_fragment"):
             reply_bridge = _sibling_module("reply_bridge")
-            result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state)
+            result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
+                                         result_budget=result_budget if native else None)
         elif isinstance(action, str) and action.startswith("followup_"):
             followup_bridge = _sibling_module("followup_bridge")
             reply_bridge = _sibling_module("reply_bridge")

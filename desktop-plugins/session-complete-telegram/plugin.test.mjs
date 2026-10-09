@@ -6,7 +6,7 @@ registerHooks({resolve(specifier, context, nextResolve) {
   if (specifier === '@hermes/plugin-sdk') return {url: 'data:text/javascript,export const host = {}', shortCircuit:true}
   return nextResolve(specifier, context)
 }})
-const {CompletionMonitor, QUIET_MS, blockingProcess, unfinishedControl, encodeRequest, decodeResultFrame, NativeHelperError} = await import('./desktop/plugin.js')
+const {CompletionMonitor, QUIET_MS, blockingProcess, unfinishedControl, stableJSON, encodeRequest, decodeResultFrame, NativeHelperError} = await import('./desktop/plugin.js')
 
 const FRAME_BEGIN = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN'
 const FRAME_END = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END'
@@ -231,11 +231,42 @@ test('default route CLI framing tolerates startup logs but rejects duplicates an
   assert.throws(()=>decodeResultFrame('{"ok":true}'),NativeHelperError)
 })
 
-test('fixed request encoding is bounded base64url JSON',()=>{
+test('fixed request encoding preserves original Windows argv envelope and Unicode fingerprints',()=>{
   const encoded=encodeRequest({action:'send',profile:'default'})
   assert.match(encoded,/^[A-Za-z0-9_-]+$/u)
   assert.equal(JSON.parse(Buffer.from(encoded,'base64url').toString('utf8')).action,'send')
-  assert.throws(()=>encodeRequest({text:'x'.repeat(20_000)}),NativeHelperError)
+  const ask={id:'srq-aabbcc112233',method:'clarify',params:{session_id:'session-korean',
+    question:'가'.repeat(2495)+'😊"\\',choices:['나'.repeat(496)+'😊"\\']}}
+  const request={action:'reply_register',descriptor:{owner:'owner',connectionId:'local',profile:'default',
+    targetProfile:'default',sid:'session-korean',session_key:'stored',epoch:'epoch',request_id:ask.id,
+    fingerprint:stableJSON(ask)},ask}
+  const korean=encodeRequest(request)
+  assert.ok(korean.length<30_000)
+  assert.deepEqual(JSON.parse(Buffer.from(korean,'base64url').toString('utf8')),request)
+  const jsonSize=Buffer.byteLength(JSON.stringify({data:''}),'utf8')
+  const boundary=encodeRequest({data:'x'.repeat(22_500-jsonSize)})
+  assert.equal(boundary.length,30_000)
+  assert.throws(()=>encodeRequest({data:'x'.repeat(22_500-jsonSize+1)}),error=>
+    error instanceof NativeHelperError&&error.permanent&&!error.ambiguousWrite)
+  assert.throws(()=>encodeRequest({data:1n}),error=>
+    error instanceof NativeHelperError&&error.permanent&&!error.ambiguousWrite)
+  for(const invalid of [{data:Number.NaN},{data:undefined}])assert.throws(()=>encodeRequest(invalid),error=>
+    error instanceof NativeHelperError&&error.permanent&&!error.ambiguousWrite)
+  const cyclic={};cyclic.self=cyclic
+  assert.throws(()=>encodeRequest(cyclic),error=>
+    error instanceof NativeHelperError&&error.permanent&&!error.ambiguousWrite)
+})
+
+test('permanent local ask encoding failure gives guidance once and never launches CLI retry',async()=>{
+  const f=fixture();f.event('message.start')
+  f.data['session.active_list'].sessions[0].status='waiting'
+  f.data['session.events.since']={epoch:'epoch-1',events:[],truncated:false,open_requests:[{id:'srq-bbccdd223344',method:'clarify',params:{
+    session_id:'ui-1',question:'😊'.repeat(2500),choices:['나'.repeat(500)]}}]}
+  await f.m.sweep();await f.m.sweep();await f.m.sweep()
+  assert.equal(f.sent.filter(request=>request.action==='reply_register').length,0)
+  assert.equal(f.notices.length,1)
+  assert.match(f.notices[0].message,/전송 크기 제한/u)
+  assert.match(f.notices[0].message,/짧게 줄여/u)
 })
 
 test('completion send stays available when ingress feature is disabled',async()=>{

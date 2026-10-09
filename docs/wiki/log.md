@@ -11,3 +11,10 @@
 - fixed default-home CLI/frame 경로, named/foreign-home refusal, per-home helper namespace 및 fake-home install/update/rollback 검증을 문서화했다.
 - 고정 core/action CI와 정확한 native command syntax를 추가했다. 운영 install/enablement/Gateway activation은 수행하지 않았다.
 - repository instruction files AGENTS.md/CLAUDE.md는 tool approval gate로 수정하지 못해 phase 1 문구가 남아 있으며, 이것은 문서 동기화의 미해결 blocker다.
+
+## 2026-10-10 update | Bounded native reply transport and Desktop ownership
+
+- Preserved the original Windows argv byte/token envelope and made local encoding/size failures permanent per ask fingerprint rather than repeatedly launching.
+- Kept the ASCII result frame while budgeting UTF-8 JSON before reply claims; oversized frozen replies use read-only digest-checked fragments with existing claim/TTL gates and no schema migration.
+- Clarified that unrelated files left in the managed Desktop folder can be removed by a later packaged update or rollback; any separately approved preservation/relocation must happen before entry adoption, which alone is not deletion approval.
+- Verification now includes synthetic actual-core alignment/adoption followed by packaged update and rollback; no current Desktop files were moved.
