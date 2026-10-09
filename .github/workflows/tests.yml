@@ -19,11 +19,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       # All Hermes homes and tempfile fixtures are disposable runner-owned data.
-      HERMES_HOME: ${{ runner.temp }}/hermes-bridge-test-home
-      HERMES_TEST_TMPDIR: ${{ runner.temp }}/hermes-bridge-test-scratch
-      TMPDIR: ${{ runner.temp }}/hermes-bridge-test-scratch
-      TMP: ${{ runner.temp }}/hermes-bridge-test-scratch
-      TEMP: ${{ runner.temp }}/hermes-bridge-test-scratch
+      HERMES_HOME: ${{ github.workspace }}/.ci-scratch/home
+      HERMES_TEST_TMPDIR: ${{ github.workspace }}/.ci-scratch/scratch
       # Dependencies are already synced from the immutable checkout below; do not
       # let the source-checkout auto-bootstrap rebuild or re-home this CI venv.
       HERMES_DISABLE_LAZY_INSTALLS: '1'
@@ -70,6 +67,9 @@ jobs:
           fi
           uv pip install --python "$CORE_PY" -r "$WORKSPACE/desktop-plugins/session-complete-telegram/requirements-test.txt"
           "$CORE_PY" -c "from pathlib import Path; import os; Path(os.environ['HERMES_HOME']).mkdir(parents=True, exist_ok=True); Path(os.environ['HERMES_TEST_TMPDIR']).mkdir(parents=True, exist_ok=True)"
+          # Export tempfile roots only after creating them; checkout/setup steps
+          # retain the runner's valid original temporary directories.
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$HERMES_TEST_TMPDIR" "$HERMES_TEST_TMPDIR" "$HERMES_TEST_TMPDIR" >> "$GITHUB_ENV"
 
       - name: Node syntax and behavior tests
         shell: bash
