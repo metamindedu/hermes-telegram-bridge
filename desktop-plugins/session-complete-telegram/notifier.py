@@ -426,7 +426,7 @@ def _send_verified(key, profile, session_key, text, root, state, api):
         if existing:
             return {"ok": existing[0] == "sent", "duplicate": True, "status": existing[0], "message_id": existing[1], "verified": bool(existing[2])}
         c.execute("INSERT INTO deliveries(dedupe_key,profile,session_key,status,created) VALUES(?,?,?,?,?)", (key, profile, session_key, "sending", time.time()))
-    payload = {"chat_id": target, "text": text, "disable_notification": False, "protect_content": True, "link_preview_options": {"is_disabled": True}}
+    payload = {"chat_id": target, "text": text, "disable_notification": False, "protect_content": False, "link_preview_options": {"is_disabled": True}}
     if topic is not None:
         payload["message_thread_id"] = topic
     answer = api(token, "sendMessage", payload)

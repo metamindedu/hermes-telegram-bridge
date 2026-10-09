@@ -132,8 +132,33 @@ class NotificationTests(unittest.TestCase):
         self.assertNotIn('Complete the fixture.',sent['text'])
         self.assertNotIn('parse_mode',sent)
         self.assertEqual(sent['text'],payloads[1][1]['text'])
-        self.assertTrue(sent['protect_content'])
+        self.assertIs(sent['protect_content'],False)
         self.assertNotIn('final_preview',result)
+
+    def test_plain_markdown_and_code_notifications_remain_copyable(self):
+        cases=(('일반 텍스트 복사 확인.','일반 텍스트 복사 확인.'),
+               ('**강조**와 `inline_code` 완료.','강조와 inline_code 완료.'),
+               ('```python\nvalue = 2 ** 3\nprint(value)\n```','value = 2 ** 3\nprint(value)'))
+        for index,(raw,expected) in enumerate(cases):
+            with self.subTest(content=raw):
+                self.execute("UPDATE messages SET content=? WHERE role='assistant'",(raw,))
+                payloads=[]
+                with patch.object(notifier,'credentials',return_value=('test',12,None)):
+                    result=notifier.deliver(self.request(),root=self.root,state=self.state/str(index),api=self.capture_api(payloads))
+                self.assertTrue(result['ok'] and result['verified'])
+                sent=payloads[0][1]
+                self.assertIs(sent['protect_content'],False)
+                self.assertIn(expected,sent['text'])
+                self.assertEqual(sent['text'],payloads[1][1]['text'])
+
+    def test_copyable_approval_notification_preserves_literal_command(self):
+        command='printf "**keep**"; echo *.py _name_'
+        payloads=[]
+        with patch.object(notifier,'credentials',return_value=('test',12,None)):
+            result=notifier.deliver_attention(self.ask_request(ask_method='approval',ask_params={'command':command}),root=self.root,state=self.state,api=self.capture_api(payloads))
+        self.assertTrue(result['ok'] and result['verified'])
+        self.assertIs(payloads[0][1]['protect_content'],False)
+        self.assertIn(command,payloads[0][1]['text'])
 
     def test_actual_queued_user_row_prevents_notification(self):
         req=self.request()

@@ -434,6 +434,7 @@ class BridgeTests(unittest.TestCase):
             calls.append((method,p));return {'ok':True,'result':{'message_id':55,'chat':{'id':99},'text':p['text']}}
         n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=api,final_preview=lambda x:x)
         b.publish(fid,n,state=self.state)
+        self.assertIs(calls[0][1]['protect_content'],False)
         self.assertEqual(calls[0][1]['reply_markup'],calls[1][1]['reply_markup'])
         self.assertIn('5분 후 만료됩니다',calls[0][1]['text'])
         self.assertEqual(b.read_form(fid,self.state)['status'],'open')

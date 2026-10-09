@@ -517,7 +517,7 @@ def publish(fid,notifier,*,state=STATE):
               ''.join(f'\n{n+1}) '+notifier.final_preview(choice) for n,choice in enumerate(q['choices']))+
               f'\n\n버튼을 선택하거나 이 메시지에 답장해 주세요.\n모든 질문에 답하면 작업이 이어집니다. {ttl_text} 후 만료됩니다.')
         row['status']='open';markup=keyboard(row,i)
-        payload={'chat_id':chat,'text':text,'reply_markup':markup,'protect_content':True,'disable_notification':False,'link_preview_options':{'is_disabled':True}}
+        payload={'chat_id':chat,'text':text,'reply_markup':markup,'protect_content':False,'disable_notification':False,'link_preview_options':{'is_disabled':True}}
         if topic is not None:payload['message_thread_id']=topic
         response=notifier.telegram(token,'sendMessage',payload)
         msg=response.get('result') or {}

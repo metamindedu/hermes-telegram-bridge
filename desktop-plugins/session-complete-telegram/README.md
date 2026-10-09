@@ -54,6 +54,9 @@ Phase 2 install/update/rollback commands and the separate unperformed activation
   from CLI inspection results, notification receipts, diagnostics, and commands.
   The existing default profile's Telegram bot + home channel are used.
   No tokens/chat IDs enter the renderer, command arguments, receipts, or logs.
+- Completion, attention/approval and clarify cards explicitly send
+  `protect_content: false`, allowing Telegram text copy and forwarding.
+  Markdown-to-plain previews, literal code, redaction and reply authorization stay unchanged.
 - Explicitly detached services and satisfied non-completion readiness watches
   do not block. Unclassified running background commands conservatively block.
 - Desktop must remain open/connected through the quiet window. Closing the app,
