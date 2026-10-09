@@ -544,7 +544,7 @@ class NativeInstallTests(unittest.TestCase):
         other.mkdir()
         with patch.dict(os.environ, {"HERMES_HOME": str(other)}):
             with self.assertRaisesRegex(RuntimeError, "foreign_hermes_home_refused"):
-                ingress.register(ctx)
+                ingress._validated_home(ctx)
 
         named_home = self.root / "global home" / "profiles" / "claire"
         named_package = named_home / "plugins" / INGRESS_ID
@@ -556,7 +556,7 @@ class NativeInstallTests(unittest.TestCase):
                                   PluginManager(scope_key=str(named_home)))
         with patch.dict(os.environ, {"HERMES_HOME": str(named_home)}):
             with self.assertRaisesRegex(RuntimeError, "named_profile_home_refused"):
-                named_ingress.register(named_ctx)
+                named_ingress._validated_home(named_ctx)
 
         _load_package(frontend_target, "phase2_frontend_home_guard_fixture")
         runtime = importlib.import_module("phase2_frontend_home_guard_fixture.runtime")

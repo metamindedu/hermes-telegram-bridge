@@ -110,15 +110,25 @@ def _run_cli(args: argparse.Namespace) -> None:
 
 
 def register(ctx) -> None:
-    """Register only the fixed CLI action dispatcher in this home."""
-    if getattr(ctx, "plugin_id", None) != PLUGIN_ID:
-        raise RuntimeError("native_plugin_owner_mismatch")
-    resolve_package_home(__file__)
+    """Declare the fixed command without accessing runtime homes or state.
+
+    Admission probes use a recording context and a throwaway home. Registration
+    grants no execution authority: validate the captured owner AND physical
+    package/active home only when the handler is invoked.
+    """
+    owner_id = getattr(ctx, "plugin_id", None)
+
+    def run_bound(args):
+        if owner_id != PLUGIN_ID:
+            _write_frame({"ok": False, "reason": "native_plugin_owner_mismatch"})
+            return
+        _run_cli(args)
+
     ctx.register_cli_command(
         name="desktop-telegram-bridge",
         help="Deliver Hermes Desktop notification actions to the configured Telegram home",
         setup_fn=_setup_cli,
-        handler_fn=_run_cli,
+        handler_fn=run_bound,
         description="Fixed local bridge command used by the Session Completion → Telegram Desktop plugin.",
     )
 

@@ -101,13 +101,12 @@ def _sibling_package(home: Path):
 
 
 def register(ctx) -> None:
-    """Register exactly one factory on the existing Telegram Application."""
-    home = _validated_home(ctx)
-
+    """Declare one factory without reading credentials, homes or bridge state."""
     def telegram_factory(application, adapter):
-        # Platform connection can occur later; refuse if the process scope moved.
-        if _validated_home(ctx) != home:
-            raise RuntimeError("foreign_hermes_home_refused")
+        # Registration is only a declaration (including admission probes).
+        # Runtime owner/location/profile checks remain mandatory before loading
+        # any helper or touching credentials, storage or Telegram handlers.
+        home = _validated_home(ctx)
         package = _sibling_package(home)
         notifier = importlib.import_module(f"{package.__package__}.notifier")
         reply_bridge = importlib.import_module(f"{package.__package__}.reply_bridge")
