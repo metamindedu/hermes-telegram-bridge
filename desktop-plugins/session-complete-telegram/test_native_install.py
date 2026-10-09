@@ -68,8 +68,11 @@ def _copy_candidate(destination: Path, version: str) -> Path:
 class NativeInstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = test_support.temporary_directory(prefix="native phase2 ")
-        self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        # Native PM keeps generation leases until process exit. Close only the
+        # leases created in this owned fixture before Windows directory cleanup.
+        self.addCleanup(self._release_fixture_pm_leases)
         self.home = self.root / "fake Hermes home"
         self.home.mkdir()
         self.config = self.home / "config.yaml"
@@ -89,8 +92,30 @@ class NativeInstallTests(unittest.TestCase):
             "v2": "2" * 40,
         }
 
-    def tearDown(self):
-        self.temp.cleanup()
+    def _release_fixture_pm_leases(self):
+        from pm import runtime
+
+        root = self.root.resolve()
+        for generation, release in tuple(runtime._HELD.items()):
+            if generation.resolve().is_relative_to(root):
+                release()
+                runtime._HELD.pop(generation)
+
+    def test_fixture_cleanup_releases_only_owned_real_runtime_leases(self):
+        from hermes_cli.runtime_state import lease_directory
+        from pm import runtime
+
+        generation = self.root / "owned runtime generation"
+        generation.mkdir()
+        (generation / ".lease-managed").write_text("", encoding="utf-8")
+        release = lease_directory(generation)
+        outside = self.root.parent / "unrelated-generation"
+        calls = []
+        with patch.object(runtime, "_HELD", {generation: release, outside: lambda: calls.append("foreign")}):
+            self._release_fixture_pm_leases()
+            self.assertEqual(set(runtime._HELD), {outside})
+            self.assertEqual(calls, [])
+            self.assertEqual(list((generation / ".leases").iterdir()), [])
 
     def _install_package(self, candidate: str, package_dir: str, *, force: bool):
         from hermes_cli import plugins_cmd
