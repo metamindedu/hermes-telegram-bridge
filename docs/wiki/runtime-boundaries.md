@@ -8,10 +8,14 @@ tags: [operations, ownership, deployment, privacy]
 
 # Source and runtime boundaries
 
-원격 저장소는 개발 원본이며 push가 실제 설치/활성화로 이어지지 않는 것이 이 프로젝트의 기본 운영 경계다. 처음에는 안정 코드를 재설계하지 않고 두 구성 요소를 한 기준 commit에 보존한다.
+Phase 2 separates the bridge into two native directory packages inside one repository: the completion/CLI package and the optional clarify-ingress package. The Desktop half remains app-wide through Hermes' existing materialization path; ingress stays opt-in and attaches only to the existing Telegram application. These are package/ownership boundaries, not permission to install or activate them.
 
-수신기 callback은 Gateway에 상주한다. 파일 변경/registry rescan만으로 기존 callback 교체를 단정하지 않는다. 승인된 재시작과 새 수신기 heartbeat 확인이 필요하며, 그때 열린 질문은 boot 변경으로 종료될 수 있다.
+The completion package owns the fixed local CLI helper under the verified default Hermes home. The renderer observes local profile routes, but helper execution is always routed through the default local home. Named/foreign homes fail closed. The ingress loader binds the sibling helper modules to the same home in a per-home namespace; it does not add a polling consumer or a cross-home module alias.
 
-코드 rollback과 상태 rollback은 다르다. 원격에는 실행 DB를 올리지 않으며, 코드 복구가 영구 중복 방지 기록을 삭제하거나 terminal 카드를 부활시키면 안 된다.
+The exact install/update/rollback syntax and separate enablement/restart gates live in [[../operations|operations]]. Candidate install, Doctor, fake-home upgrade and rollback tests are local evidence only; no production package was installed or enabled in this phase.
 
-지식 규칙은 [[SCHEMA]], 탐색은 [[index]]를 따른다.
+Ingress callbacks still run on the Gateway's existing Telegram `Application`; factory registration alone is not activation evidence. The native package ID `desktop-clarify-telegram` remains separate from the Desktop/CLI package ID `session-complete-telegram`, and their enablement must not be conflated.
+
+Code rollback and state rollback remain different. The shared `plugin-data/session-complete-telegram` directory, notification ledger, reply inbox, followup inbox, tombstones and credentials are never copied/reset by native package install/update/rollback. No state schema change or migration is introduced.
+
+Knowledge rules follow [[SCHEMA]], and navigation is maintained in [[index]].

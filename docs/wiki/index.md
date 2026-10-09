@@ -1,5 +1,5 @@
 # Wiki Index
 
-- [[runtime-boundaries]] — Git 원본, 실제 설치본, 상태 DB와 Gateway 활성화의 독립 경계.
+- [[runtime-boundaries]] — 두 native package의 소유권, default-home 경계, no-replay/state 보존 및 미수행 production activation.
 
-운영 절차는 `../operations.md`, 현재 단계는 저장소 루트 `PLAN.md`를 확인한다.
+Native install/update/rollback 명령과 activation procedure는 `../operations.md`; phase 2 scope/evidence는 repository `PLAN.md`를 확인한다. `docs/source-manifest.json`은 역사적 Phase 1 기준점이다.

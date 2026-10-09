@@ -1,0 +1,7 @@
+name: session-complete-telegram
+version: '1.5.0'
+description: Registers the fixed default-home CLI command used by the Desktop completion notifier.
+python_dependencies:
+  - markdown-it-py==4.2.0
+  - PyYAML==6.0.3
+  - python-telegram-bot==22.8

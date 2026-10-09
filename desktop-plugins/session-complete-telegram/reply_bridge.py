@@ -4,6 +4,7 @@ Credentials stay in the local helper; exact live request validation stays in Des
 from __future__ import annotations
 import asyncio
 import hashlib
+import importlib
 import json
 import secrets
 import sqlite3
@@ -22,7 +23,18 @@ MAX_TTL = 86400
 LEASE = 45
 ACTIVE = ('posting', 'open', 'queued', 'applying')
 STALE_SEEN = -1e30
-ROOT = Path('C:/Users/ovpow/AppData/Local/hermes')
+
+
+def _active_hermes_home():
+    from hermes_constants import get_hermes_home
+
+    try:
+        return Path(get_hermes_home()).expanduser().resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError('hermes_home_unavailable') from exc
+
+
+ROOT = _active_hermes_home()
 STATE = ROOT / 'plugin-data/session-complete-telegram'
 _NOTIFIER = None
 
@@ -30,8 +42,9 @@ _NOTIFIER = None
 def local_notifier():
     if _NOTIFIER is not None:
         return _NOTIFIER
-    import notifier
-    return notifier
+    if __package__:
+        return importlib.import_module('.notifier', __package__)
+    return importlib.import_module('notifier')
 
 def _resolve_clarify_timeout(cfg):
     """Mirror of ``tools.clarify_gateway.resolve_clarify_timeout``: legacy
@@ -471,20 +484,20 @@ def flush(notifier,*,state=STATE):
             c.close()
 
 
-def helper(req,notifier):
+def helper(req, notifier, *, root=ROOT, state=STATE):
     global _NOTIFIER
     _NOTIFIER = notifier
-    if not enabled():return {'ok':False,'reason':'bridge_disabled'}
+    if not enabled(root=root):return {'ok':False,'reason':'bridge_disabled'}
     action=req['action']
     if action=='reply_register':
-        checked=notifier.inspect_ask({'ask_method':'clarify','ask_id':req.get('ask',{}).get('id'),'ask_params':req.get('ask',{}).get('params',{}),'profile':req.get('descriptor',{}).get('targetProfile'),'session_key':req.get('descriptor',{}).get('session_key'),'desktop_observed':True})
+        checked=notifier.inspect_ask({'ask_method':'clarify','ask_id':req.get('ask',{}).get('id'),'ask_params':req.get('ask',{}).get('params',{}),'profile':req.get('descriptor',{}).get('targetProfile'),'session_key':req.get('descriptor',{}).get('session_key'),'desktop_observed':True},root=root)
         if not checked.get('ok'):return checked
-        result=register(req)
-        if result.get('new'):publish(result['id'],notifier)
-    elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'))
-    elif action=='reply_settle':result=settle(req.get('id'),req.get('claim'),req.get('status'))
+        result=register(req,state=state,root=root)
+        if result.get('new'):publish(result['id'],notifier,state=state)
+    elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'),state=state)
+    elif action=='reply_settle':result=settle(req.get('id'),req.get('claim'),req.get('status'),state=state)
     else:return {'ok':False,'reason':'unknown_reply_action'}
-    flush(notifier)
+    flush(notifier,state=state)
     return result
 
 

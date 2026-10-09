@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib
 import json
 import re
 import sqlite3
@@ -19,7 +20,18 @@ import time
 from pathlib import Path
 
 VERSION = "1.5.0"
-ROOT = Path("C:/Users/ovpow/AppData/Local/hermes")
+
+
+def _active_hermes_home():
+    from hermes_constants import get_hermes_home
+
+    try:
+        return Path(get_hermes_home()).expanduser().resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError("hermes_home_unavailable") from exc
+
+
+ROOT = _active_hermes_home()
 STATE = ROOT / "plugin-data" / "session-complete-telegram"
 QUIET_SECONDS = 60
 PREVIEW_CHARS = 1200
@@ -37,6 +49,13 @@ ASK_LABELS = {
     "vault.save_login": "💾 로그인 저장 확인 요청",
     "vault.code": "🔢 인증 코드 입력 요청",
 }
+
+
+def _sibling_module(name):
+    if __package__:
+        return importlib.import_module(f".{name}", __package__)
+    return importlib.import_module(name)
+
 
 def markdown_plain(text):
     """Render Markdown as readable plain text, preserving code literally."""
@@ -460,7 +479,7 @@ def _register_followup_binding(req, checked, result, *, root, state):
     if not inbox.is_file():
         return result
     try:
-        import followup_bridge
+        followup_bridge = _sibling_module("followup_bridge")
         token, chat, topic = credentials(root)
         if chat <= 0 or not followup_bridge.receiver_info(state=state):
             return result
@@ -519,6 +538,73 @@ def deliver_attention(req, *, root=ROOT, state=STATE, api=telegram):
     return {**result, "kind": kind}
 
 
+def dispatch_request(req, *, root=ROOT, state=STATE):
+    """Dispatch one bounded native or direct-launch request through existing actions."""
+    try:
+        if not isinstance(req, dict):
+            return {"ok": False, "reason": "invalid_request"}
+        action = req.get("action")
+        if action == "probe":
+            result = probe(root=root)
+        elif action == "test":
+            result = deliver(req, root=root, state=state, test=True)
+        elif action == "send":
+            result = deliver(req, root=root, state=state)
+        elif action == "attention":
+            result = deliver_attention(req, root=root, state=state)
+        elif action in ("reply_register", "reply_poll", "reply_settle"):
+            reply_bridge = _sibling_module("reply_bridge")
+            result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state)
+        elif isinstance(action, str) and action.startswith("followup_"):
+            followup_bridge = _sibling_module("followup_bridge")
+            reply_bridge = _sibling_module("reply_bridge")
+            if not reply_bridge.enabled(root=root):
+                return {"ok": False, "feature_ready": False, "reason": "disabled"}
+            owner = req.get("owner")
+            if action == "followup_owner_heartbeat":
+                result = followup_bridge.heartbeat_owner(owner, state=state)
+            elif action == "followup_ready":
+                result = followup_bridge.ready(owner, state=state)
+                for item in result.get("items", []):
+                    item["descriptor"] = json.loads(item["descriptor"])
+            elif action == "followup_claim":
+                result = followup_bridge.claim(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
+                    req.get("binding_id"), req.get("descriptor"), state=state)
+            elif action == "followup_begin_submit":
+                result = followup_bridge.begin_submit(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
+                    req.get("claim"), state=state)
+            elif action == "followup_reject":
+                result = followup_bridge.reject_pending(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
+                    req.get("binding_id"), state=state)
+            elif action == "followup_settle":
+                result = followup_bridge.settle(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
+                    req.get("claim"), req.get("status"), state=state)
+            else:
+                result = {"ok": False, "reason": "unknown_followup_action"}
+            if action in ("followup_settle", "followup_reject") and result.get("ok"):
+                try:
+                    followup_bridge.notify_receipt(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
+                                                   sys.modules[__name__], state=state)
+                except Exception:
+                    pass
+        elif action == "inspect":
+            result = inspect_session(req, root=root)
+        elif action == "loaded":
+            diagnostic("desktop_loaded", {"version": VERSION, "plugin_version": req.get("version"),
+                "profiles": req.get("profiles", []), "quiet_seconds": QUIET_SECONDS}, state=state)
+            result = {"ok": True, "version": VERSION}
+        elif action == "diagnostic":
+            data = {k: req[k] for k in ("profile", "session_key", "reason", "version") if k in req}
+            diagnostic("last_check", data, state=state)
+            result = {"ok": True}
+        else:
+            result = {"ok": False, "reason": "unknown_action"}
+    except Exception as exc:
+        # Exception text is intentionally omitted; it may contain credential URLs.
+        result = {"ok": False, "reason": type(exc).__name__}
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True)
@@ -527,60 +613,10 @@ def main():
         if len(args.request) > 30000:
             raise ValueError("oversized_request")
         req = json.loads(base64.urlsafe_b64decode(args.request).decode("utf-8"))
-        action = req.get("action")
-        if action == "probe":
-            result = probe()
-        elif action == "test":
-            result = deliver(req, test=True)
-        elif action == "send":
-            result = deliver(req)
-        elif action == "attention":
-            result = deliver_attention(req)
-        elif action in ("reply_register", "reply_poll", "reply_settle"):
-            import reply_bridge
-            import sys
-            result = reply_bridge.helper(req, sys.modules[__name__])
-        elif isinstance(action, str) and action.startswith("followup_"):
-            import followup_bridge
-            import reply_bridge
-            if not reply_bridge.enabled():
-                print(json.dumps({'ok':False,'feature_ready':False,'reason':'disabled'}))
-                return
-            owner = req.get("owner")
-            if action == "followup_owner_heartbeat":
-                result = followup_bridge.heartbeat_owner(owner)
-            elif action == "followup_ready":
-                result = followup_bridge.ready(owner)
-                for item in result.get("items", []):
-                    item["descriptor"] = json.loads(item["descriptor"])
-            elif action == "followup_claim":
-                result = followup_bridge.claim(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
-                    req.get("binding_id"), req.get("descriptor"))
-            elif action == "followup_begin_submit":
-                result = followup_bridge.begin_submit(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"), req.get("claim"))
-            elif action == "followup_reject":
-                result = followup_bridge.reject_pending(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"), req.get("binding_id"))
-            elif action == "followup_settle":
-                result = followup_bridge.settle(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"), req.get("claim"), req.get("status"))
-            else:
-                result = {"ok": False, "reason": "unknown_followup_action"}
-            if action in ('followup_settle','followup_reject') and result.get('ok'):
-                import sys
-                try:followup_bridge.notify_receipt(owner,req.get('bot'),req.get('chat'),req.get('inbound_id'),sys.modules[__name__])
-                except Exception:pass
-        elif action == "inspect":
-            result = inspect_session(req)
-        elif action == "loaded":
-            diagnostic("desktop_loaded", {"version": VERSION, "plugin_version": req.get("version"), "profiles": req.get("profiles", []), "quiet_seconds": QUIET_SECONDS})
-            result = {"ok": True, "version": VERSION}
-        elif action == "diagnostic":
-            data = {k: req[k] for k in ("profile", "session_key", "reason", "version") if k in req}
-            diagnostic("last_check", data)
-            result = {"ok": True}
-        else:
-            result = {"ok": False, "reason": "unknown_action"}
     except Exception as exc:
         result = {"ok": False, "reason": type(exc).__name__}
+    else:
+        result = dispatch_request(req)
     print(json.dumps(result, ensure_ascii=True))
 
 

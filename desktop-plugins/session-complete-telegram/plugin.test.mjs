@@ -6,7 +6,18 @@ registerHooks({resolve(specifier, context, nextResolve) {
   if (specifier === '@hermes/plugin-sdk') return {url: 'data:text/javascript,export const host = {}', shortCircuit:true}
   return nextResolve(specifier, context)
 }})
-const {CompletionMonitor, QUIET_MS, blockingProcess, unfinishedControl} = await import('./plugin.js')
+const {CompletionMonitor, QUIET_MS, blockingProcess, unfinishedControl, encodeRequest, decodeResultFrame, NativeHelperError} = await import('./desktop/plugin.js')
+
+const FRAME_BEGIN = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN'
+const FRAME_END = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END'
+function frame(value) {
+  return `${FRAME_BEGIN}\n${Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')}\n${FRAME_END}\n`
+}
+function decodeArgvRequest(args) {
+  assert.deepEqual(args.argv.slice(0, 4), ['--profile', 'default', 'desktop-telegram-bridge', '--request'])
+  assert.match(args.argv[4], /^[A-Za-z0-9_-]+$/u)
+  return JSON.parse(Buffer.from(args.argv[4], 'base64url').toString('utf8'))
+}
 
 function fixture(profile='default') {
   let time = 1000
@@ -19,13 +30,15 @@ function fixture(profile='default') {
     'session.control.read': {control:{goal:null,loop:null,heartbeat:null}},
     'session.events.since': {events:[],open_requests:[],truncated:false}
   }
-  const api = {state:{profile:{get:()=>profile}},profileRoutes:async()=>routes,notify:v=>notices.push(v),requestProfile:async(route,method,args)=>{
-    if (method==='shell.exec') {
+  const api = {state:{profile:{get:()=>profile}},profileRoutes:async()=>routes,notify:v=>notices.push(v),requestProfile:async(route,method,args,outerTimeout)=>{
+    if (method==='cli.exec') {
       assert.equal(route.profile,'default')
-      const request=JSON.parse(Buffer.from(args.command.split('--request ')[1],'base64url').toString())
-      if (request.action === 'followup_owner_heartbeat') return {code:0,stdout:JSON.stringify({ok:true,feature_ready:false})}
+      assert.equal(args.timeout,25)
+      assert.equal(outerTimeout,35_000)
+      const request=decodeArgvRequest(args)
+      if (request.action === 'followup_owner_heartbeat') return {blocked:false,code:0,output:frame({ok:true,feature_ready:false})}
       sent.push(request)
-      return {code:0,stdout:JSON.stringify({ok:true,status:'sent',verified:true})}
+      return {blocked:false,code:0,output:frame({ok:true,status:'sent',verified:true})}
     }
     const value=data[method]
     if(value instanceof Error) throw value
@@ -53,7 +66,7 @@ test('duplicate callback for same final never resends',async()=>{
 test('follow-up completing during old send is preserved',async()=>{
   const f=fixture();f.done();const original=f.api.requestProfile;let raced=false
   f.api.requestProfile=async(...args)=>{
-    if(args[1]==='shell.exec'&&!raced){raced=true;f.event('message.start',{},3);f.done(4,44)}
+    if(args[1]==='cli.exec'&&!raced){raced=true;f.event('message.start',{},3);f.done(4,44)}
     return original(...args)
   }
   await f.check();assert.equal(f.record().candidate.finalId,44)
@@ -179,15 +192,15 @@ test('sweep polls only observed routes and prunes dead sessions',async()=>{
   assert.equal(f.m.records.size,0)
   await f.m.sweep();assert.equal(activeCalls,2)
 })
-test('attention transport failure retries while the ask stays open',async()=>{
+test('definite CLI block before launch retries while the ask stays open',async()=>{
   const f=fixture();f.event('message.start')
   f.data['session.active_list'].sessions[0].status='waiting'
   f.data['session.events.since'].open_requests=[{id:'srq-666666666666',method:'clarify',params:{question:'q'}}]
   const original=f.api.requestProfile
-  let fail=true
-  f.api.requestProfile=async(route,method,args)=>{
-    if(method==='shell.exec'&&fail){fail=false;throw Error('unavailable')}
-    return original(route,method,args)
+  let blocked=true
+  f.api.requestProfile=async(route,method,args,outerTimeout)=>{
+    if(method==='cli.exec'&&blocked){blocked=false;return {blocked:true,code:-1,output:'',hint:'denied'}}
+    return original(route,method,args,outerTimeout)
   }
   await f.m.sweep();assert.equal(f.sent.length,0)
   await f.m.sweep();assert.equal(f.sent.length,1)
@@ -197,16 +210,52 @@ test('ambiguous attention send warns and is never retried',async()=>{
   const f=fixture();f.event('message.start')
   f.data['session.active_list'].sessions[0].status='waiting'
   f.data['session.events.since'].open_requests=[{id:'srq-777777777777',method:'approval',params:{command:'x'}}]
-  let shellCalls=0
+  let helperCalls=0
   f.api.requestProfile=async(route,method,args)=>{
-    if(method==='shell.exec'){
-      const request=JSON.parse(Buffer.from(args.command.split('--request ')[1],'base64url').toString())
-      if(request.action==='followup_owner_heartbeat')return {code:0,stdout:'{"feature_ready":false}'}
-      shellCalls++;return {code:0,stdout:JSON.stringify({ok:false,status:'unknown'})}
+    if(method==='cli.exec'){
+      const request=decodeArgvRequest(args)
+      if(request.action==='followup_owner_heartbeat')return {blocked:false,code:0,output:frame({ok:true,feature_ready:false})}
+      helperCalls++;return {blocked:false,code:0,output:frame({ok:false,status:'unknown'})}
     }
     return structuredClone(f.data[method])
   }
   await f.m.sweep();await f.m.sweep()
-  assert.equal(shellCalls,1)
+  assert.equal(helperCalls,1)
+  assert.equal(f.notices.length,1)
+})
+
+test('default route CLI framing tolerates startup logs but rejects duplicates and malformed frames',()=>{
+  assert.deepEqual(decodeResultFrame(`Hermes startup log\n${frame({ok:true,version:'1.5.0'})}ready`),{ok:true,version:'1.5.0'})
+  assert.throws(()=>decodeResultFrame(frame({ok:true})+frame({ok:true})),NativeHelperError)
+  assert.throws(()=>decodeResultFrame(`${FRAME_BEGIN}\nnot-base64!\n${FRAME_END}\n`),NativeHelperError)
+  assert.throws(()=>decodeResultFrame('{"ok":true}'),NativeHelperError)
+})
+
+test('fixed request encoding is bounded base64url JSON',()=>{
+  const encoded=encodeRequest({action:'send',profile:'default'})
+  assert.match(encoded,/^[A-Za-z0-9_-]+$/u)
+  assert.equal(JSON.parse(Buffer.from(encoded,'base64url').toString('utf8')).action,'send')
+  assert.throws(()=>encodeRequest({text:'x'.repeat(20_000)}),NativeHelperError)
+})
+
+test('completion send stays available when ingress feature is disabled',async()=>{
+  const f=fixture();f.done();await f.check();await f.m.sweep()
+  assert.equal(f.sent[0].action,'send')
+  assert.equal(f.sent.filter(request=>request.action==='reply_register').length,0)
+})
+
+test('ambiguous CLI frame after a write is never retried',async()=>{
+  const f=fixture();f.done();let writes=0
+  f.api.requestProfile=async(route,method,args)=>{
+    if(method==='cli.exec'){
+      const request=decodeArgvRequest(args)
+      if(request.action==='followup_owner_heartbeat')return {blocked:false,code:0,output:frame({ok:true,feature_ready:false})}
+      writes++
+      return {blocked:false,code:0,output:frame({ok:true})+frame({ok:true})}
+    }
+    return structuredClone(f.data[method])
+  }
+  await f.check();await f.check();f.done(3,42);await f.check()
+  assert.equal(writes,1)
   assert.equal(f.notices.length,1)
 })

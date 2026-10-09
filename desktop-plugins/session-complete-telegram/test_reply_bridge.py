@@ -1,18 +1,18 @@
 import asyncio
 import copy
 import json
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
+import test_support
 import reply_bridge as b
 
 
 class BridgeTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.tmp=test_support.temporary_directory(prefix='reply-test-');self.addCleanup(self.tmp.cleanup)
         self.state=Path(self.tmp.name);self.now=1000.0;self.event=0
         b.bind_receiver(77,99,None,'boot',state=self.state,now=self.now)
         self.ask={'id':'srq-aabbcc112233','method':'clarify','params':{'session_id':'runtime1','questions':[{'qid':'q1','question':'어떤 **방식**?','choices':['첫 번째','두 번째'],'multi_select':False}]}}
@@ -482,7 +482,7 @@ class BridgeTests(unittest.TestCase):
 
 class TtlPolicyTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.tmp=test_support.temporary_directory(prefix='reply-test-');self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
     def write_profile(self,name,text):
         home=self.root if name=='default' else self.root/'profiles'/name

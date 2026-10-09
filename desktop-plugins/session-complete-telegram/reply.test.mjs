@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {registerHooks} from 'node:module'
 registerHooks({resolve(s,c,n){return s==='@hermes/plugin-sdk'?{url:'data:text/javascript,export const host={}',shortCircuit:true}:n(s,c)}})
-const {CompletionMonitor,stableJSON,validReplySnapshot}=await import('./plugin.js')
+const {CompletionMonitor,stableJSON,validReplySnapshot}=await import('./desktop/plugin.js')
 function fixture() {
   const route={mode:'local',connectionId:'local',profile:'default',targetProfile:'default'}
   const row={id:'sid1',session_key:'stored1',status:'waiting'}

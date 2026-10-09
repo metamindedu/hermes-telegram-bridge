@@ -10,10 +10,13 @@ After approved native Gateway restart, newly verified completion cards accept di
 - Durable one-attempt claims prevent duplicate submission attempts. Unknown outcomes never retry. Snapshot checks are not atomic; a later waiting transition can still queue input, but cannot answer an approval.
 - A normal Desktop send can include attachments already drafted there; this plugin never clears those drafts. Text enters the normal conversation and travels through local helper stdout, not helper command arguments.
 - Followup-inbox uses a separate restricted directory; its failure must not stop clarify heartbeats or intercept mapped clarify replies. Minimal consumed-message identifiers remain after transient input text is purged.
-- See `IMPLEMENTATION.md` for actual tests, independent review, activation gates, and limits. Do not assume new native code is live from disk version alone.
+- See [`../../docs/operations.md`](../../docs/operations.md) for native package install, verification, activation gates, and limits. Do not assume new native code is live from a local source change or installed disk version alone.
 
-Local, app-wide Hermes Desktop plugin. Installed at:
-`C:/Users/ovpow/AppData/Local/hermes/desktop-plugins/session-complete-telegram`.
+Local Hermes Desktop component, now part of native directory package `session-complete-telegram`. Its canonical source is `desktop/plugin.js`; Hermes materializes that half in the app-level Desktop plugin root. The package also registers only fixed CLI command `desktop-telegram-bridge` in the default/global home. The separate native Gateway package remains `desktop-clarify-telegram` and registers only the existing Telegram factory.
+
+The two packages are independently enabled. Disabling `desktop-clarify-telegram` does not disable ordinary completion notifications. All profile observation remains local; helper execution uses only the validated default local route and refuses named/foreign homes. The renderer sends fixed argv through `cli.exec`, not an executable path or shell command. Python results are a bounded strict frame; malformed or ambiguous writes fail closed without retry.
+
+Phase 2 install/update/rollback commands and the separate unperformed activation gate are documented in [`../../docs/operations.md`](../../docs/operations.md). This repository task did not install, enable, configure, activate, restart, or contact Telegram in any production home.
 
 ## Behavior
 
@@ -57,7 +60,7 @@ Local, app-wide Hermes Desktop plugin. Installed at:
   losing the connection or a missing state contract fails closed (no notification).
   Remote SSH/cloud profiles are outside this local installation's scope.
 - Delivery claims persist in
-  `C:/Users/ovpow/AppData/Local/hermes/plugin-data/session-complete-telegram/notifications.sqlite3`.
+  `plugin-data/session-complete-telegram/notifications.sqlite3`.
   A network timeout is recorded as `unknown` and is not automatically resent;
   Telegram's send API has no idempotency key. Explicit rejected sends are also
   retained for inspection rather than retried noisily.
@@ -74,22 +77,24 @@ Desktop/receiver leases before accepting anything.
 
 ## Files and tests
 
-- `plugin.js`: app lifecycle, scoped profile routing, quiet-state gate.
+- `desktop/plugin.js`: app lifecycle, scoped profile routing, quiet-state gate and native `cli.exec` helper.
+- `__init__.py` / `runtime.py`: fixed CLI registration and package-home validation.
 - `notifier.py`: read-only durable-state checks, SQLite at-most-once claims,
-  existing Telegram credentials, fixed-destination sender.
-- `plugin.test.mjs`: JS behavior/race/future-profile tests (Node built-in runner).
-- `test_notifier.py`: Python tests using real Hermes `SessionDB` schema and
-  isolated temporary homes; Telegram calls are stubbed ONLY in unit tests.
+  existing Telegram credentials, fixed-destination sender and shared action dispatcher.
+- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`: Node behavior/race tests (Node built-in runner).
+- `test_notifier.py`: Python tests using the actual pinned Hermes `SessionDB` and redactor;
+  Telegram transport is stubbed only where the unit scenario requires it.
+- `test_native_install.py`: real Hermes install/Doctor/PluginContext APIs with fake homes and Git-transport-only mock.
 
-From this folder:
+From this folder, in the pinned-core environment described by `docs/operations.md`:
 
 ```
-node --test plugin.test.mjs reply.test.mjs
-# Run with the Python selected by pm.environments.project_python(repo):
-python -m unittest test_notifier test_reply_bridge -v
+node --check desktop/plugin.js
+node --test plugin.test.mjs reply.test.mjs followup.test.mjs
+python -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install -v
 ```
 
-No Git commit or global delegation-model/config change was made.
+The test dependencies are declared in `requirements-test.txt`. Do not run the native installer against a production home as part of source tests.
 
 ## Telegram answers (1.4.0)
 
@@ -135,8 +140,7 @@ No Git commit or global delegation-model/config change was made.
   delivery claim lapses terminally (`unknown`, never replayed).
 - A send or answer with an ambiguous outcome is never automatically retried.
   Telegram shows applied only after Desktop's authoritative response receipt.
-- `reply_bridge.py` owns ingress/store/helper logic; `native/` contains the
-  native-plugin installation sources. `reply.test.mjs` and `test_reply_bridge.py`
+- `reply_bridge.py` owns clarify ingress/store/helper logic; `plugins/desktop-clarify-telegram/` is the separate native factory-registration package. `reply.test.mjs` and `test_reply_bridge.py`
   cover bridge behavior separately from completion-notification regressions.
 
 ## Verification evidence
@@ -178,8 +182,9 @@ No Git commit or global delegation-model/config change was made.
   named-profile requests never fall back to another home.
 - Regression suite: 24 JavaScript tests and 20 Python tests passed.
 
-### Initial installation evidence
+### Phase 1 initial installation evidence (historical)
 
+This evidence describes the earlier Phase 1 direct launcher and `shell.exec` path; it is not the Phase 2 native `cli.exec` transport or activation status.
 - Desktop's actual loaded plugin called the helper through the supported
   `host.requestProfile(defaultRoute, 'shell.exec', ...)` RPC; its
   `desktop_loaded` receipt lists all 11 currently installed profiles.

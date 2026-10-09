@@ -1,22 +1,33 @@
-# 원격 소스 관리 1단계
+# Native packages and reproducible verification — Phase 2
 
-## 승인된 범위
+## Scope
 
-- 비공개 GitHub 저장소 `metamindedu/hermes-telegram-bridge`.
-- 기존 두 플러그인의 소스·테스트를 byte-for-byte 보존.
-- 운영 데이터/개인 작업 기록을 제외하고, 원본 일치·비밀정보 검사 및 실제 테스트 후 commit/push.
-- 원격 privacy와 정확한 main SHA, fresh clone을 독립적으로 확인.
+Implement and verify two native Hermes directory packages; finish the authorized development-branch Git delivery and commit-bound CI. Only task-owned fake homes may be used for install/update/rollback and temporary enablement tests. No production installation, profile/config/secrets/data write, live Gateway change or Telegram message is authorized. Independent Heavy acceptance remains required before a release claim.
 
-## 하지 않는 일
+## Package boundaries and preserved contracts
 
-- 운영 설치본 수정/이동, 설정 변경, Gateway/Desktop 재시작, Telegram 발송.
-- 공식 통합 패키지화, 경로 재설계, 자동 배포 framework, CI 전면 개선.
-- .env, 프로필 설정, 대화·수신함·알림 기록 및 로그 업로드.
+- `desktop-plugins/session-complete-telegram/` is the native package `session-complete-telegram`; its canonical Desktop entry is `desktop/plugin.js`. Its Python `__init__.py` registers only fixed CLI command `desktop-telegram-bridge`.
+- `plugins/desktop-clarify-telegram/` remains native ingress ID `desktop-clarify-telegram`; it registers only the existing Telegram factory on the existing `Application`.
+- Ingress resolves the frontend package from the same verified default home through an owner/home-validated, per-home namespaced loader. There are no global bridge aliases or broad `sys.path` edits.
+- Completion notifications and ingress are independently selectable. Ingress does not poll and disabling it does not disable the ordinary completion notification.
+- Preserve IDs `session-complete-telegram` and `desktop-clarify-telegram`, `plugin-data/session-complete-telegram`, Telegram authentication, TTL/lease/claim/no-replay behavior, and existing schemas. No data migration or automatic enable/config write is in scope.
+- Named/foreign homes fail closed. All-profile observation uses only the verified default local route for helper execution.
 
-## 완료 조건
+## Native CLI transport
 
-1. 허용한 소스가 설치본과 정확히 일치한다.
-2. 새 Git 이력에 운영 데이터·실자격증명이 없음을 검사한다.
-3. 저장소에서 관련 Node/Python 테스트를 실행하고 실제 결과를 기록한다.
-4. 비공개 원격 main과 로컬 commit/tree가 일치하고 fresh clone에서도 확인된다.
-5. 원격 관리와 운영 설치/활성화가 분리됨을 명시한다.
+- The Desktop sends fixed `argv`: `--profile default desktop-telegram-bridge --request <bounded-base64url-json>` through `cli.exec` with numeric inner and outer deadlines.
+- No renderer-provided executable, path, raw command, or environment is accepted.
+- The native handler calls the existing notifier action dispatcher; it does not implement a second action layer.
+- Results use one bounded strict frame. Startup logging may surround it; duplicate/malformed frames fail closed. Ambiguous writes are not retried and credential-bearing exception text is not returned.
+
+## Verification and CI
+
+- Preserve the existing Node completion/reply/followup and Python bridge suites; run `test_notifier` with real pinned-core SessionDB and redactor, never a stub/skip.
+- Native tests use the real Hermes install API, PluginContext, and Plugin Doctor. Only local Git transport is mocked; fresh/update/rollback operate on fake homes and assert stable IDs plus sentinel config/plugin-data preservation.
+- `requirements-test.txt` explicitly declares bridge-only test dependencies. CI uses contents-read-only permissions, verified immutable action SHAs, and public Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` with its locked dependency environment, owned by the job.
+- Windows and Ubuntu run the same source tests. This is not cross-PC Desktop GUI/materialization or production activation evidence.
+- `docs/source-manifest.json` remains the historic Phase 1 installed-source manifest; it is not regenerated as a current-file manifest.
+
+## Release / activation boundary
+
+See `docs/operations.md` for the exact two subdirectory install, pinned update and rollback commands. Production use remains separately authorized. The same pinned commands are exercised only in task-owned fake homes during this phase. Production plugin enablement, Desktop UI enablement, Gateway wiring/restart, production readback and live Telegram checks require separate approval after Heavy review.

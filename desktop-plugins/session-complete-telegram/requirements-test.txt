@@ -1,0 +1,5 @@
+# Additional dependencies required by this bridge's real Python tests.
+# Hermes core itself is installed from the immutable core commit in CI.
+markdown-it-py==4.2.0
+PyYAML==6.0.3
+python-telegram-bot==22.8

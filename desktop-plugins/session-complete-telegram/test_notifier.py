@@ -4,18 +4,18 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
+import test_support
 from hermes_state import SessionDB
 import notifier
 
 
 class NotificationTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='notify-test-', dir='C:/Users/ovpow/AppData/Local/hermes/cache/scratch')
+        self.temp = test_support.temporary_directory(prefix='notify-test-')
         self.root = Path(self.temp.name)
         self.home = self.root
         self.state = self.root / 'sender-state'

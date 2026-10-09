@@ -10,7 +10,17 @@ import sqlite3
 import time
 from pathlib import Path
 
-ROOT = Path("C:/Users/ovpow/AppData/Local/hermes")
+
+def _active_hermes_home():
+    from hermes_constants import get_hermes_home
+
+    try:
+        return Path(get_hermes_home()).expanduser().resolve(strict=True)
+    except Exception as exc:
+        raise RuntimeError("hermes_home_unavailable") from exc
+
+
+ROOT = _active_hermes_home()
 STATE = ROOT / "plugin-data" / "session-complete-telegram"
 VERSION = 1
 BINDING_TTL = 24 * 60 * 60

@@ -9,9 +9,19 @@ import subprocess
 import sys
 
 
+def _installed_home(directory):
+    parent = directory.parent
+    if parent.name not in {'plugins', 'desktop-plugins'}:
+        raise RuntimeError('Installed plugin home cannot be resolved')
+    home = parent.parent.resolve(strict=True)
+    if home.parent.name.casefold() == 'profiles':
+        raise RuntimeError('Named-profile bridge execution is refused')
+    return home
+
+
 def main():
     directory = Path(__file__).resolve().parent
-    home = directory.parents[1]
+    home = _installed_home(directory)
     repo = home / 'hermes-agent'
     # The sender intentionally uses the global notification destination.
     os.environ['HERMES_HOME'] = str(home)

@@ -102,18 +102,58 @@ export const ATTENTION_POLL_MS = 8_000
 // (terminal.read / preview.act / window.read / tour) are agent↔renderer
 // automation and must never raise "input needed".
 export const HUMAN_ASK_METHODS = new Set(['clarify', 'approval', 'sudo', 'secret', 'vault.unlock_prompt', 'vault.save_login', 'vault.code'])
-// Bootstrap with PATH Python (stdlib only), then let Hermes PM resolve the
-// committed interpreter anew on every helper call; never pin a deleted venv
-// or a hashed environment generation.
-const PYTHON = 'python'
-const SENDER = 'C:/Users/ovpow/AppData/Local/hermes/desktop-plugins/session-complete-telegram/launch.py'
 const ID = 'session-complete-telegram'
+const MAX_REQUEST_BYTES = 16 * 1024
+const MAX_RESULT_BYTES = 24 * 1024
+const RESULT_FRAME_BEGIN = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN'
+const RESULT_FRAME_END = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END'
+const HELPER_WRITE_ACTIONS = new Set([
+  'send', 'attention', 'reply_register', 'reply_poll', 'reply_settle',
+  'followup_claim', 'followup_begin_submit', 'followup_reject', 'followup_settle',
+  'loaded', 'diagnostic'
+])
+
+export class NativeHelperError extends Error {
+  constructor(message, ambiguousWrite = false) {
+    super(message)
+    this.name = 'NativeHelperError'
+    this.ambiguousWrite = ambiguousWrite
+  }
+}
 
 export function encodeRequest(value) {
   const bytes = new TextEncoder().encode(JSON.stringify(value))
+  if (bytes.byteLength > MAX_REQUEST_BYTES) throw new NativeHelperError('Helper request is too large')
   let binary = ''
   for (const byte of bytes) binary += String.fromCharCode(byte)
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_')
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
+}
+
+export function decodeResultFrame(output) {
+  if (typeof output !== 'string' || output.length > 48_000) throw new NativeHelperError('Helper response is unavailable')
+  const lines = output.split(/\r?\n/u)
+  const beginLines = lines.map((line, index) => ({line, index})).filter(x => x.line.includes(RESULT_FRAME_BEGIN))
+  const endLines = lines.map((line, index) => ({line, index})).filter(x => x.line.includes(RESULT_FRAME_END))
+  if (beginLines.length !== 1 || endLines.length !== 1 ||
+      beginLines[0].line !== RESULT_FRAME_BEGIN || endLines[0].line !== RESULT_FRAME_END ||
+      endLines[0].index !== beginLines[0].index + 2) {
+    throw new NativeHelperError('Helper response framing is invalid')
+  }
+  const encoded = lines[beginLines[0].index + 1]
+  if (!/^[A-Za-z0-9_-]+$/u.test(encoded) || encoded.length > Math.ceil(MAX_RESULT_BYTES * 4 / 3)) {
+    throw new NativeHelperError('Helper response framing is invalid')
+  }
+  try {
+    const base64 = encoded.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - encoded.length % 4) % 4)
+    const binary = atob(base64)
+    if (binary.length > MAX_RESULT_BYTES) throw new Error('oversized')
+    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0))
+    const value = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes))
+    if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.ok !== 'boolean') throw new Error('shape')
+    return value
+  } catch {
+    throw new NativeHelperError('Helper response payload is invalid')
+  }
 }
 
 export function unfinishedControl(control) {
@@ -166,13 +206,28 @@ export class CompletionMonitor {
   async helper(payload) {
     const routes = await this.refreshRoutes()
     const sender = routes.filter(r => r.mode === 'local' && r.targetProfile === 'default' && r.profile === 'default')
-    if (sender.length !== 1) throw new Error('Default local sender route unavailable')
-    // Fixed executable/script, only base64url JSON on the command line. No
-    // secrets or user-derived shell syntax. shell.exec retains its safety gate.
-    const command = `"${PYTHON}" "${SENDER}" --request ${encodeRequest(payload)}`
-    const result = await this.api.requestProfile(sender[0], 'shell.exec', { command }, 35_000)
-    if (result.code !== 0) throw new Error('Notification helper did not complete')
-    return JSON.parse(result.stdout.trim())
+    if (sender.length !== 1) throw new NativeHelperError('Default local sender route unavailable')
+    const ambiguousWrite = HELPER_WRITE_ACTIONS.has(payload.action)
+    const argv = ['--profile', 'default', 'desktop-telegram-bridge', '--request', encodeRequest(payload)]
+    let result
+    try {
+      // cli.exec's child budget is seconds; SDK's outer deadline is milliseconds.
+      result = await this.api.requestProfile(sender[0], 'cli.exec', {argv, timeout: 25}, 35_000)
+    } catch {
+      throw new NativeHelperError('Notification helper did not complete', ambiguousWrite)
+    }
+    if (result?.blocked === true) {
+      // A host block is proof the CLI never ran, so this is not an ambiguous write.
+      throw new NativeHelperError('Notification helper was blocked before launch')
+    }
+    if (!result || result.blocked !== false || result.code !== 0 || typeof result.output !== 'string') {
+      throw new NativeHelperError('Notification helper did not complete', ambiguousWrite)
+    }
+    try {
+      return decodeResultFrame(result.output)
+    } catch {
+      throw new NativeHelperError('Notification helper response could not be verified', ambiguousWrite)
+    }
   }
 
   async mounted() {
@@ -304,8 +359,12 @@ export class CompletionMonitor {
         this.invalidate(r)
         if (reply.status === 'failed' || reply.status === 'unknown') this.api.notify({kind: 'warning', title: '세션 완료 알림', message: '텔레그램 전송을 확인하지 못했습니다. 중복 방지를 위해 자동 재전송하지 않습니다.'})
       }
-    } catch {
-      if (current() && ++r.retries <= 3) this.schedule(r, 20_000)
+    } catch (error) {
+      if (current() && error instanceof NativeHelperError && error.ambiguousWrite) {
+        r.settledFinals.add(candidate.finalId)
+        this.invalidate(r)
+        this.api.notify({kind: 'warning', title: '세션 완료 알림', message: '전송 결과를 확인하지 못했습니다. 중복 방지를 위해 다시 보내지 않습니다.'})
+      } else if (current() && ++r.retries <= 3) this.schedule(r, 20_000)
       else if (current()) {
         this.invalidate(r)
         this.api.notify({kind: 'warning', title: '세션 완료 알림', message: '완료 상태를 확인하지 못해 알림을 보내지 않았습니다.'})
@@ -466,6 +525,7 @@ export class CompletionMonitor {
   async checkAsk(r, route, row) {
     if (this.stopped || r.askChecking) return
     r.askChecking = true
+    let currentAskId = null
     try {
       validateSessionRow(row)
       if (row.id !== r.sid) throw new Error('Clarify session identity changed')
@@ -478,8 +538,10 @@ export class CompletionMonitor {
       const since = await this.api.requestProfile(route, 'session.events.since', { session_id: r.sid, last_seen: r.seq })
       const open = validateOpenRequests(since)
       const ask = open.find(q => q && HUMAN_ASK_METHODS.has(q.method))
+      currentAskId = ask?.id || null
       if (ask?.method === 'clarify' && route.connectionId && ask.params?.session_id === r.sid) {
         validateReplySnapshot(since)
+        if (r.helperWriteBlockedAskId === ask.id) { r.ask = {id: ask.id}; return }
         if (r.reply && validReplySnapshot(r.reply, route, row, since)) return
         const descriptor = { owner: this.replyOwner, connectionId: route.connectionId, profile: route.profile,
           targetProfile: route.targetProfile, sid: r.sid, session_key: row.session_key,
@@ -541,8 +603,13 @@ export class CompletionMonitor {
       if (!reply?.ok && !reply?.duplicate && ['failed', 'unknown'].includes(reply?.status)) {
         this.api.notify({ kind: 'warning', title: '입력 대기 알림', message: '텔레그램 전송을 확인하지 못했습니다. 중복 방지를 위해 자동 재전송하지 않습니다.' })
       }
-    } catch {
-      // Transport hiccup: the next sweep retries while the question is open.
+    } catch (error) {
+      if (currentAskId && error instanceof NativeHelperError && error.ambiguousWrite) {
+        r.helperWriteBlockedAskId = currentAskId
+        r.ask = {id: currentAskId}
+        this.api.notify({kind: 'warning', title: '입력 대기 알림', message: '결과를 확인하지 못했습니다. 중복 방지를 위해 다시 시도하지 않습니다.'})
+      }
+      // A transport failure before a native write is retried on the next sweep.
     } finally {
       r.askChecking = false
     }

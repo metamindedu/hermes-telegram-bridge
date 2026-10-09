@@ -1,11 +1,12 @@
-import asyncio, copy, json, tempfile, time, unittest
+import asyncio, copy, json, time, unittest
 from pathlib import Path
 from unittest.mock import patch
+import test_support
 import followup_bridge as b
 
 class FollowupTests(unittest.TestCase):
  def setUp(self):
-  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.state=Path(self.tmp.name);self.now=time.time()
+  self.tmp=test_support.temporary_directory(prefix='followup-test-');self.addCleanup(self.tmp.cleanup);self.state=Path(self.tmp.name);self.now=time.time()
   b.bind_receiver(77,99,None,'boot',private_verified=True,state=self.state,now=self.now)
   b.heartbeat_owner('owner',state=self.state,now=self.now)
   self.d=dict(owner='owner',connectionId='local',profile='default',targetProfile='default',sid='sid',session_key='durable',epoch='epoch',started_at='100',final_row_id=42)

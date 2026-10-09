@@ -1,30 +1,79 @@
-# 개발·설치 반영·복구 경계
+# Phase 2 source verification, native install, and activation boundary
 
-## 소스와 운영 상태의 분리
+## Ownership and current state
 
-저장소는 코드의 개발 원본이다. 운영 설치본과 상태 DB는 Git 밖에 둔다. 수신함, 알림/전송 dedup ledger, 영구 send claims, 메시지 tombstones를 코드에 묶어 복사하거나 초기화하지 않는다. 과거 카드의 terminal 상태를 복구 명목으로 되살리지 않는다.
+The repository is the source of truth. The official native packages are the two existing directories installed from the same immutable Git commit:
 
-## 검증
+- `metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram` → package/ID `session-complete-telegram`.
+- `metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram` → package/ID `desktop-clarify-telegram`.
 
-- Node: `node --check plugin.js`와 모든 포함된 `.test.mjs`.
-- Python: `test_reply_bridge`, `test_followup_bridge`; 실제 PTB dispatch도 mock 네트워크로 확인.
-- `test_notifier`는 해당 Hermes core/PM 환경을 명시한 별도 검증이다. 기존 bootstrap 오류는 독립적으로 보고한다.
-- 실행 결과, 의미 검수, 파일 반영, 런타임 활성화 및 live-user 왕복은 별개다.
+Hermes resolves `owner/repo/subdir` through its native installer. The first package includes both the Python CLI registration and `desktop/plugin.js`; the Desktop shell materializes that JS half by its existing package mechanism. The second package registers one factory on the existing Telegram `Application`. The Gateway remains the only Telegram update/polling owner.
 
-## 승인된 운영 반영
+Phase 2 authorizes source/tests/docs/CI, isolated fake-home installation checks and development-branch commit/push/PR delivery. It does not authorize production installation/config/credentials/data changes, Gateway/Desktop activation or live Telegram sends. Independent Heavy review, exact remote SHA, CI and actual private pinned install must be verified before completion; task-owned fixture writes are not production activation.
 
-1. 설치 후보 commit을 확정하고 관련 테스트와 필요한 독립 검수를 마친다.
-2. 운영 설치 파일과 비교해 관련 없는 변경을 덮어쓰지 않는다.
-3. 두 구성 요소를 서로 맞는 후보로 반영하고 정확한 파일 hash를 확인한다. Git pull/push만으로 자동 반영하지 않는다.
-4. Desktop의 지원되는 hot reload/loaded receipt를 확인한다.
-5. 상주 Gateway Python 변경은 명시적으로 승인받아 재시작한다. 공유 served-profile 범위, active work, 열린 질문 카드부터 확인한다. 재시작은 receiver boot를 바꾸므로 열린 카드가 종료될 수 있다.
-6. 새 PID의 live status, 기존 adapter 재연결, 수신기 heartbeat와 설치 hash를 읽어 확인한다. CLI exit 0만으로 완료를 주장하지 않는다.
-7. 실제 Telegram 답변 왕복이나 장기 soak를 실행하지 않았다면 그 한계를 명시한다.
+## Required pre-install candidate checks (future separately authorized release)
 
-## 복구
+1. Pin both subdirectory installs to the same reviewed 40-character commit SHA. Verify the SHA exists on the intended repository/ref before invoking Hermes.
+2. Preserve the exact package IDs and global state root `plugin-data/session-complete-telegram`. Do not copy or reset its SQLite files; there is no schema/data migration.
+3. Run the pinned-core CI commands and native Plugin Doctor on both package directories. Install/Doctor tests use isolated fake homes; their local Git transport mock is not evidence that the private remote install has run.
+4. Confirm install commands leave `plugins.enabled` unchanged. The frontend/CLI, ingress and Desktop renderer have independent enablement surfaces; do not infer one from another.
 
-Git의 정확한 이전 commit에서 코드만 되돌린다. 상태 DB·자격증명은 변경하지 않는다. 이전 버전과 현재 스키마가 호환되는지 먼저 확인하고, 필요한 재시작은 별도로 승인받는다. 일반 코드 변경에 중복 ad-hoc 백업을 만들지 않는다.
+## Exact install, update, and rollback commands
 
-## 최초 원격 등록의 검증 범위
+Replace each variable with a previously verified full SHA. These commands are documented only and were **not executed** in this task.
 
-초기 질문 카드 수정은 관련 브리지 Python 68개와 Node 95개 테스트를 통과했고 독립 검수에서 남은 관련 Critical/High/Medium이 모두 닫혔다. 소스 manifest는 그 설치 기준점을 기록한다. 개인 대화·작업 UUID·PID별 로그는 저장소에 넣지 않는다. 최초 원격 등록이 새 배포나 다른 PC 설치 검증을 의미하지 않는다.
+Fresh install into the default/global home without enabling either agent plugin:
+
+```bash
+CANDIDATE_SHA=<verified-40-character-commit-sha>
+hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
+hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
+```
+
+Update both existing package directories to one new candidate while preserving their enablement selection:
+
+```bash
+NEW_SHA=<verified-new-40-character-commit-sha>
+hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$NEW_SHA" --force --no-enable --yes-deps
+hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$NEW_SHA" --force --no-enable --yes-deps
+```
+
+Rollback both packages to the previously reviewed commit through the same native installer transaction:
+
+```bash
+PREVIOUS_SHA=<verified-previous-40-character-commit-sha>
+hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$PREVIOUS_SHA" --force --no-enable --yes-deps
+hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$PREVIOUS_SHA" --force --no-enable --yes-deps
+```
+
+Package-owned Python dependencies are declared explicitly in plugin.yaml (markdown-it-py, PyYAML and python-telegram-bot for the completion package; python-telegram-bot for ingress). Hermes PM owns installation and dependency consent; --yes-deps is explicit consent for the reviewed declarations, not permission for another candidate. --no-enable --yes-deps preserves selection instead of activating the packages. Do not use --no-deps or disabled dependency checks for an actual production rollout.
+
+After a separately approved install, native verification uses the normal Doctor contract:
+
+```bash
+hermes --profile default plugins doctor session-complete-telegram --ci
+hermes --profile default plugins doctor desktop-clarify-telegram --ci
+```
+
+## Separate activation gate (not performed)
+
+### Existing manual Desktop entry migration
+
+The native reconciler will not overwrite an existing marker-less `desktop-plugins/session-complete-telegram/plugin.js` when it differs from the new native package entry. A successful Python package install therefore does NOT prove the running Desktop half was upgraded.
+
+For a separately approved transition from Phase 1: first install the two matching candidates and verify the fixed native CLI registration/enablement; compare and preserve any unrelated operator edits in the old Desktop folder. Then align ONLY its `plugin.js` with the reviewed native package's `desktop/plugin.js` and read back byte equality. The supported reconciler can adopt that identical entry and write its own marker, preserving other files. Do not forge the marker, delete the whole legacy folder or copy/reset plugin-data. Verify the actual loaded entry and Desktop toggle before any approved Gateway handler restart. First-phase code restoration uses its Git snapshot and the legacy layout, NOT the two-package installer commands; native package rollback is only to another previously verified packaged commit.
+
+This migration is tested only with synthetic entries in a task-owned fake app root using the actual pinned-core reconciler. It has not been applied to the current Desktop instance.
+
+Installing a package is not activation. Python command registration/ingress enablement, Desktop renderer enablement, Desktop hot reload, and Gateway handler loading are distinct. Any production enablement or restart needs a separate approval and readback. Ingress disablement must leave the completion package and ordinary Desktop completion notifications independently enabled. No plugin-enable, profile/config write, Desktop hot reload, Gateway restart, or live Telegram round trip was done here.
+
+## Verification
+
+- Node: `node --check desktop/plugin.js` and `node --test plugin.test.mjs reply.test.mjs followup.test.mjs materialization.test.mjs`.
+- Python: `python -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install -v`; this runs every `test_notifier` case with the real pinned Hermes `SessionDB` and redactor, plus the existing reply/followup bridge suites and native install fixtures.
+- CI: `.github/workflows/tests.yml` runs those exact suites on Windows and Ubuntu, with `contents: read`, pinned action SHAs, Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b`, and the core `uv.lock` inside a job-owned environment. It does not deploy, restart, upload secrets, or claim GUI verification on another PC.
+- Fake-home native install tests use only a mock for Git transport. They exercise Hermes' actual install/publication/manifest/Doctor/context contracts and verify sentinels/IDs across fresh install, update and rollback. No live Telegram calls occur.
+
+## State and rollback
+
+The only rollback target is the exact previously reviewed package commit, installed through the same native Hermes command. Existing `plugin-data/session-complete-telegram` and configuration are retained; no database copy, reset, migration or ad-hoc backup is part of this phase. `docs/source-manifest.json` remains an explicitly historical Phase 1 snapshot.
