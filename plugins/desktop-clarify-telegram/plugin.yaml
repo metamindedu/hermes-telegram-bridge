@@ -1,5 +1,6 @@
 name: desktop-clarify-telegram
 version: '1.5.0'
+requires_hermes: '>=0.21.5'
 description: Reply to Desktop clarify questions and completion notices through the existing Telegram gateway.
 python_dependencies:
   - python-telegram-bot==22.8

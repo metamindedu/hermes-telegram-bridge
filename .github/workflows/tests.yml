@@ -87,4 +87,4 @@ jobs:
           else
             CORE_PY="$GITHUB_WORKSPACE/hermes-agent/.venv/bin/python"
           fi
-          "$CORE_PY" -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install -v
+          "$CORE_PY" -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install test_registration -v
