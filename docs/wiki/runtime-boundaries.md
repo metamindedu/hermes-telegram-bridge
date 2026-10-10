@@ -22,4 +22,6 @@ Version 1.6.1 uses the versioned `desktop-command-approval-v2` capability for th
 
 Code rollback and state rollback remain different. The shared `plugin-data/session-complete-telegram` directory, notification ledger, reply inbox, followup inbox, tombstones and credentials are never copied/reset by native package install/update/rollback. No state schema change or migration is introduced.
 
+Catalog snapshot immutability and publication status must remain separate: keep both package entries pinned to the exact reviewed source, and publish later availability/PR-status documentation on the default branch without moving that package pin or its release tag. Public source and anonymous direct install do not imply human-maintainer catalog admission, search visibility or live Gateway activation. See [[../catalog-submission|catalog submissions]] and [[../public-install|public installation]].
+
 Knowledge rules follow [[SCHEMA]], and navigation is maintained in [[index]].

@@ -25,13 +25,15 @@ The current messages and question cards are primarily Korean; this release does 
 
 The minimum tested/declared Hermes compatibility floor is **0.21.5**. Reproducible CI uses the exact immutable Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` and that checkout's `uv.lock`; a SemVer floor alone does not prove compatibility with every core generation. CI tests Windows and Ubuntu with Python 3.14 and Node 24. Physical macOS and a separate user's Hermes Desktop GUI have not been verified by those tests.
 
-The plugin package code in this candidate reports version `1.6.1`. Public repository publication, a final release SHA, and maintainer-merged catalog entries are pending. Until those are published, the install and catalog documents are templates: do not use their pending SHA placeholders or assume the names are already discoverable in Hermes.
+Version **1.6.1** is publicly released under MIT at the reviewed package pin **`1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca`** ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.6.1)). Anonymous direct installation of both packages, source-byte equality, Doctor and CLI checks passed. The immutable code snapshot retains its preparation-status documentation; use this default branch's guide for current publication status.
+
+Official catalog registration is **submitted, not yet admitted**: [Desktop package PR #135956](https://github.com/NousResearch/hermes-agent/pull/135956) and [ingress companion PR #135957](https://github.com/NousResearch/hermes-agent/pull/135957). Maintainer review/merge and actual discovery are still required; do not assume `hermes plugins search` already lists these names.
 
 ## Install
 
 Read [Public installation and setup](docs/public-install.md). Both packages must be installed from their own subdirectories at the same reviewed full commit SHA; the repository root is not itself a plugin package. Configure your own Telegram bot and private home in the **default** Hermes home using Hermes's [official Telegram setup](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/telegram). Never use or request an author's token.
 
-Catalog listing is a separate maintainer-reviewed process. The two community-entry templates and submission checklist are in [Catalog submission](docs/catalog-submission.md).
+Catalog listing is a separate maintainer-reviewed process. The two submitted community entries and admission checklist are in [Catalog submission](docs/catalog-submission.md).
 
 ## Maintainer references
 

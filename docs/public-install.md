@@ -1,6 +1,6 @@
 # Public installation and setup
 
-This guide describes the two existing Hermes native packages. The repository owner will publish the public repository snapshot and release after review. The final 40-character commit SHA and catalog merge are not yet available in this documentation snapshot; replace the clearly marked SHA placeholder only with the exact, independently verified public release commit. Do not install from a branch, tag, short SHA, or guessed value.
+The MIT public release **1.6.1** is available at exact reviewed package commit **`1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca`**. Both package subdirectories were installed anonymously from GitHub with stored credentials/helpers disabled, verified byte-identical, and passed Doctor and CLI checks in an isolated home. Official catalog submissions [#135956](https://github.com/NousResearch/hermes-agent/pull/135956) and [#135957](https://github.com/NousResearch/hermes-agent/pull/135957) are open; maintainer admission/search visibility is not yet claimed. Install directly with the full pin below, not a moving branch, tag or short SHA.
 
 ## Before installing
 
@@ -17,7 +17,7 @@ Hermes's official setup guide is the source of truth for creating/configuring a 
 Each package lives in a different subdirectory; the root has no `plugin.yaml` and must not be installed as one package. Use one matching, verified full SHA for both commands:
 
 ```bash
-CANDIDATE_SHA=<verified-full-40-character-release-commit-sha>
+CANDIDATE_SHA=1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca
 
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps

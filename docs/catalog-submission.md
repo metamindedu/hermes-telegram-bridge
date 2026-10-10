@@ -1,20 +1,26 @@
-# Hermes plugin catalog submission templates
+# Hermes plugin catalog submissions
 
-This file records two **community** catalog-entry templates for the two distinct native packages in this repository. It does not create catalog entries or make either package discoverable. Each package must be admitted through a human-reviewed PR to the official Hermes catalog, and a maintainer must merge that PR. The repository owner will submit only after the public release snapshot is finalized and both packages validate at that exact commit.
+The two **community** entries were submitted separately, one catalog file per PR, to the official Hermes repository:
+- [#135956 — session-complete-telegram](https://github.com/NousResearch/hermes-agent/pull/135956)
+- [#135957 — desktop-clarify-telegram](https://github.com/NousResearch/hermes-agent/pull/135957)
+
+Both submissions are open and pin the publicly released MIT code `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` / version `1.6.1`. Submission is not admission: human maintainer review/merge and real discovery/install checks remain required. Direct pinned installation is already verified without GitHub credentials.
+
+The two open PRs' GitHub Actions currently report `action_required`: a repository maintainer must approve those fork workflows before CI can execute. No passing upstream catalog CI or maintainer admission is claimed.
 
 The official admission sources read for this preparation are the current [`plugin-catalog/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/README.md) and the [catalog submission guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission). A catalog entry is a trust signal only after maintainer review and merge; a template, direct Git install, or successful local test is not catalog admission or Nous endorsement.
 
 ## Required release pin
 
-Use the **same exact 40-character SHA** in both entries, and ensure it is the published commit containing the code and version shown below. The final release SHA is intentionally unknown here. The value `PENDING` is a visible placeholder, not an installable pin. Do not substitute the isolated baseline SHA, a branch, a tag, a short SHA, or a SHA guessed before the final release exists. The version `1.6.1` below is read from both package manifests and the Desktop entry in this candidate; update it only if the final pinned code reports a different version.
+Both entries pin **`1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca`**, the immutable public v1.6.1 package source, rather than the moving default branch or the release tag. The current main branch may contain publication-status documentation updates without changing this reviewed package pin. Future releases need a new reviewed full SHA and maintainer SHA-bump PR.
 
 ## Entry 1 — Desktop component and fixed CLI helper
 
 ```yaml
-# TEMPLATE ONLY — replace sha with the exact final release SHA before submission.
+# Submitted immutable pin; companion entry uses the same SHA.
 name: session-complete-telegram
 repo: https://github.com/metamindedu/hermes-telegram-bridge
-sha: "PENDING: exact 40-character release SHA"
+sha: "1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca"
 subdir: desktop-plugins/session-complete-telegram
 description: Sends settled Hermes Desktop completion and input-needed notices through the user's configured Telegram home.
 maintainer: NewMetaW
@@ -34,10 +40,10 @@ At this pinned code the package's `register(ctx)` registers one fixed CLI comman
 ## Entry 2 — Optional existing-Gateway ingress
 
 ```yaml
-# TEMPLATE ONLY — replace sha with the exact same final release SHA as entry 1.
+# Submitted immutable pin; Desktop entry uses the same SHA.
 name: desktop-clarify-telegram
 repo: https://github.com/metamindedu/hermes-telegram-bridge
-sha: "PENDING: exact 40-character release SHA"
+sha: "1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca"
 subdir: plugins/desktop-clarify-telegram
 description: Adds opt-in, narrowly scoped clarify-card and completion-reply handlers to the existing Telegram Gateway.
 maintainer: NewMetaW
@@ -61,7 +67,7 @@ hermes plugins validate /path/to/checkout/desktop-plugins/session-complete-teleg
 hermes plugins validate /path/to/checkout/plugins/desktop-clarify-telegram --install-deps
 ```
 
-Review every scanner warning, verify the declared version and capability arrays against the pinned source, and do not bypass a dangerous finding. Any final catalog YAML must use the real full SHA and values accepted by the current official validator; these documentation templates are deliberately not validator-ready.
+Review every scanner warning, verify the declared version and capability arrays against the pinned source, and do not bypass a dangerous finding. The submitted YAML files parse with the current official loader and both direct admission API reports passed without warnings. Public native installations exercised declared dependency consent and passed. An additional cold, strict-lazy-disabled fixture could not finish the CLI `--install-deps` preparation; explicit native PM preparation resolved the two candidates, but a later single-candidate implicit rebuild was refused by that fixture policy. Those failures are retained and are not counted as a successful complete CLI admission run. Official catalog CI and maintainer acceptance remain separate, pending gates.
 
 ## Disclosure for the maintainer PR
 
@@ -81,4 +87,4 @@ Because credentials are read from the user's existing default-home setup rather 
 
 The two catalog entries are distinct IDs and must each point at their own `subdir`; `owner/repo` at the repository root is not an installable plugin package because there is no root `plugin.yaml`. Both entries are `community` listings and must use the same exact release SHA. The official catalog's human-merged review and scanner are separate from publication of the source repository. After a maintainer accepts a listing, catalog updates still require a reviewed SHA-bump PR; the packages do not self-update.
 
-Do not create a catalog file, open a PR, change repository visibility, or claim a listing from this worktree. Those publication and admission steps are owned by the parent maintainer after final integration and verification.
+The parent maintainer performed repository publication, anonymous pinned installation and both entry submissions after final integration and verification. Those are distinct from maintainer admission, catalog search visibility and production installation/activation; none of the latter is implied by the public source or an open PR.

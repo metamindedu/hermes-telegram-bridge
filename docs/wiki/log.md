@@ -30,4 +30,9 @@
 - Bumped the matching renderer/helper/ingress handshake to 1.6.1 and `desktop-command-approval-v2` so mixed old/new packages do not grant the pre-dispatch gate.
 - Added a read-only last claim-validity check after the final snapshot; it does not renew/reclaim or provide atomic fingerprint CAS.
 - Recorded exact complete native JSON budgeting, all-row observation before one claim, command-free unsafe-review notices, and rejection of edited PTB callback messages.
-- No schema migration, production activation, live Telegram call, or source publication was performed.
+- No schema migration, production activation, live Telegram call, or source publication was performed in that correction step.
+
+## 2026-10-10 update | Public pin versus publication status
+
+- Recorded the durable distinction between immutable package/catalog source pins and later default-branch publication-status documentation.
+- Public MIT source and anonymous pinned installation were verified separately from upstream fork-workflow approval, maintainer admission, discoverability and production activation. See `../catalog-submission.md` for the actual submission record; this wiki is not runtime evidence.
