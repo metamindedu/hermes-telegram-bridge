@@ -2,7 +2,7 @@
 
 ## Release status
 
-The historical public MIT release **1.6.1** is pinned at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` and used two packages. **1.7.0 is an unreleased candidate**: no candidate SHA, CI result, catalog merge/admission, or production activation is claimed. Do not run the placeholder command until a reviewed full SHA has actually been published.
+Public MIT **1.7.0** is one installable package pinned at `13c08c022965a589e87fe7198ab1a93201539d7e` ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.7.0)). Independent source review, Python182/Node127, exact Windows/Ubuntu CI and anonymous native one-package installation passed. Catalog PR #135956 awaits maintainer admission/merge; the obsolete companion PR #135957 is closed. Direct pinned installation is available before catalog search. Historical **1.6.1** remains at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` and used two packages. Production activation/live Telegram round trip are separate.
 
 The candidate keeps the stable native ID `session-complete-telegram`, Desktop ID, fixed CLI command `desktop-telegram-bridge`, and `plugin-data/session-complete-telegram` state root. Hermes compatibility remains declared as `>=0.21.5`; this floor does not guarantee compatibility with every newer core. The reproducible test contract is Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` with its locked environment.
 
@@ -15,10 +15,10 @@ The candidate keeps the stable native ID `session-complete-telegram`, Desktop ID
 
 ## Install one package
 
-There is **one** candidate install command. Replace the variable only with a reviewed, published 40-character release SHA; the current unreleased candidate has no such SHA.
+There is **one** install command. Keep the full immutable release SHA:
 
 ```bash
-CANDIDATE_SHA=<reviewed-published-40-character-sha>
+CANDIDATE_SHA=13c08c022965a589e87fe7198ab1a93201539d7e
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
 ```
 

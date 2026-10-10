@@ -26,13 +26,13 @@ The current messages and question cards are primarily Korean; this release does 
 
 The minimum tested/declared Hermes compatibility floor is **0.21.5**. Reproducible CI uses the exact immutable Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` and that checkout's `uv.lock`; a SemVer floor alone does not prove compatibility with every core generation. CI tests Windows and Ubuntu with Python 3.14 and Node 24. Physical macOS and a separate user's Hermes Desktop GUI have not been verified by those tests.
 
-Version **1.6.1** is the historical public MIT release at the reviewed pin **`1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca`** ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.6.1)); it used two packages. Version **1.7.0 is an unreleased candidate** and has no published SHA, CI result, catalog admission, or production approval claimed here.
+Version **1.7.0** is the public MIT **one-package** release at **`13c08c022965a589e87fe7198ab1a93201539d7e`** ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.7.0)). Independent source review is GO C0/H0/M0/L0 under the documented SDK boundary; Python182/Node127, exact-SHA Windows/Ubuntu CI and anonymous one-package install/Doctor/native CLI passed. Historical **1.6.1** remains pinned at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` and used two packages. Documentation at the immutable package pin retains its pre-publication status; current availability is recorded here.
 
-The v1.6.1 catalog submissions are historical and not evidence for v1.7.0 admission. Parent-owned catalog/PR updates remain pending Heavy review and a separately approved public release; do not assume either name is currently discoverable through `hermes plugins search`.
+The owner updated [catalog PR #135956](https://github.com/NousResearch/hermes-agent/pull/135956) to this single release pin and withdrew companion [#135957](https://github.com/NousResearch/hermes-agent/pull/135957). Maintainer approval/merge and official search visibility remain pending; direct installation is available now. Public release is not proof of production activation or a live Telegram round trip.
 
 ## Install
 
-Read [Public installation and setup](docs/public-install.md). The candidate uses one install command from the existing `desktop-plugins/session-complete-telegram` subdirectory, pinned to a reviewed full SHA after release. Configure your own Telegram bot and private home in the **default** Hermes home using Hermes's [official Telegram setup](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/telegram). Never use or request an author's token.
+Read [Public installation and setup](docs/public-install.md). Install one package from `desktop-plugins/session-complete-telegram`, pinned to the reviewed release SHA. Configure your own Telegram bot and private home in the **default** Hermes home using Hermes's [official Telegram setup](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/telegram). Never use or request an author's token.
 
 See [Catalog submission](docs/catalog-submission.md) for the historical v1.6.1 record and release boundary.
 

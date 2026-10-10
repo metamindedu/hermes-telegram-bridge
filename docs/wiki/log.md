@@ -49,3 +49,9 @@
 - User chose one package with existing public APIs, without SDK development. Keep bridge authorization fail-closed, but do not promise to stop ordinary Telegram input when the host cannot install its guard.
 - Keep initialization-failure behavior as an executed native dispatcher/PTB characterization test that also verifies no bridge readiness or approval authority. Preserve earlier failed tests and candidate NO-GO results; the accepted scope changed, not historical evidence.
 - Document the limitation and Desktop/normal-Gateway recovery path in public setup/security guidance; retain owner/consent/queue/no-replay and user-state preservation requirements.
+
+## 2026-10-10 update | Single-package public release and catalog consolidation
+
+- Public MITv1.7.0 tag/release pins13c08c022965a589e87fe7198ab1a93201539d7e, with source GO C0/H0/M0/L0,182Python/127Node, exactWindows/Ubuntu CI and anonymous single-package native installation. Later publication-status docs are separate from that immutable source.
+- Owner updated #135956 to the single1.7.0 entry and closed obsolete companion #135957 without merge. Upstream maintainer admission/search and production activation remain distinct pending gates; public release does not imply either.
+- Retain the documented SDK initialization limit and earlier failed-candidate evidence. No SDK development or automatic config/auth/DB migration is part of this release.
