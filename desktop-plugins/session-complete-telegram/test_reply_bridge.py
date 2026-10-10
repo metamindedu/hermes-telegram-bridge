@@ -557,10 +557,13 @@ class BridgeTests(unittest.TestCase):
         async def scenario():
             import notifier
             from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, MessageHandler
-            handlers=[]
-            add=lambda h,group:handlers.append((group,h))
-            remove=lambda h,group:handlers.remove((group,h)) if (group,h) in handlers else None
-            app=SimpleNamespace(bot_data={},bot=SimpleNamespace(token='77:test'),running=False,
+            handlers=[]; registry={}
+            def add(h,group):
+                handlers.append((group,h)); registry.setdefault(group,[]).append(h)
+            def remove(h,group):
+                if (group,h) in handlers:handlers.remove((group,h))
+                if h in registry.get(group,[]):registry[group].remove(h)
+            app=SimpleNamespace(bot_data={},handlers=registry,bot=SimpleNamespace(token='77:test'),running=False,
                                 add_handler=add,remove_handler=remove)
             tasks=set(asyncio.all_tasks())
             lookup=b.lookup_reply;intake=b.intake

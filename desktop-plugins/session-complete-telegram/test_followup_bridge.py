@@ -114,7 +114,11 @@ class FollowupTests(unittest.TestCase):
   from types import SimpleNamespace
   async def run():
    ticks=[];probes=[];attempts=[];wired=[];clock=[0];real_sleep=asyncio.sleep
-   app=SimpleNamespace(running=True,bot=SimpleNamespace(token='77:test'),add_handler=lambda *a,**kw:None)
+   registry={}
+   def add_handler(handler,group=0):registry.setdefault(group,[]).append(handler)
+   def remove_handler(handler,group=0):
+    if handler in registry.get(group,[]):registry[group].remove(handler)
+   app=SimpleNamespace(running=True,bot_data={},handlers=registry,bot=SimpleNamespace(token='77:test'),add_handler=add_handler,remove_handler=remove_handler)
    def api(token,method,payload):
     probes.append(method)
     return {'ok':len(probes)>1,'result':{'id':99,'type':'private'}}

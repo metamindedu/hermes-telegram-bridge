@@ -742,12 +742,29 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         try:
             application.add_handler(quarantine, group=_QUARANTINE_GROUP)
         except Exception:
-            try:
-                application.remove_handler(quarantine, group=_QUARANTINE_GROUP)
-            except Exception:
-                logger.warning("Telegram gateway quarantine cleanup failed")
+            # The native TelegramApplication can raise AFTER super.add_handler.
+            # Read the exact local registration before deciding whether it failed;
+            # never remove a working reject-only boundary on an ambiguous return.
+            installed = any(item is quarantine for item in
+                            getattr(application, "handlers", {}).get(_QUARANTINE_GROUP, ()))
+            if not installed:
+                # A bounded local retry repairs a pre-registration transient
+                # before the host seals this factory key. This is not an intake,
+                # message resend, or a replay of an ambiguous external action.
+                try:
+                    application.add_handler(quarantine, group=_QUARANTINE_GROUP)
+                except Exception:
+                    pass
+                installed = any(item is quarantine for item in
+                                getattr(application, "handlers", {}).get(_QUARANTINE_GROUP, ()))
+            if not installed:
+                wiring["quarantine_handler"] = None
+                logger.error("Telegram gateway quarantine unavailable; interactions refused")
+                return False
+        if not any(item is quarantine for item in
+                   getattr(application, "handlers", {}).get(_QUARANTINE_GROUP, ())):
             wiring["quarantine_handler"] = None
-            logger.warning("Telegram gateway quarantine install failed")
+            logger.error("Telegram gateway quarantine registration unverified")
             return False
     if untracked_marker or _has_untracked_owned_handlers(application, wiring):
         wiring["untracked_existing"] = True
@@ -863,8 +880,13 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
                 await msg.reply_text('Desktop 연결을 확인한 뒤 다시 답장해 주세요.' if result.get('reason')=='lease_stale' else '이미 답했거나 만료된 질문입니다. Desktop에서 확인해 주세요.')
             await asyncio.to_thread(flush,notifier)
         except Exception:
-            if msg is not None:await msg.reply_text('답변을 반영하지 못했습니다. Desktop에서 확인해 주세요.')
-        raise ApplicationHandlerStop
+            if msg is not None:
+                try:
+                    await msg.reply_text('답변을 반영하지 못했습니다. Desktop에서 확인해 주세요.')
+                except Exception:
+                    pass  # Advice is best-effort, known-card consumption is not.
+        finally:
+            raise ApplicationHandlerStop
 
     try:
         if approval is not None:

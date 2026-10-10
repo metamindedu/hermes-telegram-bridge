@@ -108,6 +108,27 @@ def migration_required(*, root: str | Path) -> bool:
     return bool(state.get("structural_valid") and state.get("migration_required"))
 
 
+def _managed_policy_healthy() -> bool:
+    """Distinguish absent policy from an existing policy the core ignores on error."""
+    try:
+        from hermes_cli.managed_scope import get_managed_dir
+        directory = get_managed_dir()
+        if directory is None:
+            return True
+        path = Path(directory) / "config.yaml"
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return True
+        # Other stat/read/decode/parse failures must not restore raw consent.
+        import yaml
+        text = path.read_text(encoding="utf-8-sig")
+        policy = yaml.load(text, Loader=_unique_loader())
+        return isinstance(policy, dict) or (policy is None and not text.strip())
+    except Exception:
+        return False
+
+
 def _native_effective_config(root: str | Path) -> tuple[dict[str, Any] | None, str]:
     """Read Hermes' effective config for the exact already-active native home.
 
@@ -120,8 +141,12 @@ def _native_effective_config(root: str | Path) -> tuple[dict[str, Any] | None, s
         expected_home = Path(root).expanduser().resolve(strict=True)
         if active_home != expected_home:
             return None, "native_plugin_home_mismatch"
+        if not _managed_policy_healthy():
+            return None, "native_plugin_config_invalid"
         from hermes_cli.config import load_config_readonly
         effective = load_config_readonly()
+        if not _managed_policy_healthy():
+            return None, "native_plugin_config_invalid"
         if not isinstance(effective, dict) or getattr(effective, "read_error", None) is not None:
             return None, "native_plugin_config_invalid"
         plugins = effective.get("plugins", {})

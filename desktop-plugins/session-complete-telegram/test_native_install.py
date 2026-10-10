@@ -937,6 +937,28 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             try:after_row=dict(after_gate.execute('SELECT * FROM approvals WHERE id=?',(claim['id'],)).fetchone())
             finally:after_gate.close()
             self.assertEqual(after_row,before_row,'registered native read gate must not mutate claim state')
+            # A REAL valid applying claim must stop when the managed policy
+            # becomes unreadable/malformed; raw true cannot restore authority.
+            managed = self.root / 'managed applying-claim policy'
+            managed.mkdir()
+            policy = managed / 'config.yaml'
+            with patch.dict(os.environ, {'HERMES_MANAGED_DIR': str(managed)}):
+                for text in ('plugins: [', '- non-mapping policy',
+                             'plugins:\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: false\n'):
+                    policy.write_text(text, encoding='utf-8')
+                    stopped, _ = self._call_native(handler, parser, {
+                        'action': 'approval_claim_valid', 'capability': bridge.CAPABILITY,
+                        'owner': owner, 'id': claim['id'], 'claim': claim['claim'],
+                        'descriptor': claim['descriptor'], 'authority': authority,
+                        'deadline': claim['deadline']})
+                    self.assertIs(stopped.get('valid'), False, stopped)
+                policy.write_text('{}\n', encoding='utf-8')
+                restored, _ = self._call_native(handler, parser, {
+                    'action': 'approval_claim_valid', 'capability': bridge.CAPABILITY,
+                    'owner': owner, 'id': claim['id'], 'claim': claim['claim'],
+                    'descriptor': claim['descriptor'], 'authority': authority,
+                    'deadline': claim['deadline']})
+                self.assertIs(restored.get('valid'), True, restored)
             for label,changes in (
                 ('owner',{'owner':'other-native-owner'}),('claim',{'claim':'0'*32}),
                 ('authority',{'authority':'0'*64})):
