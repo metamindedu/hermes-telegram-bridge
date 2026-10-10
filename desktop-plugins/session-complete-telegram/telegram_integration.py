@@ -108,20 +108,85 @@ def migration_required(*, root: str | Path) -> bool:
     return bool(state.get("structural_valid") and state.get("migration_required"))
 
 
+def _native_effective_config(root: str | Path) -> tuple[dict[str, Any] | None, str]:
+    """Read Hermes' effective config for the exact already-active native home.
+
+    ``load_config_readonly`` applies defaults, environment expansion and the managed
+    overlay. It returns a shared cached object; this function only reads it.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        active_home = Path(get_hermes_home()).expanduser().resolve(strict=True)
+        expected_home = Path(root).expanduser().resolve(strict=True)
+        if active_home != expected_home:
+            return None, "native_plugin_home_mismatch"
+        from hermes_cli.config import load_config_readonly
+        effective = load_config_readonly()
+        if not isinstance(effective, dict) or getattr(effective, "read_error", None) is not None:
+            return None, "native_plugin_config_invalid"
+        plugins = effective.get("plugins", {})
+        if not isinstance(plugins, dict):
+            return None, "native_plugin_config_invalid"
+        enabled = plugins.get("enabled", [])
+        disabled = plugins.get("disabled", [])
+        if (type(enabled) is not list or any(type(value) is not str for value in enabled) or
+                type(disabled) is not list or any(type(value) is not str for value in disabled)):
+            return None, "native_plugin_config_invalid"
+        entries = plugins.get("entries", {})
+        settings_valid = isinstance(entries, dict)
+        entry = entries.get(PLUGIN_ID, {}) if settings_valid else {}
+        settings_valid = settings_valid and isinstance(entry, dict)
+        settings = entry.get("settings", {}) if settings_valid else {}
+        legacy_config = entry.get("config") if settings_valid else None
+        settings_valid = (settings_valid and isinstance(settings, dict) and
+                          set(settings).issubset(FEATURES) and
+                          all(type(settings.get(name, False)) is bool for name in FEATURES) and
+                          not (isinstance(legacy_config, dict) and bool(set(legacy_config) & FEATURES)) and
+                          (legacy_config is None or isinstance(legacy_config, dict)))
+        if not isinstance(settings, dict):
+            settings = {}
+        return {
+            "active": set(enabled) - set(disabled),
+            "settings_valid": bool(settings_valid),
+            "settings": {name: settings.get(name, False) for name in FEATURES},
+        }, "ready"
+    except Exception:
+        return None, "native_plugin_config_invalid"
+
+
+def _selection_reason(raw: dict[str, Any], effective: dict[str, Any] | None) -> str:
+    if effective is None:
+        return "native_plugin_config_invalid"
+    if raw.get("migration_required") or LEGACY_PLUGIN_ID in effective["active"]:
+        return "legacy_package_migration_required"
+    if not raw.get("primary_enabled") or PLUGIN_ID not in effective["active"]:
+        return "session_complete_plugin_disabled"
+    return "ready"
+
+
 def feature_status(name: str, *, root: str | Path, ctx=None) -> tuple[bool, str]:
-    """Return (enabled, bounded reason), strictly honoring native plugin settings."""
+    """Return (enabled, bounded reason), requiring raw and native effective consent."""
     if name not in FEATURES:
         return False, "unknown_feature"
-    state = _read_config(root)
-    if not state.get("structural_valid") or not state.get("settings_valid"):
+    raw = _read_config(root)
+    if not raw.get("structural_valid") or not raw.get("settings_valid"):
         return False, "native_plugin_config_invalid"
-    if state.get("migration_required"):
-        return False, "legacy_package_migration_required"
-    if not state.get("primary_enabled"):
-        return False, "session_complete_plugin_disabled"
+    if ctx is not None and getattr(ctx, "plugin_id", None) != PLUGIN_ID:
+        return False, "native_plugin_owner_mismatch"
+    effective, reason = _native_effective_config(root)
+    if effective is None:
+        return False, reason
+    selection = _selection_reason(raw, effective)
+    if selection != "ready":
+        return False, selection
+    if not effective.get("settings_valid"):
+        return False, "native_plugin_config_invalid"
+    raw_value = raw["settings"].get(name, False)
+    effective_value = effective["settings"].get(name, False)
+    if (type(raw_value) is not bool or type(effective_value) is not bool or
+            raw_value is not effective_value):
+        return False, "native_plugin_config_invalid"
     if ctx is not None:
-        if getattr(ctx, "plugin_id", None) != PLUGIN_ID:
-            return False, "native_plugin_owner_mismatch"
         getter = getattr(ctx, "get_config", None)
         if not callable(getter):
             return False, "native_plugin_config_invalid"
@@ -129,9 +194,9 @@ def feature_status(name: str, *, root: str | Path, ctx=None) -> tuple[bool, str]
             api_value = getter(name, default=False)
         except Exception:
             return False, "native_plugin_config_invalid"
-        if type(api_value) is not bool or api_value is not state["settings"].get(name, False):
+        if type(api_value) is not bool or api_value is not raw_value or api_value is not effective_value:
             return False, "native_plugin_config_invalid"
-    if state["settings"].get(name, False) is not True:
+    if raw_value is not True:
         return False, name.replace("_enabled", "_disabled")
     return True, "ready"
 
@@ -151,32 +216,32 @@ def _factory(ctx, captured_owner: object):
             logger.warning("Telegram gateway factory refused: %s", type(exc).__name__)
             return
 
-        state = _read_config(home)
-        if not state.get("structural_valid"):
+        raw = _read_config(home)
+        if not raw.get("structural_valid"):
             logger.warning("Telegram gateway factory refused: native_plugin_config_invalid")
             return
-        if state.get("migration_required"):
-            logger.warning("Telegram gateway factory refused: legacy_package_migration_required")
+        effective, effective_reason = _native_effective_config(home)
+        selection = _selection_reason(raw, effective)
+        if effective is None:
+            logger.warning("Telegram gateway factory refused: %s", effective_reason)
             return
-        if not state.get("primary_enabled"):
-            logger.warning("Telegram gateway factory refused: session_complete_plugin_disabled")
+        if selection != "ready":
+            logger.warning("Telegram gateway factory refused: %s", selection)
             return
 
-        # A malformed optional feature flag is not authority to accept replies or
-        # approvals, but handlers still install to consume known stale/tombstoned
-        # cards rather than passing those replies into the ordinary agent prompt.
-        feature_status("replies_enabled", root=home, ctx=ctx)
-        feature_status("approvals_enabled", root=home, ctx=ctx)
+        # Optional settings may be malformed or disabled. The scoped consumers
+        # still install to quarantine known cards; every action closure re-reads
+        # strict raw and native effective policy through the captured context.
         from . import approval_bridge, followup_bridge, notifier, reply_bridge
 
         reply_bridge._NOTIFIER = notifier
-        reply_bridge.wire(
+        return reply_bridge.wire(
             application,
             adapter,
             followup_bridge,
             approval_bridge,
-            replies_enabled=lambda: feature_enabled("replies_enabled", root=home),
-            approvals_enabled=lambda: feature_enabled("approvals_enabled", root=home),
+            replies_enabled=lambda: feature_enabled("replies_enabled", root=home, ctx=ctx),
+            approvals_enabled=lambda: feature_enabled("approvals_enabled", root=home, ctx=ctx),
         )
 
     return telegram_factory

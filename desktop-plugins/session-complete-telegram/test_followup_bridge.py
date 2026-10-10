@@ -121,8 +121,11 @@ class FollowupTests(unittest.TestCase):
    def follow_tick(*a,**kw):
     attempts.append(1)
     if len(attempts)==1:raise OSError('synthetic store outage')
+   def follow_wire(*a,**kw):
+    wired.append(1)
+    return True
    notifier=SimpleNamespace(credentials=lambda:('77:test',99,None),telegram=api)
-   follow=SimpleNamespace(bind_receiver=follow_tick,wire=lambda *a,**kw:wired.append(1))
+   follow=SimpleNamespace(bind_receiver=follow_tick,wire=follow_wire)
    async def thread(fn,*a,**kw):return fn(*a,**kw)
    async def sleep(seconds):
     clock[0]+=30

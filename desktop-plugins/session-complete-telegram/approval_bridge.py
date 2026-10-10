@@ -1073,8 +1073,15 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
         return {"ok": False, "reason": "approval_store_unavailable"}
 
 
-def wire(application, notifier, bot, chat, topic, boot, *, approvals_enabled=lambda: False, state=STATE):
-    """Attach approval callbacks to the existing PTB Application, never poll it."""
+def _add_owned_handler(application, handler, group, owned_handlers):
+    if owned_handlers is not None:
+        owned_handlers.append((handler, group))
+    application.add_handler(handler, group=group)
+
+
+def wire(application, notifier, bot, chat, topic, boot, *, approvals_enabled=lambda: False,
+         state=STATE, _owned_handlers=None):
+    """Attach approval consumers to the existing PTB Application, never poll it."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
 
     try:
@@ -1163,8 +1170,8 @@ def wire(application, notifier, bot, chat, topic, boot, *, approvals_enabled=lam
 
     # Install before clarify handlers so even rejected/expired approval-card
     # replies cannot enter the general clarify or agent-prompt path.
-    application.add_handler(CallbackQueryHandler(callback, pattern=r"^hda:"), group=0)
-    application.add_handler(MessageHandler(ExactApprovalReply(), consume_text_reply), group=0)
+    _add_owned_handler(application, CallbackQueryHandler(callback, pattern=r"^hda:"), 0, _owned_handlers)
+    _add_owned_handler(application, MessageHandler(ExactApprovalReply(), consume_text_reply), 0, _owned_handlers)
     return True
 
 

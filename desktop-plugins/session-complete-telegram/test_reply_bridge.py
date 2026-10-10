@@ -556,23 +556,29 @@ class BridgeTests(unittest.TestCase):
         self.create()
         async def scenario():
             import notifier
-            from telegram.ext import ApplicationHandlerStop
+            from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, MessageHandler
             handlers=[]
-            app=SimpleNamespace(bot=SimpleNamespace(token='77:test'),running=False,add_handler=lambda h,group:handlers.append(h))
+            add=lambda h,group:handlers.append((group,h))
+            remove=lambda h,group:handlers.remove((group,h)) if (group,h) in handlers else None
+            app=SimpleNamespace(bot_data={},bot=SimpleNamespace(token='77:test'),running=False,
+                                add_handler=add,remove_handler=remove)
             tasks=set(asyncio.all_tasks())
             lookup=b.lookup_reply;intake=b.intake
             with patch.object(notifier,'credentials',return_value=('77:test',99,None)),patch.object(b.secrets,'token_hex',return_value='boot'),patch.object(b,'lookup_reply',side_effect=lambda bot,chat,mid:lookup(bot,chat,mid,self.state)),patch.object(b,'intake',side_effect=lambda *a:intake(*a,state=self.state,now=self.now)),patch.object(b,'flush'):
                 b.wire(app,None,replies_enabled=lambda:True)
-                self.assertEqual(len(handlers),2)
+                group_zero=[handler for group,handler in handlers if group==0]
+                self.assertEqual(len(group_zero),2)
+                callback_handler=next(handler for handler in group_zero if isinstance(handler,CallbackQueryHandler))
+                text_handler=next(handler for handler in group_zero if isinstance(handler,MessageHandler))
                 ordinary=SimpleNamespace(reply_to_message=None)
-                self.assertFalse(handlers[1].filters.filter(ordinary))
+                self.assertFalse(text_handler.filters.filter(ordinary))
                 human=SimpleNamespace(id=99,is_bot=False);bot=SimpleNamespace(id=77,is_bot=True)
                 msg=SimpleNamespace(chat=SimpleNamespace(id=99,type='private'),message_id=100,from_user=bot,message_thread_id=None,forward_origin=None)
                 query=SimpleNamespace(id='callback-native',data=f'hdq:{self.fid}:0:c:1',message=msg,from_user=human,answer=AsyncMock())
-                with self.assertRaises(ApplicationHandlerStop):await handlers[0].callback(SimpleNamespace(callback_query=query),None)
+                with self.assertRaises(ApplicationHandlerStop):await callback_handler.callback(SimpleNamespace(callback_query=query),None)
                 self.assertEqual(b.read_form(self.fid,self.state)['status'],'queued')
                 known=SimpleNamespace(chat=msg.chat,reply_to_message=SimpleNamespace(message_id=100))
-                self.assertTrue(handlers[1].filters.filter(known))
+                self.assertTrue(text_handler.filters.filter(known))
             for task in set(asyncio.all_tasks())-tasks:task.cancel()
             await asyncio.gather(*(set(asyncio.all_tasks())-tasks),return_exceptions=True)
         asyncio.run(scenario())

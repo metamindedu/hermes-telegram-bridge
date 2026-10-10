@@ -11,6 +11,8 @@ class ApprovalBridgeTests(unittest.TestCase):
     def setUp(self):
         self.temp=test_support.temporary_directory(prefix='approval-bridge-');self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)/'home';self.root.mkdir()
+        self.home_patch=patch.dict('os.environ',{'HERMES_HOME':str(self.root)})
+        self.home_patch.start();self.addCleanup(self.home_patch.stop)
         (self.root/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals:\n  timeout: 300\n',encoding='utf-8')
         self.state=self.root/'plugin-data'/'session-complete-telegram';self.now=time.time();self.owner='desktop-owner-fixture'
         self.route={'mode':'local','connectionId':'local-connection','profile':'default','targetProfile':'default'}

@@ -486,7 +486,7 @@ class NativeInstallTests(unittest.TestCase):
                         "SELECT kind FROM outbound WHERE bot=77 AND chat=99 AND mid=902").fetchone()
                 self.assertIsNotNone(consumed, "revoked stale-card reply must be tombstoned")
                 self.assertEqual(consumed["kind"], "legacy")
-                self.assertEqual(handler_counts, {group: len(handlers) for group, handlers in app.handlers.items() if group == 0})
+                self.assertEqual(handler_counts, {group: len(handlers) for group, handlers in app.handlers.items() if group != 1})
 
                 extra_tasks = set(asyncio.all_tasks()) - before_tasks
                 for task in extra_tasks:

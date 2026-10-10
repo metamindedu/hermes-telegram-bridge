@@ -7,8 +7,10 @@ import base64
 import hashlib
 import importlib
 import json
+import logging
 import secrets
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -42,6 +44,47 @@ def _active_hermes_home():
 ROOT = _active_hermes_home()
 STATE = ROOT / 'plugin-data/session-complete-telegram'
 _NOTIFIER = None
+_WIRED_MARKER = "_newmetaw_session_complete_telegram_wired"
+_WIRING_STATE = "_newmetaw_session_complete_telegram_wiring_state"
+_QUARANTINE_GROUP = -10000
+logger = logging.getLogger("hermes.plugin.session_complete_telegram")
+
+
+def _add_owned_handler(application, handler, group, owned_handlers):
+    if owned_handlers is not None:
+        owned_handlers.append((handler, group))
+    application.add_handler(handler, group=group)
+
+
+def _has_untracked_owned_handlers(application, wiring) -> bool:
+    """Read public PTB handler registrations and recognize only this package's code files."""
+    handlers = getattr(application, "handlers", None)
+    if not isinstance(handlers, dict):
+        return False
+    package_root = Path(__file__).resolve().parent
+    known = {id(handler) for handler, _group in wiring.get("owned_handlers", ())}
+    quarantine = wiring.get("quarantine_handler")
+    if quarantine is not None:
+        known.add(id(quarantine))
+    for group_handlers in handlers.values():
+        if not isinstance(group_handlers, (list, tuple)):
+            continue
+        for handler in group_handlers:
+            if id(handler) in known:
+                continue
+            callback = getattr(handler, "callback", None)
+            module = sys.modules.get(getattr(callback, "__module__", ""))
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                continue
+            try:
+                source_path = Path(module_file).resolve()
+                if (source_path.parent == package_root and
+                        source_path.name in {"reply_bridge.py", "approval_bridge.py", "followup_bridge.py"}):
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return False
 
 
 def local_notifier():
@@ -594,16 +637,127 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
 
 
 def wire(application, adapter, followup=None, approval=None, *, replies_enabled=None, approvals_enabled=None):
-    """Install scoped consumers on the existing PTB Application, never a second poller."""
+    """Install scoped consumers transactionally on the existing PTB Application."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
     bot_data = getattr(application, "bot_data", None)
-    if isinstance(bot_data, dict) and bot_data.get("_newmetaw_session_complete_telegram_wired") is True:
-        return
+    if not isinstance(bot_data, dict):
+        try:
+            application.bot_data = {}
+            bot_data = application.bot_data
+        except Exception:
+            return False
+    prior = bot_data.get(_WIRING_STATE)
+    if isinstance(prior, dict) and prior.get("untracked_existing") is True:
+        return False
+    if bot_data.get(_WIRED_MARKER) is True and isinstance(prior, dict) and prior.get("ready") is True:
+        return True
     notifier = local_notifier()
-    token,chat,topic=notifier.credentials()
-    # Refuse wiring on any adapter except the exact configured notification bot.
-    if application.bot.token!=token or chat<=0:return
-    bot=int(token.split(':',1)[0]);boot=secrets.token_hex(16)
+    try:
+        token, chat, topic = notifier.credentials()
+        if application.bot.token != token or chat <= 0:
+            return False
+        bot = int(token.split(":", 1)[0])
+    except Exception:
+        logger.warning("Telegram gateway wiring refused: configured_destination_unavailable")
+        return False
+    if isinstance(prior, dict) and prior.get("bot") == bot and prior.get("chat") == chat:
+        wiring = prior
+    else:
+        wiring = {"bot": bot, "chat": chat, "ready": False, "quarantine_handler": None, "task": None}
+        bot_data[_WIRING_STATE] = wiring
+    wiring["ready"] = False
+    untracked_marker = (bot_data.get(_WIRED_MARKER) is True and
+                        not (isinstance(prior, dict) and prior.get("ready") is True))
+    safe_approval = approval
+    if safe_approval is None:
+        try:
+            safe_approval = (importlib.import_module(".approval_bridge", __package__)
+                             if __package__ else importlib.import_module("approval_bridge"))
+        except Exception:
+            safe_approval = None
+    quarantine = wiring.get("quarantine_handler")
+    if quarantine is None:
+        def known_approval(reply, chat_id, mid):
+            try:
+                if safe_approval is not None and safe_approval.lookup_message(
+                        bot, chat_id, mid, state=safe_approval.STATE):
+                    return True
+            except Exception:
+                pass
+            text = getattr(reply, "text", None)
+            author = getattr(reply, "from_user", None)
+            return bool(chat_id == chat and getattr(author, "id", None) == bot and
+                        getattr(author, "is_bot", False) is True and isinstance(text, str) and
+                        text.startswith("⚠️ Hermes Desktop 명령 승인"))
+
+        def known_clarify(reply, chat_id, mid):
+            try:
+                if lookup_reply(bot, chat_id, mid, state=STATE) is not None:
+                    return True
+            except Exception:
+                pass
+            text = getattr(reply, "text", None)
+            return bool(isinstance(text, str) and text.startswith("❓ Hermes Desktop — 질문"))
+
+        def known_followup(reply, chat_id, mid):
+            try:
+                if followup is not None and followup.lookup_outbound(
+                        bot, chat_id, mid, state=followup.STATE) is not None:
+                    return True
+            except Exception:
+                pass
+            try:
+                if notifier.legacy_message_id(mid, state=getattr(notifier, "STATE", STATE)):
+                    return True
+            except Exception:
+                pass
+            text = getattr(reply, "text", None)
+            author = getattr(reply, "from_user", None)
+            return bool(chat_id == chat and getattr(author, "id", None) == bot and
+                        getattr(author, "is_bot", False) is True and isinstance(text, str) and
+                        text.startswith("✅ Hermes Desktop 세션 작업 종료"))
+
+        class KnownCardReply(filters.MessageFilter):
+            def filter(self, message):
+                reply = getattr(message, "reply_to_message", None)
+                msg_chat = getattr(message, "chat", None)
+                author = getattr(reply, "from_user", None) if reply is not None else None
+                mid = getattr(reply, "message_id", None) if reply is not None else None
+                chat_id = getattr(msg_chat, "id", None)
+                if (reply is None or chat_id != chat or getattr(msg_chat, "type", None) != "private" or
+                        getattr(author, "id", None) != bot or getattr(author, "is_bot", False) is not True or
+                        type(mid) is not int):
+                    return False
+                if wiring.get("ready") is True:
+                    return ((approval is None and known_approval(reply, chat_id, mid)) or
+                            (followup is None and known_followup(reply, chat_id, mid)))
+                return (known_approval(reply, chat_id, mid) or known_clarify(reply, chat_id, mid) or
+                        known_followup(reply, chat_id, mid))
+
+        async def quarantine_known_reply(update, context):
+            raise ApplicationHandlerStop
+
+        quarantine = MessageHandler(KnownCardReply(), quarantine_known_reply)
+        wiring["quarantine_handler"] = quarantine
+        try:
+            application.add_handler(quarantine, group=_QUARANTINE_GROUP)
+        except Exception:
+            try:
+                application.remove_handler(quarantine, group=_QUARANTINE_GROUP)
+            except Exception:
+                logger.warning("Telegram gateway quarantine cleanup failed")
+            wiring["quarantine_handler"] = None
+            logger.warning("Telegram gateway quarantine install failed")
+            return False
+    if untracked_marker or _has_untracked_owned_handlers(application, wiring):
+        wiring["untracked_existing"] = True
+        bot_data[_WIRED_MARKER] = False
+        logger.warning("Telegram gateway wiring refused: untracked_existing_handlers")
+        return False
+
+    bot = int(token.split(":", 1)[0]); boot = secrets.token_hex(16)
+    owned_handlers = []
+    task = None
 
     def reply_gate():
         if callable(replies_enabled):
@@ -616,16 +770,16 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
             try:return approvals_enabled() is True
             except Exception:return False
         if __package__:
-            gateway = importlib.import_module('.telegram_integration', __package__)
+            gateway = importlib.import_module(".telegram_integration", __package__)
         else:
-            gateway = importlib.import_module('telegram_integration')
-        return gateway.feature_enabled('approvals_enabled', root=ROOT)
+            gateway = importlib.import_module("telegram_integration")
+        return gateway.feature_enabled("approvals_enabled", root=ROOT)
 
     def verify_private_home():
         try:
-            result=notifier.telegram(token,'getChat',{'chat_id':chat})
-            value=result.get('result') or {}
-            return bool(result.get('ok') and value.get('type')=='private' and value.get('id')==chat)
+            result=notifier.telegram(token,"getChat",{"chat_id":chat})
+            value=result.get("result") or {}
+            return bool(result.get("ok") and value.get("type")=="private" and value.get("id")==chat)
         except Exception:
             return False
 
@@ -638,7 +792,6 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
                 replies_live=reply_gate()
                 approvals_live=approval_gate()
                 if replies_live:
-                    # A new inbox must never take down the existing receiver.
                     try:await asyncio.to_thread(bind_receiver,bot,chat,topic,boot)
                     except Exception:pass
                 if (followup is not None and replies_live) or (approval is not None and approvals_live):
@@ -657,24 +810,23 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
                         await asyncio.to_thread(approval.bind_receiver, bot, chat, topic, boot,
                             private_verified=True, version=approval.VERSION, capability=approval.CAPABILITY)
                     except Exception:
-                        # Approval inbox failure is isolated from clarify/followup heartbeats.
                         pass
                 await asyncio.sleep(8)
         finally:
             if verification is not None:
                 verification.cancel()
                 await asyncio.gather(verification,return_exceptions=True)
-    # Factory runs both before and after Application.start(). Use the event loop,
-    # not Application.create_task's pre-start warning path.
+
     async def ready():
         while not application.running:await asyncio.sleep(1)
         await heartbeat_loop()
-    asyncio.get_running_loop().create_task(ready())
+
     def identity(message,user,mid,author):
         return dict(bot=bot,boot=boot,chat=getattr(message.chat,'id',None),user=getattr(user,'id',None),
           topic=getattr(message,'message_thread_id',None),mid=mid,private=getattr(message.chat,'type',None)=='private',
           human=not getattr(user,'is_bot',True),bot_author=getattr(author,'id',None)==bot and getattr(author,'is_bot',False),
           forwarded=bool(getattr(message,'forward_origin',None)),edited=False)
+
     async def callback(update,context):
         query=update.callback_query
         try:
@@ -691,12 +843,13 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
             try:await query.answer('처리하지 못했습니다. Desktop에서 확인해 주세요.',show_alert=True)
             except Exception:pass
         raise ApplicationHandlerStop
+
     class ExactReply(filters.MessageFilter):
         def filter(self,message):
             reply=getattr(message,'reply_to_message',None)
             if reply is None:return False
-            # Keep tombstones matched so stale replies never turn into new prompts.
             return lookup_reply(bot,message.chat.id,reply.message_id) is not None
+
     async def text_reply(update,context):
         msg=update.message
         try:
@@ -712,16 +865,40 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         except Exception:
             if msg is not None:await msg.reply_text('답변을 반영하지 못했습니다. Desktop에서 확인해 주세요.')
         raise ApplicationHandlerStop
-    if approval is not None:
-        try:
-            approval.wire(application, notifier, bot, chat, topic, boot, approvals_enabled=approval_gate)
+
+    try:
+        if approval is not None:
+            if not callable(getattr(approval,"wire",None)):
+                raise RuntimeError("approval_consumer_unavailable")
+            result=approval.wire(application,notifier,bot,chat,topic,boot,
+                approvals_enabled=approval_gate,_owned_handlers=owned_handlers)
+            if result is not True:raise RuntimeError("approval_consumer_install_incomplete")
+        _add_owned_handler(application,CallbackQueryHandler(callback,pattern=r"^hdq:"),0,owned_handlers)
+        _add_owned_handler(application,MessageHandler(ExactReply(),text_reply),0,owned_handlers)
+        if followup is not None:
+            result=followup.wire(application,notifier,bot,chat,topic,boot,
+                enabled=reply_gate,_owned_handlers=owned_handlers)
+            if result is not True:raise RuntimeError("followup_consumer_install_incomplete")
+        ready_coro=ready()
+        try:task=asyncio.get_running_loop().create_task(ready_coro)
         except Exception:
-            # No approval failure can stop the existing clarify/followup handler setup.
-            pass
-    application.add_handler(CallbackQueryHandler(callback,pattern=r'^hdq:'),group=0)
-    application.add_handler(MessageHandler(ExactReply(),text_reply),group=0)
-    if followup is not None:
-        # Existing authoritative clarify mappings win even during a followup DB outage.
-        followup.wire(application,notifier,bot,chat,topic,boot,enabled=reply_gate)
-    if isinstance(bot_data, dict):
-        bot_data["_newmetaw_session_complete_telegram_wired"] = True
+            ready_coro.close()
+            raise
+        wiring["owned_handlers"]=tuple(owned_handlers)
+        wiring["task"]=task
+        wiring["ready"]=True
+        bot_data[_WIRED_MARKER]=True
+        return True
+    except Exception as exc:
+        if task is not None and not task.done():task.cancel()
+        cleanup_failed=False
+        for handler,group in reversed(owned_handlers):
+            try:application.remove_handler(handler,group=group)
+            except Exception:cleanup_failed=True
+        wiring["owned_handlers"]=()
+        wiring["task"]=None
+        wiring["ready"]=False
+        bot_data[_WIRED_MARKER]=False
+        logger.warning("Telegram gateway wiring incomplete: %s%s",type(exc).__name__,
+            " (owned-handler cleanup incomplete)" if cleanup_failed else "")
+        return False

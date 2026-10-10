@@ -24,6 +24,9 @@ class NativeFeatureGateTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "default-home"
         self.root.mkdir()
+        self.home_patch = patch.dict(os.environ, {"HERMES_HOME": str(self.root)})
+        self.home_patch.start()
+        self.addCleanup(self.home_patch.stop)
         self.module_name = "_feature_gate_fixture"
         spec = importlib.util.spec_from_file_location(
             self.module_name, PACKAGE / "__init__.py", submodule_search_locations=[str(PACKAGE)])

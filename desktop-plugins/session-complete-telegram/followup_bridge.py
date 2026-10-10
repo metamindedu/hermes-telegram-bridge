@@ -405,7 +405,14 @@ def notify_receipt(owner,bot,chat,mid,notifier,*,state=STATE):
     notifier.telegram(token,'sendMessage',payload)
 
 
-def wire(application, notifier, bot, chat, topic, boot, *, state=STATE, enabled=lambda: True):
+def _add_owned_handler(application, handler, group, owned_handlers):
+    if owned_handlers is not None:
+        owned_handlers.append((handler, group))
+    application.add_handler(handler, group=group)
+
+
+def wire(application, notifier, bot, chat, topic, boot, *, state=STATE, enabled=lambda: True,
+         _owned_handlers=None):
     """Install completion-only ingress on the existing PTB Application."""
     from telegram.ext import MessageHandler, filters, ApplicationHandlerStop
 
@@ -481,7 +488,8 @@ def wire(application, notifier, bot, chat, topic, boot, *, state=STATE, enabled=
             pass
         raise ApplicationHandlerStop
 
-    application.add_handler(MessageHandler(RecognizedCompletion(), handler), group=0)
+    _add_owned_handler(application, MessageHandler(RecognizedCompletion(), handler), 0, _owned_handlers)
+    return True
 
 
 __all__ = ["BINDING_TTL", "LEASE", "MAX_TEXT", "STATE", "bind_receiver", "canonical", "claim", "connect", "consume_known", "consume_legacy", "heartbeat_owner", "ingest", "lookup_outbound", "ready", "receiver_info", "register_completion", "settle", "notify_receipt", "wire"]
