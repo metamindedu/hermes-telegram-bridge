@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 
 def _active_hermes_home():
@@ -557,6 +557,10 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             reply_bridge = _sibling_module("reply_bridge")
             result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                          result_budget=result_budget if native else None)
+        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice"}:
+            approval_bridge = _sibling_module("approval_bridge")
+            result = approval_bridge.helper(req, sys.modules[__name__], root=root, state=state,
+                                            result_budget=result_budget if native else None)
         elif isinstance(action, str) and action.startswith("followup_"):
             followup_bridge = _sibling_module("followup_bridge")
             reply_bridge = _sibling_module("reply_bridge")
@@ -594,7 +598,14 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
         elif action == "loaded":
             diagnostic("desktop_loaded", {"version": VERSION, "plugin_version": req.get("version"),
                 "profiles": req.get("profiles", []), "quiet_seconds": QUIET_SECONDS}, state=state)
-            result = {"ok": True, "version": VERSION}
+            capabilities = []
+            try:
+                approval_bridge = _sibling_module("approval_bridge")
+                if approval_bridge.VERSION == VERSION and approval_bridge.CAPABILITY == "desktop-command-approval-v1":
+                    capabilities.append(approval_bridge.CAPABILITY)
+            except Exception:
+                pass
+            result = {"ok": True, "version": VERSION, "capabilities": capabilities}
         elif action == "diagnostic":
             data = {k: req[k] for k in ("profile", "session_key", "reason", "version") if k in req}
             diagnostic("last_check", data, state=state)

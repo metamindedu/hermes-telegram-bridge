@@ -589,7 +589,7 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     return result
 
 
-def wire(application,adapter,followup=None):
+def wire(application,adapter,followup=None,approval=None):
     """Native plugin factory: scoped PTB handlers, no additional update consumer."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
     notifier = local_notifier()
@@ -626,6 +626,13 @@ def wire(application,adapter,followup=None):
                         if private_verified:
                             try:await asyncio.to_thread(followup.bind_receiver,bot,chat,topic,boot,private_verified=True)
                             except Exception:pass
+                    if private_verified and approval is not None:
+                        try:
+                            await asyncio.to_thread(approval.bind_receiver, bot, chat, topic, boot,
+                                private_verified=True, version=approval.VERSION, capability=approval.CAPABILITY)
+                        except Exception:
+                            # Approval inbox failure is isolated from clarify/followup heartbeats.
+                            pass
                 await asyncio.sleep(8)
         finally:
             if verification is not None:
@@ -679,6 +686,12 @@ def wire(application,adapter,followup=None):
         except Exception:
             if msg is not None:await msg.reply_text('답변을 반영하지 못했습니다. Desktop에서 확인해 주세요.')
         raise ApplicationHandlerStop
+    if approval is not None:
+        try:
+            approval.wire(application, notifier, bot, chat, topic, boot, enabled=enabled)
+        except Exception:
+            # No approval failure can stop the existing clarify/followup handler setup.
+            pass
     application.add_handler(CallbackQueryHandler(callback,pattern=r'^hdq:'),group=0)
     application.add_handler(MessageHandler(ExactReply(),text_reply),group=0)
     if followup is not None:

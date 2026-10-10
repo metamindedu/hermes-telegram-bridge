@@ -39,7 +39,7 @@ hermes --profile default plugins enable desktop-clarify-telegram
 
 Then, in Hermes Desktop's Plugins screen, enable **Session Completion → Telegram**. This renderer toggle is separate from enabling the native CLI package. Completion notices need the first package and the Desktop toggle. Inbound clarify answers additionally need the second package and the existing Telegram Gateway to be running. The ingress registers handlers on that Gateway's existing `Application`; it does not create another update poller.
 
-The baseline's pending command-approval notices are notification-only. Telegram does not approve/deny those prompts in version 1.5.0. A separate approval-response feature is planned for 1.6 and is unreleased/not included here; its intended actions are only approve once or deny for the matching pending request through Desktop's in-process approval queue.
+Version 1.6 additionally supports **Allow Once / Deny** on eligible dangerous-command requests in Desktop's local in-process queue. This needs both matching packages, the Desktop component, and a fresh receiver/version/capability handshake. After an approved code update, restart the existing Telegram Gateway at a safe idle point so its resident factory loads the matching handlers; source replacement or plugin rediscovery alone is not a handler-upgrade guarantee. Unverifiable, generic/plugin-rule/compute-host and unsafe review requests remain notification-only. A decision receipt is not command-completion evidence. No session/permanent permissions are offered.
 
 ## Verify and use
 
@@ -70,6 +70,6 @@ To disable, run the corresponding `hermes --profile default plugins disable <pac
 
 ## What has and has not been tested
 
-The repository CI's current workflow runs the Node syntax/behavior suites and the Python modules `test_notifier`, `test_reply_bridge`, `test_followup_bridge`, `test_native_install`, and `test_registration`, on Windows and Ubuntu, using Python 3.14, Node 24, and immutable Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b`. Registration/runtime guard regressions are included; commit-bound remote CI results must be checked for the final release. These are source/API-contract and isolated fake-home tests, not physical macOS tests; they do not verify a separate user's Desktop GUI or prove production installation/Gateway activation.
+The repository CI's current workflow runs the Node syntax/behavior suites and the Python modules `test_notifier`, `test_reply_bridge`, `test_followup_bridge`, `test_approval_bridge`, `test_native_install`, and `test_registration`, on Windows and Ubuntu, using Python 3.14, Node 24, and immutable Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b`. Registration/runtime guard regressions are included; commit-bound remote CI results must be checked for the final release. These are source/API-contract and isolated fake-home tests, not physical macOS tests; they do not verify a separate user's Desktop GUI or prove production installation/Gateway activation.
 
 Historical native install/update/rollback command forms and the separate activation boundary remain linked in [operations notes](operations.md); those notes document past development work and are not a claim that this release is installed or active.

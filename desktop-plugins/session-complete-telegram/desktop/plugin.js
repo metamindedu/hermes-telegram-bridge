@@ -1,7 +1,9 @@
 import { host } from '@hermes/plugin-sdk'
 
 // App-level disk plugin: no profile configuration, agent prompt or core changes.
-export const VERSION = '1.5.0'
+export const VERSION = '1.6.0'
+export const APPROVAL_CAPABILITY = 'desktop-command-approval-v1'
+export const APPROVAL_LEASE_MS = 45_000
 
 export function stableJSON(value) {
   if (Array.isArray(value)) return '[' + value.map(stableJSON).join(',') + ']'
@@ -97,6 +99,70 @@ export function validReplySnapshot(bridge, route, row, snapshot) {
     ask.params?.session_id === d.sid && stableJSON(ask) === d.fingerprint
 }
 
+const APPROVAL_REQUEST_KEYS = ['session_id','request_id','command','description','pattern_key','pattern_keys',
+  'allow_permanent','allow_session','choices']
+const APPROVAL_QUEUE_KEYS = ['request_id','command','description','pattern_key','pattern_keys',
+  'allow_permanent','allow_session']
+
+export function validateApprovalPair(request, pending, runtimeSid) {
+  if (!request || typeof request !== 'object' || Array.isArray(request) || request.method !== 'approval' ||
+      typeof request.id !== 'string' || !/^srq-[0-9a-f]{4,32}$/u.test(request.id) ||
+      !pending || typeof pending !== 'object' || Array.isArray(pending) ||
+      typeof runtimeSid !== 'string' || !runtimeSid) return false
+  const p = request.params
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return false
+  const queueKeys = [...APPROVAL_QUEUE_KEYS]
+  const paramKeys = [...APPROVAL_REQUEST_KEYS]
+  if (Object.hasOwn(pending, 'smart_denied')) { queueKeys.push('smart_denied'); paramKeys.push('smart_denied') }
+  if (!exactKeys(pending, queueKeys) || !exactKeys(p, paramKeys)) return false
+  if (p.session_id !== runtimeSid || p.request_id !== pending.request_id ||
+      typeof pending.request_id !== 'string' || !/^[0-9a-f]{32}$/u.test(pending.request_id)) return false
+  if (pending.smart_denied !== undefined && pending.smart_denied !== false) return false
+  if (p.smart_denied !== undefined && p.smart_denied !== false) return false
+  if (typeof pending.command !== 'string' || !pending.command || p.command !== pending.command ||
+      typeof pending.description !== 'string' || !pending.description || p.description !== pending.description) return false
+  if (typeof pending.pattern_key !== 'string' || !pending.pattern_key ||
+      /^(?:plugin_rule:|tirith:|execute_code(?:$|:))/u.test(pending.pattern_key) ||
+      !Array.isArray(pending.pattern_keys) || pending.pattern_keys.length !== 1 ||
+      pending.pattern_keys[0] !== pending.pattern_key || p.pattern_key !== pending.pattern_key ||
+      stableJSON(p.pattern_keys) !== stableJSON(pending.pattern_keys)) return false
+  if (typeof pending.allow_permanent !== 'boolean' || p.allow_permanent !== pending.allow_permanent ||
+      pending.allow_session !== true || p.allow_session !== true) return false
+  const expected = pending.allow_permanent ? ['once','session','always','deny'] : ['once','session','deny']
+  return Array.isArray(p.choices) && stableJSON(p.choices) === stableJSON(expected)
+}
+
+export async function approvalFingerprint(value) {
+  if (!globalThis.crypto?.subtle) throw new Error('approval_digest_unavailable')
+  const bytes = new TextEncoder().encode(stableJSON(value))
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes))
+  return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+export function validApprovalSnapshot(bridge, route, row, snapshot, pending, owner) {
+  try {
+    const d = bridge?.descriptor
+    if (!d || d.owner !== owner || bridge.requestFingerprint !== d.request_fingerprint ||
+        bridge.pendingFingerprint !== d.pending_fingerprint || !route || route.mode !== 'local' ||
+        route.connectionId !== d.connectionId || route.profile !== d.profile ||
+        route.targetProfile !== d.targetProfile || row?.id !== d.sid ||
+        row?.session_key !== d.session_key || row?.status !== 'waiting' ||
+        !snapshot || !((typeof snapshot.epoch === 'string' && snapshot.epoch) ||
+          (typeof snapshot.epoch === 'number' && Number.isFinite(snapshot.epoch))) ||
+        String(snapshot.epoch) !== d.epoch || !Array.isArray(snapshot.open_requests) ||
+        !Array.isArray(pending)) return false
+    const requests = validateOpenRequests(snapshot)
+    const matches = requests.filter(q => q.id === d.request_id)
+    if (matches.length !== 1 || !validateApprovalPair(matches[0], bridge.pending, d.sid)) return false
+    const queue = pending.filter(item => item?.request_id === d.queue_id)
+    if (queue.length !== 1 || !validateApprovalPair(matches[0], queue[0], d.sid)) return false
+    return stableJSON(matches[0]) === stableJSON(bridge.request) &&
+      stableJSON(queue[0]) === stableJSON(bridge.pending)
+  } catch {
+    return false
+  }
+}
+
 function exactKeys(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
     Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
@@ -149,7 +215,8 @@ const MAX_FRAGMENT_CHUNKS = MAX_FRAGMENT_BYTES / FRAGMENT_CHUNK_BYTES
 const RESULT_FRAME_BEGIN = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN'
 const RESULT_FRAME_END = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END'
 const HELPER_WRITE_ACTIONS = new Set([
-  'send', 'attention', 'reply_register', 'reply_poll', 'reply_settle',
+  'send', 'attention', 'reply_register', 'reply_poll', 'reply_settle', 'reply_fragment',
+  'approval_owner_heartbeat', 'approval_register', 'approval_poll', 'approval_settle', 'approval_notice',
   'followup_claim', 'followup_begin_submit', 'followup_reject', 'followup_settle',
   'loaded', 'diagnostic'
 ])
@@ -259,6 +326,10 @@ export class CompletionMonitor {
     this.replySweepUnverified = new Set()
     this.replySweepAbsent = new Set()
     this.lastReplyPollSucceeded = false
+    this.approvalCapable = false
+    this.approvalSweepUnverified = new Set()
+    this.approvalSweepAbsent = new Set()
+    this.lastApprovalPollSucceeded = false
   }
 
   async refreshRoutes(force = false) {
@@ -309,6 +380,14 @@ export class CompletionMonitor {
       const routes = await this.refreshRoutes()
       const reply = await this.helper({action: 'loaded', profiles: routes.map(r => r.profile), version: VERSION})
       this.loadedRecorded = reply.ok === true
+      const capable = reply.ok === true && reply.version === VERSION &&
+        Array.isArray(reply.capabilities) && reply.capabilities.includes(APPROVAL_CAPABILITY)
+      if (capable && !this.approvalCapable) {
+        for (const record of this.records.values()) {
+          if (record.ask?.method === 'approval') record.ask = null
+        }
+      }
+      this.approvalCapable = capable
     } catch {
       // Startup may precede gateway.ready. It is retried by that event, not by
       // launching all profile backends or restarting the user's current session.
@@ -542,6 +621,8 @@ export class CompletionMonitor {
     this.sweeping = true
     this.replySweepUnverified = new Set()
     this.replySweepAbsent = new Set()
+    this.approvalSweepUnverified = new Set()
+    this.approvalSweepAbsent = new Set()
     for (const record of this.records.values()) record.sweepAbsent = false
     try {
       const byRoute = new Map()
@@ -561,7 +642,10 @@ export class CompletionMonitor {
           active = await this.api.requestProfile(route, 'session.active_list', {})
           rows = validateActiveSessions(active)
         } catch {
-          for (const r of records) if (r.reply) this.replySweepUnverified.add(r.reply.id)
+          for (const r of records) {
+            if (r.reply) this.replySweepUnverified.add(r.reply.id)
+            if (r.approval) this.approvalSweepUnverified.add(r.approval.id)
+          }
           continue
         }
         for (const r of records) {
@@ -572,25 +656,38 @@ export class CompletionMonitor {
             // bridge until reply_poll retires it. Incomplete lists never reach
             // this branch.
             if (r.reply) this.replySweepAbsent.add(r.reply.id)
+            if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
             r.sweepAbsent = true
-            if (!r.reply) this.records.delete(r.key)
+            if (!r.reply && !r.approval) this.records.delete(r.key)
             continue
           }
           r.sweepAbsent = false
-          if (row.status !== 'waiting') { r.ask = null; continue }
+          if (row.status !== 'waiting') {
+            r.ask = null
+            if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+            continue
+          }
           await this.checkAsk(r, route, row)
         }
       }
       await this.pumpReplies()
       if (this.lastReplyPollSucceeded) {
         for (const r of [...this.records.values()]) {
-          if (r.sweepAbsent) this.records.delete(r.key)
+          if (r.sweepAbsent && !r.approval) this.records.delete(r.key)
+        }
+      }
+      await this.pumpApprovals()
+      if (this.lastApprovalPollSucceeded) {
+        for (const r of [...this.records.values()]) {
+          if (r.sweepAbsent && !r.reply) this.records.delete(r.key)
         }
       }
       await this.pumpFollowups()
     } finally {
       this.replySweepUnverified.clear()
       this.replySweepAbsent.clear()
+      this.approvalSweepUnverified.clear()
+      this.approvalSweepAbsent.clear()
       this.sweeping = false
     }
   }
@@ -600,6 +697,7 @@ export class CompletionMonitor {
     r.askChecking = true
     let currentAskId = null
     let currentAskFingerprint = null
+    let currentAskMethod = null
     try {
       validateSessionRow(row)
       if (row.id !== r.sid) throw new Error('Clarify session identity changed')
@@ -613,6 +711,11 @@ export class CompletionMonitor {
       const open = validateOpenRequests(since)
       const ask = open.find(q => q && HUMAN_ASK_METHODS.has(q.method))
       currentAskId = ask?.id || null
+      currentAskMethod = ask?.method || null
+      if (ask?.method === 'approval') currentAskFingerprint = stableJSON(ask)
+      if (ask?.method === 'approval' && route.connectionId && ask.params?.session_id === r.sid) {
+        if (await this.checkApproval(r, route, row, since, ask)) return
+      }
       if (ask?.method === 'clarify' && route.connectionId && ask.params?.session_id === r.sid) {
         validateReplySnapshot(since)
         currentAskFingerprint = stableJSON(ask)
@@ -676,7 +779,7 @@ export class CompletionMonitor {
       // Any terminal answer settles the episode: gate rejections are
       // deterministic and an ambiguous send must never be retried. Only the
       // transport-failure catch below re-attempts while the ask stays open.
-      r.ask = { id: ask.id }
+      r.ask = { id: ask.id, method: ask.method }
       if (!reply?.ok && !reply?.duplicate && ['failed', 'unknown'].includes(reply?.status)) {
         this.api.notify({ kind: 'warning', title: '입력 대기 알림', message: '텔레그램 전송을 확인하지 못했습니다. 중복 방지를 위해 자동 재전송하지 않습니다.' })
       }
@@ -693,6 +796,192 @@ export class CompletionMonitor {
       // A transport failure before a native write is retried on the next sweep.
     } finally {
       r.askChecking = false
+    }
+  }
+
+  async checkApproval(r, route, row, since, ask) {
+    if (!this.approvalCapable) return false
+    validateSessionRow(row)
+    const requests = validateOpenRequests(since)
+    const matches = requests.filter(value => value.id === ask.id)
+    if (matches.length !== 1 || matches[0].method !== 'approval') return false
+    const pendingReply = await this.api.requestProfile(route, 'approval.pending', {session_id:r.sid})
+    if (!pendingReply || !Array.isArray(pendingReply.approvals)) throw new Error('approval pending snapshot unavailable')
+    const pending = pendingReply.approvals.filter(value => value?.request_id === ask.params?.request_id)
+    if (pending.length !== 1 || !validateApprovalPair(ask, pending[0], r.sid)) {
+      if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+      return false
+    }
+    const requestFingerprint = await approvalFingerprint(ask)
+    const pendingFingerprint = await approvalFingerprint(pending[0])
+    const descriptor = {
+      owner:this.replyOwner, connectionId:route.connectionId, profile:route.profile,
+      targetProfile:route.targetProfile, sid:r.sid, session_key:row.session_key,
+      epoch:String(since.epoch), request_id:ask.id, queue_id:pending[0].request_id,
+      request_fingerprint:requestFingerprint, pending_fingerprint:pendingFingerprint
+    }
+    if (!descriptor.connectionId || !descriptor.profile || !descriptor.targetProfile || !descriptor.session_key ||
+        !((typeof since.epoch === 'string' && since.epoch) || (typeof since.epoch === 'number' && Number.isFinite(since.epoch)))) {
+      if (r.approval) this.approvalSweepUnverified.add(r.approval.id)
+      return true
+    }
+    const previous = r.approval
+    if (previous) {
+      const same = stableJSON(previous.descriptor) === stableJSON(descriptor) &&
+        stableJSON(previous.request) === stableJSON(ask) && stableJSON(previous.pending) === stableJSON(pending[0])
+      if (!same) {
+        this.approvalSweepAbsent.add(previous.id)
+        return true
+      }
+      r.ask = {id:ask.id, method:'approval'}
+      return true
+    }
+    const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
+      capability:APPROVAL_CAPABILITY})
+    if (heartbeat?.feature_ready !== true || heartbeat.version !== VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) {
+      return false
+    }
+    const registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
+      owner:this.replyOwner, descriptor, request:ask, pending:pending[0], route:{
+        mode:route.mode, connectionId:route.connectionId, profile:route.profile, targetProfile:route.targetProfile
+      }, session:{id:row.id, session_key:row.session_key, status:row.status}, epoch:since.epoch})
+    if (registered?.ok === true && typeof registered.id === 'string' &&
+        ['posting','open','queued','applying'].includes(registered.status)) {
+      r.approval = {id:registered.id, descriptor, request:ask, pending:pending[0],
+        requestFingerprint, pendingFingerprint, route:{...route}}
+      r.ask = {id:ask.id, method:'approval'}
+      return true
+    }
+    if (registered?.reason && /^(?:review_|redaction_|timeout_unavailable)$/u.test(registered.reason)) {
+      const notice = await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
+        owner:this.replyOwner, descriptor, request:ask, pending:pending[0], reason:registered.reason})
+      r.ask = {id:ask.id, method:'approval'}
+      this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
+        message:'이 명령은 Telegram에서 안전하게 검토할 수 없습니다. 전체 명령과 현재 승인을 Desktop에서 확인해 주세요.'})
+      if (!notice?.ok && !notice?.duplicate && ['failed','unknown'].includes(notice?.status)) {
+        this.api.notify({kind:'warning', title:'입력 대기 알림',
+          message:'알림 전송 결과를 확인하지 못했습니다. 중복 방지를 위해 다시 보내지 않았습니다.'})
+      }
+      return true
+    }
+    if (registered?.reason === 'prior_owner' || registered?.duplicate || registered?.status &&
+        ['expired','rejected','unknown','applied'].includes(registered.status)) {
+      r.ask = {id:ask.id, method:'approval'}
+      return true
+    }
+    return false
+  }
+
+  async approvalSnapshot(bridge) {
+    const d = bridge.descriptor
+    const routes = await this.refreshRoutes(true)
+    const matches = routes.filter(route => route.mode === 'local' && route.connectionId === d.connectionId &&
+      route.profile === d.profile && route.targetProfile === d.targetProfile)
+    if (matches.length !== 1) throw new Error('approval route unavailable')
+    const route = matches[0]
+    const [active, snapshot, pendingReply] = await Promise.all([
+      this.api.requestProfile(route, 'session.active_list', {}),
+      this.api.requestProfile(route, 'session.events.since', {session_id:d.sid, last_seen:0}),
+      this.api.requestProfile(route, 'approval.pending', {session_id:d.sid})
+    ])
+    const rows = validateActiveSessions(active)
+    const row = rows.find(value => value.id === d.sid)
+    if (!pendingReply || !Array.isArray(pendingReply.approvals)) throw new Error('approval pending snapshot unavailable')
+    const valid = validApprovalSnapshot(bridge, route, row, snapshot, pendingReply.approvals, this.replyOwner)
+    if (!valid) return null
+    const request = snapshot.open_requests.find(value => value.id === d.request_id)
+    const pending = pendingReply.approvals.find(value => value.request_id === d.queue_id)
+    if (await approvalFingerprint(request) !== d.request_fingerprint ||
+        await approvalFingerprint(pending) !== d.pending_fingerprint) return null
+    return {route, row, snapshot, request, pending}
+  }
+
+  async pumpApprovals() {
+    this.lastApprovalPollSucceeded = false
+    // No owned approval means there is no input to deliver. Registration owns
+    // its own capability/receiver heartbeat; do not launch idle helper RPCs on
+    // every ordinary completion/clarify sweep.
+    if (this.stopped || ![...this.records.values()].some(record => record.approval)) return
+    try {
+      const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
+        capability:APPROVAL_CAPABILITY})
+      if (heartbeat?.feature_ready !== true || heartbeat.version !== VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) return
+    } catch { return }
+    const bridges = new Map()
+    const observations = []
+    const unverified = [...this.approvalSweepUnverified]
+    const absent = [...this.approvalSweepAbsent]
+    for (const record of this.records.values()) {
+      const bridge = record.approval
+      if (!bridge || unverified.includes(bridge.id) || absent.includes(bridge.id)) continue
+      try {
+        const current = await this.approvalSnapshot(bridge)
+        if (!current) { absent.push(bridge.id); continue }
+        const authority = await approvalFingerprint(bridge.descriptor)
+        observations.push({id:bridge.id, request_fingerprint:bridge.descriptor.request_fingerprint,
+          pending_fingerprint:bridge.descriptor.pending_fingerprint, authority})
+        bridges.set(bridge.id, {...bridge, route:current.route})
+      } catch {
+        unverified.push(bridge.id)
+      }
+    }
+    let polled
+    try {
+      const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
+        capability:APPROVAL_CAPABILITY})
+      if (heartbeat?.feature_ready !== true || heartbeat.version !== VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) return
+      polled = await this.helper({action:'approval_poll', owner:this.replyOwner, capability:APPROVAL_CAPABILITY,
+        observations, unverified:[...new Set(unverified)], absent:[...new Set(absent)]})
+    } catch { return }
+    if (polled?.ok !== true || !Array.isArray(polled.items)) return
+    this.lastApprovalPollSucceeded = true
+    for (const terminal of polled.terminal || []) {
+      if (typeof terminal !== 'string') continue
+      for (const record of this.records.values()) if (record.approval?.id === terminal) record.approval = null
+    }
+    for (const item of polled.items) {
+      const bridge = bridges.get(item?.id)
+      let status = 'rejected'
+      try {
+        if (!bridge || this.stopped || !['once','deny'].includes(item.choice) ||
+            stableJSON(item.descriptor) !== stableJSON(bridge.descriptor) ||
+            !Number.isFinite(item.deadline) || Date.now() >= item.deadline * 1000) {
+          throw new Error('approval claim invalid')
+        }
+        // A post-claim fresh route, session, open-request and native queue snapshot
+        // is required immediately before the only RPC write.
+        const fresh = await this.approvalSnapshot(bridge)
+        if (!fresh || this.stopped || Date.now() >= item.deadline * 1000 ||
+            stableJSON(item.request) !== stableJSON(fresh.request) ||
+            stableJSON(item.pending) !== stableJSON(fresh.pending)) throw new Error('approval snapshot changed')
+        status = 'unknown'
+        let receipt
+        try {
+          receipt = await this.api.requestProfile(fresh.route, 'approval.respond', {
+            session_id:bridge.descriptor.sid, request_id:bridge.descriptor.queue_id,
+            choice:item.choice, all:false
+          }, 15_000)
+        } catch { throw new Error('approval response unknown') }
+        if (!receipt || typeof receipt !== 'object' || typeof receipt.resolved !== 'number' ||
+            !Number.isFinite(receipt.resolved) || receipt.all === true) {
+          status = 'unknown'
+        } else if (receipt.resolved === 1) {
+          status = 'applied'
+        } else if (receipt.resolved === 0) {
+          status = 'expired'
+        } else {
+          status = 'unknown'
+        }
+      } catch {
+        if (status !== 'unknown') status = 'rejected'
+      }
+      try {
+        const settled = await this.helper({action:'approval_settle', capability:APPROVAL_CAPABILITY,
+          id:item.id, claim:item.claim, status})
+        if (settled?.ok) {
+          for (const record of this.records.values()) if (record.approval?.id === item.id) record.approval = null
+        }
+      } catch { /* applying lease becomes unknown; never replay */ }
     }
   }
 

@@ -13,7 +13,7 @@ This is an independently authored NewMetaW project, not a fork of `telegram-noti
 - Sends input-needed notices for supported pending requests. With the optional ingress enabled, clarify cards can accept a choice or text only for the matching live request and configured private-home owner. A reply to a verified completion card can be queued as ordinary text to that same live Desktop session.
 - Uses local routes only. Remote/foreign homes, unrelated chats, and replies not attached to a verified card are outside the supported path.
 
-**Approval status:** the 1.5.0 baseline can notify you about command-approval prompts, but Telegram cannot approve or deny them. A separate approval-response feature is planned for 1.6 and is unreleased/not included here; its intended actions are only **approve once** or **deny** for the matching pending request through Desktop's in-process approval queue, not generic host or arbitrary-command authorization. Do not assume it is implemented until 1.6 is integrated and verified.
+**Command approvals (1.6):** eligible dangerous-command requests in the local Desktop approval queue can show **Allow Once / Deny** buttons. A click is bound to the original private-home owner, exact bot message, live route/session, and immutable request/queue IDs. Only one matching decision is delivered; session/permanent permission is never granted. Unverifiable, generic/plugin-rule, isolated compute-host, or unsafe/oversized review requests remain notification-only and must be answered in Desktop. A delivered decision is not proof that the command finished.
 
 ## Data and trust
 
@@ -25,7 +25,7 @@ The current messages and question cards are primarily Korean; this release does 
 
 The minimum tested/declared Hermes compatibility floor is **0.21.5**. Reproducible CI uses the exact immutable Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` and that checkout's `uv.lock`; a SemVer floor alone does not prove compatibility with every core generation. CI tests Windows and Ubuntu with Python 3.14 and Node 24. Physical macOS and a separate user's Hermes Desktop GUI have not been verified by those tests.
 
-The plugin package code in this documentation baseline reports version `1.5.0`. Public repository publication, a final release SHA, and maintainer-merged catalog entries are pending. Until those are published, the install and catalog documents are templates: do not use their pending SHA placeholders or assume the names are already discoverable in Hermes.
+The plugin package code in this candidate reports version `1.6.0`. Public repository publication, a final release SHA, and maintainer-merged catalog entries are pending. Until those are published, the install and catalog documents are templates: do not use their pending SHA placeholders or assume the names are already discoverable in Hermes.
 
 ## Install
 

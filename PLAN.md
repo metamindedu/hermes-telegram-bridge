@@ -19,10 +19,11 @@ Implement and verify two native Hermes directory packages; finish the authorized
 - No renderer-provided executable, path, raw command, or environment is accepted.
 - The native handler calls the existing notifier action dispatcher; it does not implement a second action layer.
 - Results use one bounded strict frame: UTF-8 JSON ≤24 KiB serialized with `ensure_ascii=False` inside the existing ASCII base64 frame, within the 48,000-character stdout ceiling. Startup logging may surround it; duplicate/malformed frames fail closed. Native `reply_poll` budgets the entire response before claiming; oversized frozen descriptor/result data uses bounded SHA-256-verified read-only chunks without a schema change or claim/TTL renewal. Unselected forms remain queued. Ambiguous writes are not retried and credential-bearing exception text is not returned.
+- Approval helper actions are an explicit bounded `approval_*` allowlist under the same frame/CLI budget. Their new `approval-inbox` is separate from clarify/followup schemas; a verified package/version/capability handshake is mandatory, and an old resident ingress factory that does not pass the approval module grants no approval capability. Only the pinned in-process command gate can be acted on; queue IDs are first-settlement bindings, not server-side fingerprint CAS.
 
 ## Verification and CI
 
-- Preserve the existing Node completion/reply/followup and Python bridge suites; run `test_notifier` with real pinned-core SessionDB and redactor, never a stub/skip.
+- Preserve the existing Node completion/reply/followup suites and add `approval.test.mjs`; Python includes `test_approval_bridge` with the real pinned dangerous-command detector, approval queue first-settlement/coalesced follower behavior, real native dispatcher, and PTB `Application.process_update`. Preserve `test_notifier` with real pinned-core SessionDB and redactor, never a stub/skip.
 - Native tests use the real Hermes install API, PluginContext, and Plugin Doctor. Only local Git transport is mocked; fresh/update/rollback operate on fake homes and assert stable IDs plus sentinel config/plugin-data preservation.
 - `requirements-test.txt` explicitly declares bridge-only test dependencies. CI uses contents-read-only permissions, verified immutable action SHAs, and public Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` with its locked dependency environment, owned by the job.
 - Windows and Ubuntu run the same source tests. This is not cross-PC Desktop GUI/materialization or production activation evidence.

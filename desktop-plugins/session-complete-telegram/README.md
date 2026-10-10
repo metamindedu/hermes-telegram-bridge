@@ -1,6 +1,6 @@
 # Session Completion → Telegram
 
-## Completion replies (1.5.0)
+## Completion replies (1.6.0)
 
 After approved native Gateway restart, newly verified completion cards accept direct plain-text replies from the configured private-home owner. They submit through the captured Desktop route to the same in-memory session with `prompt.submit` and `queued:true`. No session handoff, resume, creation, interruption, or core change. Older cards lack trustworthy routing metadata and are not actionable.
 
@@ -84,28 +84,38 @@ Desktop/receiver leases before accepting anything.
 - `__init__.py` / `runtime.py`: fixed CLI registration and package-home validation.
 - `notifier.py`: read-only durable-state checks, SQLite at-most-once claims,
   existing Telegram credentials, fixed-destination sender and shared action dispatcher.
-- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`: Node behavior/race tests (Node built-in runner).
-- `test_notifier.py`: Python tests using the actual pinned Hermes `SessionDB` and redactor;
-  Telegram transport is stubbed only where the unit scenario requires it.
+- `followup_bridge.py`: completion-card reply lifecycle and isolated followup inbox.
+- `approval_bridge.py`: separate command-approval inbox, full literal review, receiver lease, and one-shot tap claim; Telegram never answers the core queue directly.
+- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`, `approval.test.mjs`: Node behavior/race tests (Node built-in runner).
+- `test_notifier.py`, `test_reply_bridge.py`, `test_followup_bridge.py`, `test_approval_bridge.py`: Python bridge tests using the actual pinned Hermes redactor/approval contract and real PTB `Application.process_update`; Telegram transport is mocked only where a unit scenario requires it.
 - `test_native_install.py`: real Hermes install/Doctor/PluginContext APIs with fake homes and Git-transport-only mock.
 
 From this folder, in the pinned-core environment described by `docs/operations.md`:
 
 ```
 node --check desktop/plugin.js
-node --test plugin.test.mjs reply.test.mjs followup.test.mjs
-python -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install -v
+node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs
+python -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install -v
 ```
 
 The test dependencies are declared in `requirements-test.txt`. Do not run the native installer against a production home as part of source tests.
+
+## Telegram command approvals (1.6.0)
+
+- `Allow Once` and `Deny` buttons are available only for the pinned core's real dangerous-command gate when the current Desktop `approval` request exactly matches its `approval.pending` queue entry, runtime session, queue ID, command, description, and producer pattern key. The helper re-runs the actual pinned `tools.approval_detection` classifier; no copied classifier is used.
+- The Telegram card displays the complete redacted command and description literally (no Markdown parsing, previews, or truncation). If redaction is unstable/ambiguous, suspicious credential text survives, Unicode/control characters are unsafe, the card exceeds Telegram's one-message bound, or the configured timeout is unavailable/expired, no buttons are sent; a notification-only card directs the user to Desktop.
+- Only `once` or `deny` can be submitted, always to the exact frozen queue ID with `all:false`. Only a numeric `resolved === 1` is reported as delivered; `resolved === 0` is expired and every other/timeout result is unknown. There is no `request.answer` fallback, retry, permanent/session allowlist update, or free-text approval.
+- `execute_code`, plugin-rule/action, sudo, secret/vault, generic/unknown approvals, and compute-host paths without an authoritative in-process native queue remain notification-only. Queue IDs provide core first-settlement binding; Desktop additionally rechecks the complete request and pending snapshots before registration, polling, and the final RPC. The RPC has no server-side fingerprint-CAS field, so this is not described as one.
+- The separate `approval-inbox` uses one-shot posting/open/queued/applying/terminal transitions, a short receiver/owner lease, and no replay after ambiguous sends, stale queued taps, owner change, or restart. A tap during a lease gap creates no receipt; a queued choice observed across a gap is terminally rejected. It shares the existing gateway `Application` and heartbeat; it never starts another Telegram poller.
+- Approval cards follow the profile's `approvals.timeout` with no clarify one-hour floor. The current `approval.pending` snapshot is rechecked on each pass and the native queue remains the deadline authority; a late tap can only receive `resolved:0` and is never redirected to another answer method.
+- Ingress, helper, and Desktop advertise the same package/capability version. An older resident ingress/factory or helper without that verified capability remains fail-closed/notification-only until the supported restart/upgrade path loads the matching package.
 
 ## Telegram answers (1.4.0)
 
 - Only active `clarify` requests are actionable: single-choice, multiple-choice
   with Submit, and explicit text replies to the exact Telegram card. A batch
   waits for all answers before submitting one complete response to Desktop.
-- Approval, sudo, secret/vault prompts and questions in final prose remain
-  notification-only. No approval or secret-entry bypass exists.
+- Dangerous command approvals are actionable only as scoped above; sudo, secret/vault prompts and questions in final prose remain notification-only. No secret-entry bypass exists.
 - The existing default messaging gateway owns all Telegram updates. A native
   `desktop-clarify-telegram` plugin adds scoped PTB handlers; no second
   getUpdates client, webhook change, core patch or secondary-profile config.
