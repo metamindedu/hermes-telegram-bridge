@@ -180,6 +180,26 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.assertIs(payload['protect_content'],False);self.assertNotIn(command,payload['text'])
         self.assertIn('Desktop에서',payload['text']);self.assertNotIn('reply_markup',payload)
 
+    def test_malformed_approval_blocks_are_unavailable_without_review_or_buttons(self):
+        command='rm -rf approval-fixture && echo password=synthetic-secret-value-739102'
+        self.request,self.pending=self.pair(command=command)
+        self.descriptor=self.descriptor_for()
+        req={'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,
+            'descriptor':self.descriptor,'request':self.request,'pending':self.pending,
+            'route':self.route,'session':self.session,'epoch':'epoch-fixture'}
+        for block in ('malformed', ['malformed'], False, 0, '', [], None):
+            with self.subTest(block=block):
+                (self.root/'config.yaml').write_text(
+                    'plugins:\n  enabled: [desktop-clarify-telegram]\napprovals: '+json.dumps(block)+'\n',encoding='utf-8')
+                result=notifier.dispatch_request(req,root=self.root,state=self.state,native=True,result_budget=24*1024)
+                self.assertEqual(result,{'ok':False,'reason':'timeout_unavailable'})
+                self.assertEqual(self.calls,[])
+                c=b.connect(self.state)
+                try:self.assertEqual(c.execute('SELECT count(*) FROM approvals').fetchone()[0],0)
+                finally:c.close()
+        (self.root/'config.yaml').write_text('plugins:\n  enabled: [desktop-clarify-telegram]\n',encoding='utf-8')
+        self.assertEqual(b._approval_timeout('default',notifier,self.root),300)
+
     def test_actual_timeout_is_used_without_clarify_ttl_floor(self):
         (self.root/'config.yaml').write_text('approvals:\n  timeout: 23\n',encoding='utf-8')
         result=self.registered();self.assertLessEqual(result['expires']-self.now,23.01)

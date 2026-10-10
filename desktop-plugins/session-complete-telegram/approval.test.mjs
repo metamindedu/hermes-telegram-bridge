@@ -280,7 +280,8 @@ test('stop and deadline are rechecked after a valid native claim gate before RPC
 test('unsafe approval registration reasons from checkAsk only reach notification-only approval_notice', async () => {
   const reasons=['review_text_missing','redaction_not_stable','redaction_omission','redaction_collision',
     'review_unicode_ambiguous','review_control_character','review_card_too_large','review_unavailable',
-    'timeout_unavailable','invalid_review_text','approval_result_too_large']
+    'timeout_unavailable','invalid_review_text','approval_result_too_large',
+    'approval_store_unavailable','AttributeError','disabled','receiver_unavailable','unexpected_failure']
   for(const reason of reasons){
     const f=fixture();const calls=[];const notices=[]
     const command='rm -rf /tmp/example && echo synthetic-secret-value-739102'
@@ -314,6 +315,47 @@ test('unsafe approval registration reasons from checkAsk only reach notification
     assert.equal(JSON.stringify(notices).includes(command),false,reason)
     assert.equal(JSON.stringify(notices).includes('synthetic-secret-value-739102'),false,reason)
     assert.equal(r.ask.id,request.id,reason)
+  }
+})
+
+test('supported approval failures never fall into attention even without a typed reason or ready receiver', async () => {
+  for(const variant of ['receiver-unready','null','empty','invalid-reason']){
+    const f=fixture();const calls=[];const notices=[]
+    const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:n=>notices.push(n),
+      requestProfile:async(_route,method)=>method==='approval.pending' ? {approvals:[f.pending]} : f.snapshot}
+    const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}});monitor.approvalCapable=true;monitor.replyOwner=f.owner
+    monitor.helper=async payload=>{
+      calls.push(payload.action)
+      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:variant!=='receiver-unready',version:VERSION,capability:APPROVAL_CAPABILITY}
+      if(payload.action==='approval_register')return variant==='null' ? null : variant==='empty' ? {} : {ok:false,reason:123}
+      if(payload.action==='approval_notice')return {ok:true,status:'sent',notification_only:true}
+      if(payload.action==='attention')return {ok:true,status:'sent'}
+      throw Error(payload.action)
+    }
+    const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
+    await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
+    assert.deepEqual(calls,variant==='receiver-unready' ? ['approval_owner_heartbeat','approval_notice'] :
+      ['approval_owner_heartbeat','approval_register','approval_notice'],variant)
+    assert.equal(record.approval,null);assert.equal(record.ask.id,f.request.id)
+    assert.equal(JSON.stringify(notices).includes(f.request.params.command),false)
+  }
+})
+
+test('unsupported generic/plugin-rule/compute-host approvals retain ordinary notification-only behavior', async () => {
+  for(const key of ['plugin_rule:fixture','execute_code','tirith:secret']){
+    const f=fixture();f.request.params.pattern_key=key;f.request.params.pattern_keys=[key]
+    f.pending.pattern_key=key;f.pending.pattern_keys=[key]
+    assert.equal(validateApprovalPair(f.request,f.pending,f.row.id),false)
+    const calls=[];const payloads=[]
+    const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:()=>{},
+      requestProfile:async(_route,method)=>method==='approval.pending' ? {approvals:[f.pending]} : f.snapshot}
+    const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}});monitor.approvalCapable=true;monitor.replyOwner=f.owner
+    monitor.helper=async payload=>{calls.push(payload.action);payloads.push(payload);return {ok:true,status:'sent'}}
+    const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
+    await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
+    assert.deepEqual(calls,['attention'],key);assert.equal(record.approval,null)
+    assert.deepEqual(payloads[0].ask_params,{},key)
+    assert.equal(payloads[0].ask_method,'approval');assert.equal(payloads[0].ask_id,f.request.id)
   }
 })
 

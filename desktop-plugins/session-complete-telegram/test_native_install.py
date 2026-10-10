@@ -558,6 +558,90 @@ class NativeInstallTests(unittest.TestCase):
                          [(200, "accepted_queued", None), (201, "rejected", None)])
         self.assertEqual(feedback, 2)
 
+    def test_malformed_timeout_native_receipt_drives_command_free_checkask(self):
+        """Actual registered CLI receipts feed the real renderer, not a preset error category."""
+        import subprocess
+        plugin, handler, parser = self._native_frontend_handler('native_timeout_review_boundary',candidate='v2')
+        with patch.dict(os.environ, {'HERMES_HOME':str(self.home),'LOCALAPPDATA':str(self.local_app_data)}):
+            notice_module=importlib.import_module('native_timeout_review_boundary.notifier')
+            bridge=importlib.import_module('native_timeout_review_boundary.approval_bridge')
+        state=self.home/'plugin-data'/FRONTEND_ID
+        owner='native-timeout-owner'
+        bridge.bind_receiver(77,99,None,'native-timeout-boot',private_verified=True,state=state)
+        bridge.owner_heartbeat(owner,state=state)
+        command='rm -rf approval-native-fixture && echo password=synthetic-secret-value-739102'
+        dangerous,key,description=__import__('tools.approval_detection',fromlist=['detect_dangerous_command']).detect_dangerous_command(command)
+        self.assertTrue(dangerous)
+        with self.assertRaisesRegex(ValueError,'redaction_omission'):
+            bridge.review_card({'params':{'command':command,'description':description}},300)
+        calls=[]
+        def telegram_stub(token,method,payload):
+            calls.append((method,payload))
+            return {'ok':True,'result':{'message_id':901,'chat':{'id':99,'type':'private'},'text':payload['text']}}
+        script=r'''
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {registerHooks} from 'node:module';
+registerHooks({resolve(s,c,n){if(s==='@hermes/plugin-sdk')return {url:'data:text/javascript,export const host={}',shortCircuit:true};return n(s,c)}});
+const x=JSON.parse(readFileSync(0,'utf8'));
+const {CompletionMonitor}=await import(x.entry);
+const actions=[],notices=[];
+const snapshot={epoch:'native-epoch',open_requests:[x.request]};
+const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[x.route],notify:n=>notices.push(n),
+ requestProfile:async(_r,m)=>{if(m==='session.events.since')return snapshot;if(m==='approval.pending')return {approvals:[x.pending]};throw Error(m)}};
+const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}});monitor.approvalCapable=true;monitor.replyOwner=x.owner;
+monitor.helper=async req=>{actions.push(req.action);if(req.action==='approval_owner_heartbeat')return x.heartbeat;
+ if(req.action==='approval_register')return x.registration;if(req.action==='approval_notice')return x.notice;
+ if(req.action==='attention')return {ok:true,status:'sent'};throw Error(req.action)};
+const record={sid:x.session.id,ask:null,approval:null,askChecking:false};
+await monitor.checkAsk(record,x.route,x.session,snapshot,x.request);
+assert.deepEqual(actions,['approval_owner_heartbeat','approval_register','approval_notice']);
+assert.equal(record.approval,null);assert.equal(record.ask.id,x.request.id);
+assert.equal(JSON.stringify(notices).includes(x.command),false);assert.equal(JSON.stringify(notices).includes('synthetic-secret-value-739102'),false);
+console.log('actual native timeout receipt: command-free renderer boundary verified');
+'''
+        with patch.object(notice_module,'credentials',return_value=('77:synthetic-token',99,None)), \
+                patch.object(notice_module,'telegram',side_effect=telegram_stub):
+            for index,block in enumerate(('malformed',['malformed'])):
+                with self.subTest(block=block):
+                    self.config.write_text('plugins:\n  enabled: [desktop-clarify-telegram]\napprovals: '+json.dumps(block)+'\n',encoding='utf-8')
+                    queue_id=('a' if index==0 else 'b')*32
+                    request={'id':('srq-aabbcc112233' if index==0 else 'srq-112233aabbcc'),'method':'approval','params':{
+                        'session_id':'runtime-native','request_id':queue_id,'command':command,'description':description,
+                        'pattern_key':key,'pattern_keys':[key],'allow_permanent':True,'allow_session':True,
+                        'choices':['once','session','always','deny']}}
+                    pending={k:request['params'][k] for k in ('request_id','command','description','pattern_key','pattern_keys','allow_permanent','allow_session')}
+                    route={'mode':'local','connectionId':'native-local','profile':'default','targetProfile':'default'}
+                    session={'id':'runtime-native','session_key':'durable-native','status':'waiting'}
+                    descriptor={'owner':owner,'connectionId':route['connectionId'],'profile':'default','targetProfile':'default',
+                        'sid':session['id'],'session_key':session['session_key'],'epoch':'native-epoch',
+                        'request_id':request['id'],'queue_id':queue_id,'request_fingerprint':bridge._digest(request),
+                        'pending_fingerprint':bridge._digest(pending)}
+                    heartbeat,_=self._call_native(handler,parser,{'action':'approval_owner_heartbeat','capability':bridge.CAPABILITY,'owner':owner})
+                    registration,_=self._call_native(handler,parser,{'action':'approval_register','capability':bridge.CAPABILITY,
+                        'owner':owner,'descriptor':descriptor,'request':request,'pending':pending,'route':route,'session':session,'epoch':'native-epoch'})
+                    self.assertEqual(registration,{'ok':False,'reason':'timeout_unavailable'})
+                    before=len(calls)
+                    notice_req={'action':'approval_notice','capability':bridge.CAPABILITY,'owner':owner,
+                        'descriptor':descriptor,'request':request,'pending':pending,'reason':registration['reason']}
+                    notice,_=self._call_native(handler,parser,notice_req)
+                    self.assertTrue(notice['notification_only'])
+                    duplicate,_=self._call_native(handler,parser,notice_req)
+                    self.assertTrue(duplicate['duplicate'])
+                    self.assertEqual(sum(m=='sendMessage' for m,_ in calls[before:]),1)
+                    for _,payload in calls[before:]:
+                        self.assertNotIn('reply_markup',payload)
+                        self.assertNotIn(command,payload['text']);self.assertNotIn('synthetic-secret-value-739102',payload['text'])
+                    c=bridge.connect(state)
+                    try:self.assertEqual(c.execute('SELECT count(*) FROM approvals').fetchone()[0],0)
+                    finally:c.close()
+                    payload={'entry':(self.home/'plugins'/FRONTEND_ID/'desktop/plugin.js').as_uri(),'owner':owner,
+                        'route':route,'session':session,'request':request,'pending':pending,'command':command,
+                        'heartbeat':heartbeat,'registration':registration,'notice':notice}
+                    result=subprocess.run(['node','--input-type=module','-e',script],input=json.dumps(payload),
+                        text=True,capture_output=True,timeout=20)
+                    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
     def test_registered_native_dispatcher_frames_real_approval_inbox_claim(self):
         """Run approval_* through the actual registered CLI handler in a fake Hermes home."""
         plugin, handler, parser = self._native_frontend_handler("phase2_real_approval_dispatch",candidate="v2")

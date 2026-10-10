@@ -4,9 +4,6 @@ import { host } from '@hermes/plugin-sdk'
 export const VERSION = '1.6.1'
 export const APPROVAL_CAPABILITY = 'desktop-command-approval-v2'
 export const APPROVAL_LEASE_MS = 45_000
-const APPROVAL_NON_ACTIONABLE_REASONS = new Set([
-  'invalid_review_text', 'timeout_unavailable', 'approval_result_too_large'
-])
 
 export function stableJSON(value) {
   if (Array.isArray(value)) return '[' + value.map(stableJSON).join(',') + ']'
@@ -777,7 +774,10 @@ export class CompletionMonitor {
       if (!ask || (r.ask && r.ask.id === ask.id)) return
       const reply = await this.helper({
         action: 'attention', kind: 'ask', profile: route.targetProfile, session_key: row.session_key,
-        ask_id: ask.id, ask_method: ask.method, ask_params: ask.params || {}, desktop_observed: true
+        ask_id: ask.id, ask_method: ask.method,
+        // Unverified/unsupported approval notifications remain metadata-only;
+        // complete command review belongs exclusively to the approval path.
+        ask_params: ask.method === 'approval' ? {} : (ask.params || {}), desktop_observed: true
       })
       // Any terminal answer settles the episode: gate rejections are
       // deterministic and an ambiguous send must never be retried. Only the
@@ -841,13 +841,13 @@ export class CompletionMonitor {
     }
     const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
       capability:APPROVAL_CAPABILITY})
-    if (heartbeat?.feature_ready !== true || heartbeat.version !== VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) {
-      return false
+    let registered = {ok:false, reason:'receiver_unavailable'}
+    if (heartbeat?.feature_ready === true && heartbeat.version === VERSION && heartbeat.capability === APPROVAL_CAPABILITY) {
+      registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
+        owner:this.replyOwner, descriptor, request:ask, pending:pending[0], route:{
+          mode:route.mode, connectionId:route.connectionId, profile:route.profile, targetProfile:route.targetProfile
+        }, session:{id:row.id, session_key:row.session_key, status:row.status}, epoch:since.epoch})
     }
-    const registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
-      owner:this.replyOwner, descriptor, request:ask, pending:pending[0], route:{
-        mode:route.mode, connectionId:route.connectionId, profile:route.profile, targetProfile:route.targetProfile
-      }, session:{id:row.id, session_key:row.session_key, status:row.status}, epoch:since.epoch})
     if (registered?.ok === true && typeof registered.id === 'string' &&
         ['posting','open','queued','applying'].includes(registered.status)) {
       r.approval = {id:registered.id, descriptor, request:ask, pending:pending[0],
@@ -855,26 +855,24 @@ export class CompletionMonitor {
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
-    const unsafeReview = typeof registered?.reason === 'string' &&
-      (/^(?:review_|redaction_)/u.test(registered.reason) || APPROVAL_NON_ACTIONABLE_REASONS.has(registered.reason))
-    if (unsafeReview) {
-      const notice = await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
-        owner:this.replyOwner, descriptor, request:ask, pending:pending[0], reason:registered.reason})
-      r.ask = {id:ask.id, method:'approval'}
-      this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
-        message:'이 명령은 Telegram에서 안전하게 검토할 수 없습니다. 전체 명령과 현재 승인을 Desktop에서 확인해 주세요.'})
-      if (!notice?.ok && !notice?.duplicate && ['failed','unknown'].includes(notice?.status)) {
-        this.api.notify({kind:'warning', title:'입력 대기 알림',
-          message:'알림 전송 결과를 확인하지 못했습니다. 중복 방지를 위해 다시 보내지 않았습니다.'})
-      }
-      return true
-    }
     if (registered?.reason === 'prior_owner' || registered?.duplicate || registered?.status &&
         ['expired','rejected','unknown','applied'].includes(registered.status)) {
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
-    return false
+    // Once the pair is supported, no failure category may re-enter generic
+    // attention with command text. Unknown/malformed failures are guidance-only.
+    const notice = await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
+      owner:this.replyOwner, descriptor, request:ask, pending:pending[0],
+      reason:typeof registered?.reason === 'string' ? registered.reason : 'review_unavailable'})
+    r.ask = {id:ask.id, method:'approval'}
+    this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
+      message:'이 명령은 Telegram에서 안전하게 검토할 수 없습니다. 전체 명령과 현재 승인을 Desktop에서 확인해 주세요.'})
+    if (!notice?.ok && !notice?.duplicate && ['failed','unknown'].includes(notice?.status)) {
+      this.api.notify({kind:'warning', title:'입력 대기 알림',
+        message:'알림 전송 결과를 확인하지 못했습니다. 중복 방지를 위해 다시 보내지 않았습니다.'})
+    }
+    return true
   }
 
   async approvalSnapshot(bridge) {

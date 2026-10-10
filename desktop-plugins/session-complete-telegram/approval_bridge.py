@@ -381,13 +381,18 @@ def _approval_timeout(profile, notifier, root):
         home = notifier.profile_home(profile, root=root)
         config_path = home / "config.yaml"
         if config_path.is_file():
-            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
+            if loaded is None:
+                loaded = {}
             if not isinstance(loaded, dict):
                 return None
             config = loaded
+        approvals = config.get("approvals", {})
+        if not isinstance(approvals, dict):
+            return None
+        raw = approvals.get("timeout", 300)
     except Exception:
         return None
-    raw = (config.get("approvals") or {}).get("timeout", 300)
     try:
         seconds = int(raw)
     except (TypeError, ValueError, OverflowError):
