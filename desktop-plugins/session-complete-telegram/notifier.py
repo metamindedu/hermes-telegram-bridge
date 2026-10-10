@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 
 def _active_hermes_home():
@@ -557,7 +557,7 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             reply_bridge = _sibling_module("reply_bridge")
             result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                          result_budget=result_budget if native else None)
-        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice"}:
+        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice", "approval_claim_valid"}:
             approval_bridge = _sibling_module("approval_bridge")
             result = approval_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                             result_budget=result_budget if native else None)
@@ -601,7 +601,7 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             capabilities = []
             try:
                 approval_bridge = _sibling_module("approval_bridge")
-                if approval_bridge.VERSION == VERSION and approval_bridge.CAPABILITY == "desktop-command-approval-v1":
+                if approval_bridge.VERSION == VERSION and approval_bridge.CAPABILITY == "desktop-command-approval-v2":
                     capabilities.append(approval_bridge.CAPABILITY)
             except Exception:
                 pass

@@ -6,7 +6,7 @@ The official admission sources read for this preparation are the current [`plugi
 
 ## Required release pin
 
-Use the **same exact 40-character SHA** in both entries, and ensure it is the published commit containing the code and version shown below. The final release SHA is intentionally unknown here. The value `PENDING` is a visible placeholder, not an installable pin. Do not substitute the isolated baseline SHA, a branch, a tag, a short SHA, or a SHA guessed before the final release exists. The version `1.6.0` below is read from both package manifests and the Desktop entry in this baseline; update it only if the final pinned code reports a different version.
+Use the **same exact 40-character SHA** in both entries, and ensure it is the published commit containing the code and version shown below. The final release SHA is intentionally unknown here. The value `PENDING` is a visible placeholder, not an installable pin. Do not substitute the isolated baseline SHA, a branch, a tag, a short SHA, or a SHA guessed before the final release exists. The version `1.6.1` below is read from both package manifests and the Desktop entry in this candidate; update it only if the final pinned code reports a different version.
 
 ## Entry 1 — Desktop component and fixed CLI helper
 
@@ -21,7 +21,7 @@ maintainer: NewMetaW
 tier: community
 category: desktop
 requires_hermes: ">=0.21.5"
-version: "1.6.0"
+version: "1.6.1"
 capabilities:
   provides_tools: []
   provides_hooks: []
@@ -44,7 +44,7 @@ maintainer: NewMetaW
 tier: community
 category: platform
 requires_hermes: ">=0.21.5"
-version: "1.6.0"
+version: "1.6.1"
 capabilities:
   provides_tools: []
   provides_hooks: []
@@ -71,7 +71,7 @@ The PR and the pinned README should disclose all of the following, even if a cat
 - The Desktop component locally reads persisted session titles, final assistant responses, and pending clarify request text/choices from local profiles under that same default home. It waits for a 60-second settled quiet period; completion previews are redacted and capped at 1,200 characters, but redaction is not an absolute guarantee.
 - Telegram cards are intentionally copyable/forwardable (`protect_content: false`). The package stores local SQLite delivery/deduplication data, descriptors, and message-ID tombstones; clarify question/form content may remain until up to 24 hours after expiry, while raw inbound reply text is cleared on settlement or expiry.
 - The renderer uses a fixed argv for `desktop-telegram-bridge` through the Hermes `cli.exec` route. It does not supply an arbitrary executable, shell command, or environment, and the helper refuses named/foreign homes. The native ingress is opt-in, uses the existing Gateway `Application`, and accepts only replies/callbacks tied to exact cards and the configured private owner/live session. It is not unrestricted chat access or a permanent approval mechanism.
-- Version 1.6 provides Allow Once / Deny only for eligible dangerous-command approvals in Desktop's local in-process queue, with original-message/private-owner and live-request authority. Generic/plugin-rule/compute-host or unsafe/oversized review requests remain notification-only. Exact queue IDs and `all:false` prevent broad approval; no session/permanent rights are written. Ambiguous delivery is never replayed, and a delivered decision is not command-completion evidence. Approval review/state uses a separate local inbox.
+- Version 1.6.1 provides Allow Once / Deny only for eligible dangerous-command approvals in Desktop's local in-process queue, with original-message/private-owner and live-request authority. It requires matching version/capability handshakes, including the read-only final claim-validity gate before dispatch; that gate is not atomic server-side fingerprint CAS. Generic/plugin-rule/compute-host or unsafe/oversized review requests remain notification-only. Exact queue IDs and `all:false` prevent broad approval; no session/permanent rights are written. Ambiguous delivery is never replayed, and a delivered decision is not command-completion evidence. Approval review/state uses a separate local inbox.
 - The source sends no telemetry to NewMetaW. The current user-facing notices/cards are primarily Korean; do not claim complete localization.
 - The package is independently authored by NewMetaW and is not a fork of `telegram-notify`, a bundled Hermes plugin, or a Nous Research product. The listing must be `community`, not `official`; Nous Research has not endorsed it.
 

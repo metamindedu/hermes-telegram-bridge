@@ -398,5 +398,266 @@ class ApprovalBridgeTests(unittest.TestCase):
                 await app.shutdown()
         asyncio.run(run())
 
+    def test_native_claim_validity_is_read_only_and_checks_live_authority(self):
+        result=self.registered();row=self.row(result['id'])
+        self.assertTrue(b.choose(row['token'],'once',{**self.identity(result['id']),'event':'claim-gate'},
+                                state=self.state,now=self.now+.1)['ok'])
+        observation=self.observe(result['id'])
+        polled=notifier.dispatch_request({'action':'approval_poll','capability':b.CAPABILITY,'owner':self.owner,
+            'observations':[observation],'unverified':[],'absent':[]},root=self.root,state=self.state,
+            native=True,result_budget=24*1024)
+        self.assertTrue(polled['ok'],polled);self.assertEqual(len(polled['items']),1)
+        item=polled['items'][0];before=self.row(item['id'])
+        request={'action':'approval_claim_valid','capability':b.CAPABILITY,'owner':self.owner,
+            'id':item['id'],'claim':item['claim'],'descriptor':item['descriptor'],
+            'authority':b._digest(item['descriptor']),'deadline':item['deadline']}
+        valid=notifier.dispatch_request(request,root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertEqual(valid,{'ok':True,'valid':True,'id':item['id'],'claim':item['claim'],
+            'authority':b._digest(item['descriptor']),'deadline':item['deadline']})
+        self.assertEqual(self.row(item['id']),before,'read gate must not renew or mutate the claim')
+        for label,changes in (
+            ('owner',{'owner':'different-owner'}),('id',{'id':'f'*32}),
+            ('claim',{'claim':'0'*32}),('authority',{'authority':'0'*64}),
+            ('descriptor',{'descriptor':{**item['descriptor'],'epoch':'changed'}})):
+            with self.subTest(label=label):
+                denied=notifier.dispatch_request({**request,**changes},root=self.root,state=self.state,
+                    native=True,result_budget=24*1024)
+                self.assertIs(denied.get('valid'),False,denied)
+                self.assertEqual(self.row(item['id']),before)
+
+        c=b.connect(self.state)
+        try:
+            saved_live=json.loads(c.execute("SELECT value FROM receiver WHERE key='live'").fetchone()[0])
+        finally:c.close()
+        for label,changes in (
+            ('receiver-bot',{'bot':78}),('receiver-chat',{'chat':98}),('receiver-topic',{'topic':5}),
+            ('receiver-boot',{'boot':'other-boot'}),('receiver-version',{'version':'1.6.0'}),
+            ('receiver-capability',{'capability':'desktop-command-approval-v1'})):
+            with self.subTest(label=label):
+                c=b.connect(self.state)
+                try:c.execute("UPDATE receiver SET value=? WHERE key='live'",(b.canonical({**saved_live,**changes}),))
+                finally:c.close()
+                denied=notifier.dispatch_request(request,root=self.root,state=self.state,native=True,result_budget=24*1024)
+                self.assertIs(denied.get('valid'),False,denied)
+                self.assertEqual(self.row(item['id']),before)
+                c=b.connect(self.state)
+                try:c.execute("UPDATE receiver SET value=? WHERE key='live'",(b.canonical(saved_live),))
+                finally:c.close()
+
+        c=b.connect(self.state)
+        try:c.execute('UPDATE owners SET seen=? WHERE owner=?',(time.time()-b.LEASE-1,self.owner))
+        finally:c.close()
+        stale_owner=notifier.dispatch_request(request,root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertIs(stale_owner.get('valid'),False)
+        c=b.connect(self.state)
+        try:
+            c.execute('UPDATE owners SET seen=? WHERE owner=?',(time.time(),self.owner))
+            c.execute('UPDATE approvals SET deadline=? WHERE id=?',(time.time()-1,item['id']))
+        finally:c.close()
+        expired=notifier.dispatch_request(request,root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertIs(expired.get('valid'),False)
+        c=b.connect(self.state)
+        try:c.execute('UPDATE approvals SET deadline=?,expires=? WHERE id=?',(item['deadline'],time.time()-1,item['id']))
+        finally:c.close()
+        absolute_expired=notifier.dispatch_request(request,root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertIs(absolute_expired.get('valid'),False)
+        self.assertEqual(self.row(item['id'])['status'],'applying','read gate must neither retire nor renew')
+        self.assertEqual(self.row(item['id']),{**before,'deadline':item['deadline'],'expires':self.row(item['id'])['expires']})
+
+    def test_claim_gate_barrier_rejects_real_sqlite_boot_change_and_ingress_disable_without_replay(self):
+        import threading
+        for index,cause in enumerate(('boot-change','ingress-disable')):
+            if index:
+                self.now=time.time()
+                self.assertTrue(b.bind_receiver(77,99,None,'boot-fixture',private_verified=True,
+                    state=self.state,now=self.now))
+                b.owner_heartbeat(self.owner,state=self.state,now=self.now)
+                self.request,self.pending=self.pair(queue_id='b'*32,srq='srq-112233aabbcc')
+                self.request_fp=b._digest(self.request);self.pending_fp=b._digest(self.pending)
+                self.descriptor=self.descriptor_for()
+            result=self.registered();row=self.row(result['id'])
+            self.assertTrue(b.choose(row['token'],'deny',{**self.identity(result['id']),'event':'barrier-'+cause},
+                                     state=self.state,now=self.now+.1)['ok'])
+            observation=self.observe(result['id'])
+            first=notifier.dispatch_request({'action':'approval_poll','capability':b.CAPABILITY,'owner':self.owner,
+                'observations':[observation],'unverified':[],'absent':[]},root=self.root,state=self.state,
+                native=True,result_budget=24*1024)
+            self.assertEqual(len(first['items']),1)
+            item=first['items'][0]
+            at_snapshot=threading.Event();resume=threading.Event();receipts=[];respond=[]
+            def paused_renderer_tail():
+                at_snapshot.set()
+                if not resume.wait(timeout=5):raise AssertionError('claim-validity barrier was not resumed')
+                receipt=notifier.dispatch_request({'action':'approval_claim_valid','capability':b.CAPABILITY,
+                    'owner':self.owner,'id':item['id'],'claim':item['claim'],'descriptor':item['descriptor'],
+                    'authority':b._digest(item['descriptor']),'deadline':item['deadline']},
+                    root=self.root,state=self.state,native=True,result_budget=24*1024)
+                receipts.append(receipt)
+                if receipt.get('valid') is True:respond.append('approval.respond')
+            thread=threading.Thread(target=paused_renderer_tail,daemon=True);thread.start()
+            self.assertTrue(at_snapshot.wait(timeout=5))
+            if cause=='boot-change':
+                self.assertTrue(b.bind_receiver(77,99,None,'boot-after-claim',private_verified=True,
+                    state=self.state,now=time.time()))
+                self.assertEqual(self.row(item['id'])['status'],'unknown')
+            else:
+                (self.root/'config.yaml').write_text('plugins:\n  enabled: []\napprovals:\n  timeout: 300\n',encoding='utf-8')
+                self.assertEqual(self.row(item['id'])['status'],'applying')
+            resume.set();thread.join(timeout=5);self.assertFalse(thread.is_alive())
+            self.assertEqual(len(receipts),1,cause);self.assertIs(receipts[0].get('valid'),False,cause)
+            self.assertEqual(respond,[],cause)
+            if cause=='ingress-disable':
+                (self.root/'config.yaml').write_text('plugins:\n  enabled:\n    - desktop-clarify-telegram\napprovals:\n  timeout: 300\n',encoding='utf-8')
+            replay=notifier.dispatch_request({'action':'approval_poll','capability':b.CAPABILITY,'owner':self.owner,
+                'observations':[observation],'unverified':[],'absent':[]},root=self.root,state=self.state,
+                native=True,result_budget=24*1024)
+            self.assertEqual(replay.get('items'),[],cause)
+
+    def test_exact_poll_projection_defers_unicode_claim_with_terminal_ids_without_consuming(self):
+        large_command='rm -rf approval-fixture # '+'가'*3000+'🙂'*300
+        self.request,self.pending=self.pair(command=large_command)
+        self.request_fp=b._digest(self.request);self.pending_fp=b._digest(self.pending);self.descriptor=self.descriptor_for()
+        register_req={'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,
+            'descriptor':self.descriptor,'request':self.request,'pending':self.pending,'route':self.route,
+            'session':self.session,'epoch':'epoch-fixture'}
+        raw=json.dumps(register_req,ensure_ascii=False,separators=(',',':')).encode('utf-8')
+        self.assertLessEqual(len(raw),22_500,'preserve the native request envelope')
+        queued=notifier.dispatch_request(register_req,root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertTrue(queued.get('ok'),queued);self.assertEqual(queued['status'],'open')
+        queued_row=self.row(queued['id'])
+        self.assertTrue(b.choose(queued_row['token'],'once',{**self.identity(queued['id']),'event':'large-unicode'},
+                                 state=self.state,now=time.time()+.1)['ok'])
+
+        second_request,second_pending=self.pair(queue_id='b'*32,srq='srq-112233aabbcc')
+        second_descriptor=self.descriptor_for(second_request,second_pending)
+        other=notifier.dispatch_request({'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,
+            'descriptor':second_descriptor,'request':second_request,'pending':second_pending,'route':self.route,
+            'session':self.session,'epoch':'epoch-fixture'},root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertTrue(other.get('ok'),other)
+        c=b.connect(self.state)
+        try:
+            c.execute('UPDATE approvals SET seen=? WHERE id=?',(time.time()-5,other['id']))
+            terminal_ids=[f'{i+1:032x}' for i in range(200)]
+            for terminal_id in terminal_ids:
+                c.execute("INSERT INTO approvals(id,identity,owner,descriptor,request_json,pending_json,request_fingerprint,pending_fingerprint,review_text,token,bot,chat,topic,boot,created,expires,seen,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'applied')",
+                    (terminal_id,'terminal:'+terminal_id,self.owner,'{}','{}','{}','0'*64,'1'*64,None,
+                     'terminal-token:'+terminal_id,77,99,None,'boot-fixture',self.now,self.now-1,self.now))
+        finally:c.close()
+        observations=[self.observe(queued['id']),self.observe(other['id'])]
+        stale_seen=self.row(other['id'])['seen']
+        item_projection={'id':queued['id'],'claim':'f'*32,'deadline':time.time()+b.LEASE,
+            'descriptor':self.descriptor,'request':self.request,'pending':self.pending,'choice':'once'}
+        complete_projection={'ok':True,'items':[item_projection],'terminal':terminal_ids}
+        combined_bytes=len(json.dumps(complete_projection,ensure_ascii=False,separators=(',',':')).encode('utf-8'))
+        terminal_bytes=len(json.dumps({'ok':True,'items':[],'terminal':terminal_ids},ensure_ascii=False,
+            separators=(',',':')).encode('utf-8'))
+        self.assertGreater(combined_bytes,24*1024);self.assertLessEqual(terminal_bytes,24*1024)
+        first=notifier.dispatch_request({'action':'approval_poll','capability':b.CAPABILITY,'owner':self.owner,
+            'observations':observations,'unverified':terminal_ids[:100],'absent':terminal_ids[100:]},
+            root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertTrue(first.get('ok'),first);self.assertEqual(first['items'],[])
+        self.assertCountEqual(first['terminal'],terminal_ids)
+        self.assertLessEqual(len(json.dumps(first,ensure_ascii=False,separators=(',',':')).encode('utf-8')),24*1024)
+        self.assertEqual(self.row(queued['id'])['status'],'queued','budget check must precede the claim mutation')
+        self.assertGreater(self.row(other['id'])['seen'],stale_seen,msg='all active observations are checked before claim selection')
+        import base64
+        import importlib.util
+        import io
+        from contextlib import redirect_stdout
+        native_name='approval_native_frame_fixture'
+        native_path=Path(__file__).with_name('__init__.py')
+        spec=importlib.util.spec_from_file_location(native_name,native_path,submodule_search_locations=[str(native_path.parent)])
+        native_entry=importlib.util.module_from_spec(spec);__import__('sys').modules[native_name]=native_entry
+        spec.loader.exec_module(native_entry)
+        stdout=io.StringIO()
+        with redirect_stdout(stdout):native_entry._write_frame(first)
+        frame=stdout.getvalue();self.assertLessEqual(len(frame),48_000)
+        encoded=frame.splitlines()[1]
+        frame_json=base64.urlsafe_b64decode(encoded+'='*((4-len(encoded)%4)%4))
+        self.assertLessEqual(len(frame_json),24*1024);self.assertEqual(json.loads(frame_json),first)
+        second=notifier.dispatch_request({'action':'approval_poll','capability':b.CAPABILITY,'owner':self.owner,
+            'observations':observations,'unverified':[],'absent':[]},root=self.root,state=self.state,
+            native=True,result_budget=24*1024)
+        self.assertEqual(len(second['items']),1,second)
+        self.assertEqual(second['items'][0]['id'],queued['id'])
+        self.assertEqual(self.row(queued['id'])['status'],'applying')
+
+    def test_single_claim_that_cannot_fit_native_result_is_rejected_before_buttons(self):
+        register_req={'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,
+            'descriptor':self.descriptor,'request':self.request,'pending':self.pending,'route':self.route,
+            'session':self.session,'epoch':'epoch-fixture'}
+        rejected=notifier.dispatch_request(register_req,root=self.root,state=self.state,native=True,result_budget=256)
+        self.assertEqual(rejected,{'ok':False,'reason':'approval_result_too_large'})
+        c=b.connect(self.state)
+        try:self.assertEqual(c.execute('SELECT count(*) FROM approvals').fetchone()[0],0)
+        finally:c.close()
+        self.assertFalse(any(method=='sendMessage' for method,_ in self.calls))
+        notice=notifier.dispatch_request({'action':'approval_notice','capability':b.CAPABILITY,'owner':self.owner,
+            'descriptor':self.descriptor,'request':self.request,'pending':self.pending,
+            'reason':'approval_result_too_large'},root=self.root,state=self.state,native=True,result_budget=24*1024)
+        self.assertTrue(notice.get('ok'),notice)
+        payload=next(payload for method,payload in self.calls if method=='sendMessage')
+        self.assertNotIn(self.request['params']['command'],payload['text'])
+        self.assertNotIn('reply_markup',payload)
+        self.assertIn('Desktop에서',payload['text'])
+
+    def test_unsafe_notice_reasons_are_command_free_deduplicated_via_native_dispatch(self):
+        command='rm -rf approval-fixture && echo password=synthetic-secret-value-739102'
+        self.request,self.pending=self.pair(command=command)
+        self.request_fp=b._digest(self.request);self.pending_fp=b._digest(self.pending);self.descriptor=self.descriptor_for()
+        calls=[]
+        reason='invalid_review_text'
+        for _ in range(2):
+            response=notifier.dispatch_request({'action':'approval_notice','capability':b.CAPABILITY,
+                'owner':self.owner,'descriptor':self.descriptor,'request':self.request,'pending':self.pending,
+                'reason':reason},root=self.root,state=self.state,native=True,result_budget=24*1024)
+            self.assertTrue(response.get('ok'),response)
+            calls.append(response)
+        sends=[payload for method,payload in self.calls if method=='sendMessage']
+        self.assertEqual(len(sends),1)
+        self.assertIs(calls[1].get('duplicate'),True)
+        self.assertNotIn(command,sends[0]['text']);self.assertNotIn('synthetic-secret-value-739102',sends[0]['text'])
+        self.assertNotIn('reply_markup',sends[0]);self.assertIn('Desktop에서',sends[0]['text'])
+
+    def test_ptb_process_update_rejects_actual_edit_date_even_when_card_text_matches(self):
+        from telegram import Update
+        from telegram.ext import Application, TypeHandler
+        async def run():
+            def same_text_not_modified(token,method,payload):
+                if method=='editMessageText':
+                    self.calls.append((method,copy.deepcopy(payload)))
+                    return {'ok':False,'error_code':400,'description':'Bad Request: message is not modified'}
+                return self.telegram(token,method,payload)
+            with patch.object(notifier,'telegram',side_effect=same_text_not_modified):
+                result=self.registered()
+            self.assertEqual(result['status'],'open','same-text 400 not modified is not an edit of the card')
+            row=self.row(result['id']);before=(row['status'],row['choice'],row['seen'])
+            callback_data=self.calls[0][1]['reply_markup']['inline_keyboard'][0][0]['callback_data']
+            app=Application.builder().token('77:synthetic-token').build()
+            with patch.object(type(app.bot),'initialize',new=AsyncMock()),patch.object(type(app.bot),'shutdown',new=AsyncMock()):
+                await app.initialize()
+                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',enabled=lambda:True,state=self.state))
+                later=[]
+                async def downstream(update,context):later.append(update)
+                app.add_handler(TypeHandler(Update,downstream),group=1)
+                update=Update.de_json({'update_id':90,'callback_query':{'id':'edited-query',
+                    'from':{'id':99,'is_bot':False,'first_name':'owner'},'chat_instance':'fixture','data':callback_data,
+                    'message':{'message_id':row['message_id'],'date':1,'edit_date':2,
+                        'chat':{'id':99,'type':'private'},'from':{'id':77,'is_bot':True,'first_name':'bot'},
+                        'text':row['review_text']}}},app.bot)
+                answers=AsyncMock();real_choose=b.choose;identities=[]
+                def capture_choose(token,choice,identity,**kwargs):
+                    identities.append(identity);return real_choose(token,choice,identity,**kwargs)
+                with patch.object(b,'choose',side_effect=capture_choose),patch.object(type(update.callback_query),'answer',new=answers):
+                    await app.process_update(update)
+                self.assertEqual(len(identities),1)
+                self.assertIs(identities[0]['edited'],True)
+                after=self.row(result['id'])
+                self.assertEqual((after['status'],after['choice'],after['seen']),before)
+                self.assertEqual(self.receipts(),0);self.assertEqual(later,[])
+                self.assertEqual(answers.await_args.args[0],'만료되었거나 현재 요청과 일치하지 않습니다. Desktop에서 확인해 주세요.')
+                await app.shutdown()
+        asyncio.run(run())
+
 if __name__=='__main__':unittest.main(verbosity=2)
 

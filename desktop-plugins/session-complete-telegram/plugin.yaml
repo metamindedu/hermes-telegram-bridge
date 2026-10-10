@@ -1,5 +1,5 @@
 name: session-complete-telegram
-version: '1.6.0'
+version: '1.6.1'
 requires_hermes: '>=0.21.5'
 description: Registers the fixed default-home CLI command used by the Desktop completion notifier.
 python_dependencies:

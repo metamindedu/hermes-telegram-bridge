@@ -1,6 +1,6 @@
 # Session Completion → Telegram
 
-## Completion replies (1.6.0)
+## Completion replies (1.6.1)
 
 After approved native Gateway restart, newly verified completion cards accept direct plain-text replies from the configured private-home owner. They submit through the captured Desktop route to the same in-memory session with `prompt.submit` and `queued:true`. No session handoff, resume, creation, interruption, or core change. Older cards lack trustworthy routing metadata and are not actionable.
 
@@ -100,7 +100,7 @@ python -m unittest test_notifier test_reply_bridge test_followup_bridge test_app
 
 The test dependencies are declared in `requirements-test.txt`. Do not run the native installer against a production home as part of source tests.
 
-## Telegram command approvals (1.6.0)
+## Telegram command approvals (1.6.1)
 
 - `Allow Once` and `Deny` buttons are available only for the pinned core's real dangerous-command gate when the current Desktop `approval` request exactly matches its `approval.pending` queue entry, runtime session, queue ID, command, description, and producer pattern key. The helper re-runs the actual pinned `tools.approval_detection` classifier; no copied classifier is used.
 - The Telegram card displays the complete redacted command and description literally (no Markdown parsing, previews, or truncation). If redaction is unstable/ambiguous, suspicious credential text survives, Unicode/control characters are unsafe, the card exceeds Telegram's one-message bound, or the configured timeout is unavailable/expired, no buttons are sent; a notification-only card directs the user to Desktop.

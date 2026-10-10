@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -18,8 +19,8 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.6.0"
-CAPABILITY = "desktop-command-approval-v1"
+VERSION = "1.6.1"
+CAPABILITY = "desktop-command-approval-v2"
 PREFIX = "hda:"
 LEASE = 45
 MAX_TTL = 31_536_000
@@ -49,6 +50,11 @@ _KNOWN_CARDS: set[tuple[int, int, int]] = set()
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _response_bytes(value):
+    """The native result's exact UTF-8 JSON payload before its ASCII frame."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 def _digest(value):
@@ -111,6 +117,18 @@ def connect(state=STATE):
         os.chmod(path, 0o600)
     except OSError:
         pass
+    return c
+
+
+def connect_readonly(state=STATE):
+    """Open an existing approval inbox without creating schema or changing rows."""
+    path = Path(state) / "approval-inbox" / "approvals.sqlite3"
+    if not path.is_file():
+        return None
+    c = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=8,
+                        isolation_level=None, factory=ClosingConnection)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA query_only=ON")
     return c
 
 
@@ -428,8 +446,68 @@ def _validate_descriptor(descriptor):
                 for key in ("request_fingerprint", "pending_fingerprint")))
 
 
-def register(req, notifier, *, root=ROOT, state=STATE, now=None):
+def claim_valid(owner, approval_id, claim, descriptor, authority, deadline, *,
+                root=ROOT, state=STATE, now=None):
+    """Read-only last freshness gate for one applying approval claim.
+
+    This is a fresh local check, not an atomic server-side fingerprint CAS. It
+    never renews, reclaims, settles, or changes the claim and returns no command.
+    """
     now = time.time() if now is None else now
+    if (not isinstance(owner, str) or not owner or len(owner) > 100 or
+            not isinstance(approval_id, str) or not re.fullmatch(r"[0-9a-f]{32}", approval_id) or
+            not isinstance(claim, str) or not re.fullmatch(r"[0-9a-f]{32}", claim) or
+            not isinstance(authority, str) or not re.fullmatch(r"[0-9a-f]{64}", authority) or
+            type(deadline) not in (int, float) or not isinstance(deadline, (int, float)) or
+            not math.isfinite(deadline) or not _validate_descriptor(descriptor)):
+        return {"ok": False, "reason": "invalid_claim"}
+    try:
+        expected_authority = _digest(descriptor)
+        if authority != expected_authority:
+            return {"ok": True, "valid": False, "id": approval_id, "claim": claim,
+                    "authority": authority, "deadline": deadline}
+        ingress = _sibling("reply_bridge")
+        if not ingress.enabled(root=root):
+            return {"ok": True, "valid": False, "id": approval_id, "claim": claim,
+                    "authority": authority, "deadline": deadline}
+        c = connect_readonly(state)
+        if c is None:
+            return {"ok": True, "valid": False, "id": approval_id, "claim": claim,
+                    "authority": authority, "deadline": deadline}
+        try:
+            row = c.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            live = _receiver(c, now)
+            valid = False
+            if row is not None and live is not None:
+                try:
+                    stored_descriptor = json.loads(row["descriptor"])
+                    valid = bool(
+                        row["status"] == "applying" and row["owner"] == owner and row["claim"] == claim and
+                        row["deadline"] is not None and float(row["deadline"]) == float(deadline) and
+                        float(row["deadline"]) > now and float(row["expires"]) > now and
+                        0 <= now - float(row["seen"]) <= LEASE and _owner_live(c, owner, now) and
+                        row["boot"] == live["boot"] and
+                        (row["bot"], row["chat"], row["topic"]) ==
+                        (live["bot"], live["chat"], live["topic"]) and
+                        stored_descriptor == descriptor and canonical(stored_descriptor) == row["descriptor"] and
+                        _digest(stored_descriptor) == authority and
+                        row["request_fingerprint"] == descriptor["request_fingerprint"] and
+                        row["pending_fingerprint"] == descriptor["pending_fingerprint"])
+                except (TypeError, ValueError, KeyError, OverflowError, RecursionError):
+                    valid = False
+            return {"ok": True, "valid": valid, "id": approval_id, "claim": claim,
+                    "authority": authority, "deadline": deadline}
+        finally:
+            c.close()
+    except Exception:
+        # No exception, command, descriptor, or credential material crosses the frame.
+        return {"ok": False, "reason": "approval_store_unavailable"}
+
+
+def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=None):
+    now = time.time() if now is None else now
+    if result_budget is not None and (type(result_budget) is not int or result_budget <= 0):
+        return {"ok": False, "reason": "invalid_result_budget"}
     descriptor, request, pending = req.get("descriptor"), req.get("request"), req.get("pending")
     route, row, epoch, owner = req.get("route"), req.get("session"), req.get("epoch"), req.get("owner")
     if not _validate_descriptor(descriptor) or descriptor.get("owner") != owner:
@@ -449,6 +527,16 @@ def register(req, notifier, *, root=ROOT, state=STATE, now=None):
     except Exception as exc:
         # Exception text may contain command material; return only a stable category.
         return {"ok": False, "reason": str(exc) if str(exc).startswith(("review_", "redaction_")) else "review_unavailable"}
+    if result_budget is not None:
+        projected_item = {"id": "0" * 32, "claim": "0" * 32,
+                          "deadline": min(float(expires), now + LEASE),
+                          "descriptor": descriptor, "request": request,
+                          "pending": pending, "choice": "once"}
+        try:
+            if len(_response_bytes({"ok": True, "items": [projected_item], "terminal": []})) > result_budget:
+                return {"ok": False, "reason": "approval_result_too_large"}
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            return {"ok": False, "reason": "approval_result_too_large"}
     identity = _digest(_identity_base(descriptor))
     c = connect(state)
     try:
@@ -718,7 +806,7 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
         if not live or not _owner_live(c, owner, now):
             c.commit()
             return {"ok": False, "feature_ready": False, "reason": "lease_stale", "items": []}
-        items = []
+        candidates = []
         for row in c.execute("SELECT * FROM approvals WHERE owner=? AND status IN ('posting','open','queued','applying') ORDER BY created,id",
                              (owner,)).fetchall():
             if row["boot"] != live["boot"]:
@@ -757,20 +845,46 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
                     "descriptor": json.loads(row["descriptor"]),
                     "request": json.loads(row["request_json"]),
                     "pending": json.loads(row["pending_json"]), "choice": row["choice"]}
-            encoded = json.dumps({"ok": True, "items": [item]}, ensure_ascii=False,
-                                 separators=(",", ":"), allow_nan=False).encode("utf-8")
-            if result_budget is not None and len(encoded) + 12_000 > result_budget:
+            if (result_budget is not None and
+                    len(_response_bytes({"ok": True, "items": [item], "terminal": []})) > result_budget):
+                # A single queued row that cannot fit even without terminal IDs
+                # cannot become an actionable button. Retire it explicitly; its
+                # terminal ID is included below whenever it was observed.
+                _retire(c, row, "rejected", now)
                 continue
-            c.execute("UPDATE approvals SET status='applying',claim=?,deadline=?,dirty=1 WHERE id=? AND status='queued'",
-                      (claim, deadline, row["id"]))
-            items.append(item)
-            # Preserve the one-shot native result/apply budget.
-            break
-        c.commit()
+            candidates.append((row, item))
         known_ids = set(by_id) | unverifiable | definitive_absent
-        terminal = [row["id"] for row in c.execute(
-            "SELECT id FROM approvals WHERE owner=? AND status IN ('applied','expired','rejected','unknown')",
+        all_terminal = [row["id"] for row in c.execute(
+            "SELECT id FROM approvals WHERE owner=? AND status IN ('applied','expired','rejected','unknown') ORDER BY created,id",
             (owner,)).fetchall() if row["id"] in known_ids]
+
+        def fits(value):
+            return result_budget is None or len(_response_bytes(value)) <= result_budget
+
+        terminal = []
+        for terminal_id in all_terminal:
+            trial = {"ok": True, "items": [], "terminal": [*terminal, terminal_id]}
+            if fits(trial):
+                terminal.append(terminal_id)
+        # Do not consume a claim if any known terminal ID cannot be returned in
+        # this frame. The omitted IDs remain terminal in SQLite and are reoffered
+        # on the next poll; no authority is lost.
+        item = None
+        if len(terminal) == len(all_terminal):
+            for row, candidate in candidates:
+                projected = {"ok": True, "items": [candidate], "terminal": terminal}
+                if not fits(projected):
+                    # The item was checked alone above. If terminal IDs push it
+                    # over budget, defer both claim and TTL/claim mutation.
+                    break
+                updated = c.execute(
+                    "UPDATE approvals SET status='applying',claim=?,deadline=?,dirty=1 WHERE id=? AND status='queued'",
+                    (candidate["claim"], candidate["deadline"], row["id"]))
+                if updated.rowcount == 1:
+                    item = candidate
+                    break
+        c.commit()
+        items = [item] if item is not None else []
         return {"ok": True, "items": items, "terminal": terminal}
     except Exception:
         c.rollback()
@@ -858,9 +972,9 @@ def approval_notice(req, notifier, *, root=ROOT, state=STATE, api=None):
             descriptor.get("pending_fingerprint") != _digest(pending)):
         return {"ok": False, "reason": "invalid_descriptor"}
     kind = req.get("reason")
-    safe_reasons = {"review_text_missing", "redaction_not_stable", "redaction_omission", "redaction_collision",
+    safe_reasons = {"review_text_missing", "invalid_review_text", "redaction_not_stable", "redaction_omission", "redaction_collision",
                     "review_unicode_ambiguous", "review_control_character", "review_card_too_large",
-                    "review_unavailable", "timeout_unavailable", "receiver_unavailable", "owner_unavailable"}
+                    "review_unavailable", "approval_result_too_large", "timeout_unavailable", "receiver_unavailable", "owner_unavailable"}
     if kind not in safe_reasons:
         kind = "review_unavailable"
     profile = descriptor["targetProfile"]
@@ -911,15 +1025,19 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
         return {"ok": False, "reason": "capability_mismatch"}
     if action == "approval_notice":
         return approval_notice(req, notifier, root=root, state=state)
-    if action not in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle"}:
+    if action not in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
+                       "approval_claim_valid"}:
         return {"ok": False, "reason": "unknown_approval_action"}
     try:
+        if action == "approval_claim_valid":
+            return claim_valid(req.get("owner"), req.get("id"), req.get("claim"), req.get("descriptor"),
+                               req.get("authority"), req.get("deadline"), root=root, state=state)
         if action == "approval_owner_heartbeat":
             return owner_heartbeat(req.get("owner"), state=state)
         if action == "approval_register":
             if not _sibling("reply_bridge").enabled(root=root):
                 return {"ok": False, "feature_ready": False, "reason": "disabled"}
-            result = register(req, notifier, root=root, state=state)
+            result = register(req, notifier, root=root, state=state, result_budget=result_budget)
             if result.get("status") in ("open", "queued", "applying", *TERMINAL):
                 flush(notifier, state=state)
             return result
@@ -963,7 +1081,7 @@ def wire(application, notifier, bot, chat, topic, boot, *, enabled=lambda: True,
             "bot_author": author_id == bot and getattr(author, "is_bot", False) is True,
             "forwarded": bool(forwarded or getattr(message, "forward_origin", None) or
                               getattr(message, "forward_from", None)),
-            "edited": bool(edited), "inline": bool(inline),
+            "edited": bool(edited or getattr(message, "edit_date", None)), "inline": bool(inline),
             "inaccessible": msg_chat is None or getattr(message, "text", None) is None,
             "message_text": getattr(message, "text", None), "event": event,
         }

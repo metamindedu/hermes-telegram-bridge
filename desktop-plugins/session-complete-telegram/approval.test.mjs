@@ -112,11 +112,16 @@ test('approval registration freezes full fingerprints and binds queue not just s
   assert.equal(actions[1].pending.request_id,f.pending.request_id)
 })
 
-async function runPump(resolved, {throwRpc=false, changeOnFinal=false}={}) {
+async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimValidity=true,
+  gateVariant=null, pausePostClaim=false, runStoppedOnGate=false, expireOnGate=false}={}) {
   const f=await bridgeFixture();const owner=f.owner
-  const item={id:'stored-card',claim:'claim-opaque',deadline:Date.now()/1000+30,descriptor:f.descriptor,
+  const item={id:'stored-card',claim:'b'.repeat(32),deadline:Date.now()/1000+30,descriptor:f.descriptor,
     request:f.request,pending:f.pending,choice:'once'}
   const calls=[];const helperCalls=[];let snapshots=0
+  let resumeSnapshot
+  let reachSnapshot
+  const postClaimSnapshotReached=new Promise(resolve=>{reachSnapshot=resolve})
+  const resumePostClaimSnapshot=new Promise(resolve=>{resumeSnapshot=resolve})
   const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:()=>{},
     requestProfile:async(route,method,args)=>{
       calls.push({route,method,args})
@@ -133,6 +138,7 @@ async function runPump(resolved, {throwRpc=false, changeOnFinal=false}={}) {
   monitor.records.set('record',{approval:bridge})
   monitor.approvalSnapshot=async()=>{
     snapshots++
+    if(pausePostClaim&&snapshots===2){reachSnapshot();await resumePostClaimSnapshot}
     if(changeOnFinal && snapshots===2)return null
     return {route:f.route,row:f.row,snapshot:f.snapshot,request:f.request,pending:f.pending}
   }
@@ -140,11 +146,25 @@ async function runPump(resolved, {throwRpc=false, changeOnFinal=false}={}) {
     helperCalls.push(request)
     if(request.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:VERSION,capability:APPROVAL_CAPABILITY}
     if(request.action==='approval_poll')return {ok:true,items:[item],terminal:[]}
+    if(request.action==='approval_claim_valid'){
+      if(runStoppedOnGate)monitor.stopped=true
+      if(expireOnGate)Date.now=()=>item.deadline*1000
+      const receipt={ok:true,valid:claimValidity,id:item.id,claim:item.claim,
+        authority:await approvalFingerprint(item.descriptor),deadline:item.deadline}
+      if(gateVariant==='id')receipt.id='wrong-id'
+      if(gateVariant==='claim')receipt.claim='wrong-claim'
+      if(gateVariant==='authority')receipt.authority='0'.repeat(64)
+      if(gateVariant==='deadline')receipt.deadline+=1
+      if(gateVariant==='shape')receipt.extra='not-typed'
+      return receipt
+    }
     if(request.action==='approval_settle')return {ok:true,status:request.status}
     throw new Error('unexpected helper '+request.action)
   }
-  await monitor.pumpApprovals()
-  return {calls,helperCalls,monitor}
+  const pump=monitor.pumpApprovals()
+  if(!pausePostClaim)await pump
+  return {calls,helperCalls,monitor,pump,postClaimSnapshotReached,
+    resumePostClaimSnapshot:()=>resumeSnapshot()}
 }
 
 test('resolved 0 is expired, exact queue id/all false, and there is no request.answer fallback', async () => {
@@ -188,6 +208,115 @@ test('old sender/renderer capability cannot enable approval registration', async
   assert.equal(actions.length,1)
   assert.equal(actions[0].action,'loaded')
 })
+test('approval_claim_valid is explicitly dispatched but remains a read-only non-ambiguous helper action', async () => {
+  const f=fixture();const transported=[]
+  const api={profileRoutes:async()=>[f.route],requestProfile:async(_route,method,args)=>{
+    assert.equal(method,'cli.exec')
+    const request=JSON.parse(Buffer.from(args.argv[4],'base64url').toString('utf8'))
+    transported.push(request)
+    const receipt={ok:true,valid:true,id:request.id,claim:request.claim,authority:request.authority,deadline:request.deadline}
+    const output=['HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN',Buffer.from(JSON.stringify(receipt)).toString('base64url'),
+      'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END',''].join('\n')
+    return {blocked:false,code:0,output}
+  }}
+  const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}})
+  const request={action:'approval_claim_valid',id:'a'.repeat(32),claim:'b'.repeat(32),authority:'c'.repeat(64),deadline:123}
+  const receipt=await monitor.helper(request)
+  assert.deepEqual(transported,[request]);assert.equal(receipt.valid,true)
+  api.requestProfile=async()=>{throw new Error('synthetic transport outage')}
+  await assert.rejects(monitor.helper(request),error=>error?.ambiguousWrite===false)
+})
+
+test('new pre-dispatch authorization contract requires 1.6.1 approval-v2 handshake', () => {
+  assert.equal(VERSION,'1.6.1')
+  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v2')
+})
+
+test('claim validity is the last fresh gate before approval.respond and accepts only an exact typed receipt', async () => {
+  const positive=await runPump({resolved:1})
+  assert.equal(positive.helperCalls.filter(call=>call.action==='approval_claim_valid').length,1)
+  assert.equal(positive.calls.filter(call=>call.method==='approval.respond').length,1)
+  assert.equal(positive.calls.some(call=>call.method==='request.answer'),false)
+  for(const gateVariant of ['id','claim','authority','deadline','shape']){
+    const invalid=await runPump({resolved:1},{gateVariant})
+    assert.equal(invalid.calls.filter(call=>call.method==='approval.respond').length,0,gateVariant)
+    assert.equal(invalid.calls.some(call=>call.method==='request.answer'),false,gateVariant)
+    assert.equal(invalid.helperCalls.find(call=>call.action==='approval_settle').status,'rejected',gateVariant)
+  }
+  const lost=await runPump({resolved:1},{claimValidity:false})
+  assert.equal(lost.calls.filter(call=>call.method==='approval.respond').length,0)
+  assert.equal(lost.helperCalls.find(call=>call.action==='approval_settle').status,'rejected')
+})
+
+test('post-claim snapshot barrier rechecks boot-change and ingress-disable gates without replay', async () => {
+  for(const cause of ['receiver-boot-changed','ingress-disabled']){
+    const out=await runPump({resolved:1},{pausePostClaim:true,claimValidity:false})
+    await out.postClaimSnapshotReached
+    // Real SQLite receiver/enablement flips are exercised by test_approval_bridge;
+    // this barrier verifies the renderer never starts approval.respond afterward.
+    out.resumePostClaimSnapshot()
+    await out.pump
+    await out.monitor.pumpApprovals()
+    assert.equal(out.calls.filter(call=>call.method==='approval.respond').length,0,cause)
+    assert.equal(out.helperCalls.filter(call=>call.action==='approval_poll').length,1,cause)
+    assert.equal(out.helperCalls.filter(call=>call.action==='approval_claim_valid').length,1,cause)
+    assert.equal(out.calls.some(call=>call.method==='request.answer'),false,cause)
+  }
+})
+
+test('stop and deadline are rechecked after a valid native claim gate before RPC', async () => {
+  const originalNow=Date.now
+  try{
+    const stopped=await runPump({resolved:1},{runStoppedOnGate:true})
+    assert.equal(stopped.calls.filter(call=>call.method==='approval.respond').length,0)
+    assert.equal(stopped.helperCalls.find(call=>call.action==='approval_settle').status,'rejected')
+    Date.now=originalNow
+    const expired=await runPump({resolved:1},{expireOnGate:true})
+    assert.equal(expired.calls.filter(call=>call.method==='approval.respond').length,0)
+    assert.equal(expired.helperCalls.find(call=>call.action==='approval_settle').status,'rejected')
+  }finally{Date.now=originalNow}
+})
+
+test('unsafe approval registration reasons from checkAsk only reach notification-only approval_notice', async () => {
+  const reasons=['review_text_missing','redaction_not_stable','redaction_omission','redaction_collision',
+    'review_unicode_ambiguous','review_control_character','review_card_too_large','review_unavailable',
+    'timeout_unavailable','invalid_review_text','approval_result_too_large']
+  for(const reason of reasons){
+    const f=fixture();const calls=[];const notices=[]
+    const command='rm -rf /tmp/example && echo synthetic-secret-value-739102'
+    const request={id:'srq-aabbcc112233',method:'approval',params:{session_id:f.row.id,request_id:'a'.repeat(32),
+      command,description:'recursive delete',pattern_key:'recursive delete',pattern_keys:['recursive delete'],
+      allow_permanent:true,allow_session:true,choices:['once','session','always','deny']}}
+    const pending={request_id:'a'.repeat(32),command,description:'recursive delete',pattern_key:'recursive delete',
+      pattern_keys:['recursive delete'],allow_permanent:true,allow_session:true}
+    const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:notice=>notices.push(notice),
+      requestProfile:async(_route,method)=>{
+        if(method==='session.events.since')return {epoch:'epoch-1',open_requests:[request]}
+        if(method==='approval.pending')return {approvals:[pending]}
+        throw new Error('unexpected RPC '+method)
+      }}
+    const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}})
+    monitor.approvalCapable=true;monitor.replyOwner='owner'
+    monitor.helper=async payload=>{
+      calls.push(payload)
+      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:VERSION,capability:APPROVAL_CAPABILITY}
+      if(payload.action==='approval_register')return {ok:false,reason}
+      if(payload.action==='approval_notice')return {ok:true,status:'sent',notification_only:true}
+      if(payload.action==='attention')return {ok:true,status:'sent'}
+      throw new Error('unexpected helper '+payload.action)
+    }
+    const r={sid:f.row.id,ask:null,approval:null,askChecking:false}
+    await monitor.checkAsk(r,f.route,{...f.row,status:'waiting'},
+      {epoch:'epoch-1',open_requests:[request]},request)
+    assert.deepEqual(calls.map(call=>call.action),['approval_owner_heartbeat','approval_register','approval_notice'],reason)
+    assert.equal(calls.some(call=>call.action==='attention'),false,reason)
+    assert.equal(calls.find(call=>call.action==='approval_notice').reason,reason)
+    assert.equal(JSON.stringify(notices).includes(command),false,reason)
+    assert.equal(JSON.stringify(notices).includes('synthetic-secret-value-739102'),false,reason)
+    assert.equal(r.ask.id,request.id,reason)
+  }
+})
+
 test('disconnected receiver cannot poll or apply an already clicked decision', async () => {
   const f=await bridgeFixture();const calls=[]
   const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:()=>{},requestProfile:async()=>{calls.push('rpc')}}

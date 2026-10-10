@@ -24,3 +24,10 @@
 - Kept the ASCII result frame while budgeting UTF-8 JSON before reply claims; oversized frozen replies use read-only digest-checked fragments with existing claim/TTL gates and no schema migration.
 - Clarified that unrelated files left in the managed Desktop folder can be removed by a later packaged update or rollback; any separately approved preservation/relocation must happen before entry adoption, which alone is not deletion approval.
 - Verification now includes synthetic actual-core alignment/adoption followed by packaged update and rollback; no current Desktop files were moved.
+
+## 2026-10-10 update | Approval last-gate and bounded response corrections
+
+- Bumped the matching renderer/helper/ingress handshake to 1.6.1 and `desktop-command-approval-v2` so mixed old/new packages do not grant the pre-dispatch gate.
+- Added a read-only last claim-validity check after the final snapshot; it does not renew/reclaim or provide atomic fingerprint CAS.
+- Recorded exact complete native JSON budgeting, all-row observation before one claim, command-free unsafe-review notices, and rejection of edited PTB callback messages.
+- No schema migration, production activation, live Telegram call, or source publication was performed.

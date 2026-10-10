@@ -1,9 +1,12 @@
 import { host } from '@hermes/plugin-sdk'
 
 // App-level disk plugin: no profile configuration, agent prompt or core changes.
-export const VERSION = '1.6.0'
-export const APPROVAL_CAPABILITY = 'desktop-command-approval-v1'
+export const VERSION = '1.6.1'
+export const APPROVAL_CAPABILITY = 'desktop-command-approval-v2'
 export const APPROVAL_LEASE_MS = 45_000
+const APPROVAL_NON_ACTIONABLE_REASONS = new Set([
+  'invalid_review_text', 'timeout_unavailable', 'approval_result_too_large'
+])
 
 export function stableJSON(value) {
   if (Array.isArray(value)) return '[' + value.map(stableJSON).join(',') + ']'
@@ -852,7 +855,9 @@ export class CompletionMonitor {
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
-    if (registered?.reason && /^(?:review_|redaction_|timeout_unavailable)$/u.test(registered.reason)) {
+    const unsafeReview = typeof registered?.reason === 'string' &&
+      (/^(?:review_|redaction_)/u.test(registered.reason) || APPROVAL_NON_ACTIONABLE_REASONS.has(registered.reason))
+    if (unsafeReview) {
       const notice = await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
         owner:this.replyOwner, descriptor, request:ask, pending:pending[0], reason:registered.reason})
       r.ask = {id:ask.id, method:'approval'}
@@ -944,6 +949,7 @@ export class CompletionMonitor {
       let status = 'rejected'
       try {
         if (!bridge || this.stopped || !['once','deny'].includes(item.choice) ||
+            bridge.id !== item.id || typeof item.claim !== 'string' || !/^[0-9a-f]{32}$/u.test(item.claim) ||
             stableJSON(item.descriptor) !== stableJSON(bridge.descriptor) ||
             !Number.isFinite(item.deadline) || Date.now() >= item.deadline * 1000) {
           throw new Error('approval claim invalid')
@@ -954,6 +960,18 @@ export class CompletionMonitor {
         if (!fresh || this.stopped || Date.now() >= item.deadline * 1000 ||
             stableJSON(item.request) !== stableJSON(fresh.request) ||
             stableJSON(item.pending) !== stableJSON(fresh.pending)) throw new Error('approval snapshot changed')
+        const authority = await approvalFingerprint(bridge.descriptor)
+        const gate = await this.helper({action:'approval_claim_valid', capability:APPROVAL_CAPABILITY,
+          owner:this.replyOwner, id:item.id, claim:item.claim, descriptor:bridge.descriptor,
+          authority, deadline:item.deadline})
+        if (!exactKeys(gate, ['ok','valid','id','claim','authority','deadline']) || gate.ok !== true ||
+            gate.valid !== true || gate.id !== item.id || gate.claim !== item.claim ||
+            gate.authority !== authority || gate.deadline !== item.deadline || !Number.isFinite(gate.deadline)) {
+          throw new Error('approval claim authority lost')
+        }
+        // This is the last fresh read, not atomic server-side fingerprint CAS.
+        // Recheck local lifetime immediately before starting the one-way RPC.
+        if (this.stopped || Date.now() >= item.deadline * 1000) throw new Error('approval claim expired')
         status = 'unknown'
         let receipt
         try {
