@@ -76,7 +76,7 @@ jobs:
         working-directory: desktop-plugins/session-complete-telegram
         run: |
           node --check desktop/plugin.js
-          node --test plugin.test.mjs reply.test.mjs followup.test.mjs materialization.test.mjs
+          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs materialization.test.mjs
 
       - name: Full Python bridge and native-install tests
         shell: bash
@@ -87,4 +87,4 @@ jobs:
           else
             CORE_PY="$GITHUB_WORKSPACE/hermes-agent/.venv/bin/python"
           fi
-          "$CORE_PY" -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install -v
+          "$CORE_PY" -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install -v

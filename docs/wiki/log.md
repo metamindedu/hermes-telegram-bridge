@@ -12,6 +12,12 @@
 - 고정 core/action CI와 정확한 native command syntax를 추가했다. 운영 install/enablement/Gateway activation은 수행하지 않았다.
 - repository instruction files AGENTS.md/CLAUDE.md는 tool approval gate로 수정하지 못해 phase 1 문구가 남아 있으며, 이것은 문서 동기화의 미해결 blocker다.
 
+## 2026-10-10 update | Native command approval inbox boundaries
+
+- Recorded the versioned, one-shot Telegram Allow Once/Deny path for the real pinned in-process dangerous-command queue only; generic/execute_code/plugin-rule/compute-host approvals stay notification-only.
+- Documented exact queue-ID `approval.respond` semantics, local snapshot checks without server fingerprint CAS, complete redacted review requirements, no-replay on leases/restarts, and same-Application/no-second-poller ownership.
+- Added the isolated approval inbox to the helper fingerprint/capability handshake and documented that this source change is not Gateway activation or production approval.
+
 ## 2026-10-10 update | Bounded native reply transport and Desktop ownership
 
 - Preserved the original Windows argv byte/token envelope and made local encoding/size failures permanent per ask fingerprint rather than repeatedly launching.

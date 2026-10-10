@@ -11,7 +11,8 @@ from pathlib import Path
 
 PLUGIN_ID = "desktop-clarify-telegram"
 FRONTEND_ID = "session-complete-telegram"
-_HELPER_FILES = ("__init__.py", "runtime.py", "notifier.py", "reply_bridge.py", "followup_bridge.py")
+_HELPER_FILES = ("__init__.py", "runtime.py", "notifier.py", "reply_bridge.py", "followup_bridge.py", "approval_bridge.py")
+FRONTEND_VERSION = "1.6.0"
 
 
 def _validated_home(ctx) -> Path:
@@ -112,8 +113,13 @@ def register(ctx) -> None:
         notifier = importlib.import_module(f"{package.__package__}.notifier")
         reply_bridge = importlib.import_module(f"{package.__package__}.reply_bridge")
         followup_bridge = importlib.import_module(f"{package.__package__}.followup_bridge")
+        approval_bridge = importlib.import_module(f"{package.__package__}.approval_bridge")
+        manifest = __import__("hermes_yaml").safe_load((Path(package.__path__[0]) / "plugin.yaml").read_text(encoding="utf-8-sig"))
+        approval_ready = bool(isinstance(manifest, dict) and manifest.get("version") == FRONTEND_VERSION and
+                              notifier.VERSION == FRONTEND_VERSION and approval_bridge.VERSION == FRONTEND_VERSION and
+                              approval_bridge.CAPABILITY == "desktop-command-approval-v1")
         reply_bridge._NOTIFIER = notifier
-        reply_bridge.wire(application, adapter, followup_bridge)
+        reply_bridge.wire(application, adapter, followup_bridge, approval_bridge if approval_ready else None)
 
     ctx.register_telegram_handler(telegram_factory)
 

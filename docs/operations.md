@@ -25,6 +25,18 @@ Phase 2 authorizes source/tests/docs/CI, isolated fake-home installation checks 
 - The native handler supplies this result budget internally; it is not renderer-controlled. `reply_poll` fits the whole response projection before changing a queued row to `applying` and returns at most one native apply claim per poll, so fragment assembly cannot age sibling claims. Ordinary answers retain the full descriptor/result response. An individually oversized response can use bounded fragment metadata; read-only `reply_fragment` returns allow-listed chunks for the exact owner/id/claim after current-boot, absolute-TTL and 45-second claim-deadline checks. It does not change schema, claim again, extend expiry or refresh the claim lease. Unselected forms remain `queued`.
 - The Desktop assembles a bounded chunk count/byte total, verifies exact SHA-256 bytes and strict JSON shape, then repeats the existing live immutable identity/deadline checks before one `request.answer`. Missing, malformed, corrupt or expired fragment data settles the attempted claim as unknown/expired and is never replayed.
 
+## Native command approval inbox (1.6.0)
+
+The separate `approval-inbox/approvals.sqlite3` is not a schema extension to the clarify or followup stores. Its callback namespace is `hda:` with an opaque random token and a one-character `o` (once) / `d` (deny) action; command, session, queue IDs and credentials are never in callback data. Only the exact default bot, private-home owner, chat, topic, original bot-authored message ID and unchanged full card text are actionable. Inline/inaccessible/forwarded/edited/foreign/expired/duplicate taps are rejected without creating a receipt or changing approval state. Known/tombstoned approval-card text replies are consumed and never interpreted as approval or agent input.
+
+The monitor requires a fresh local route, waiting runtime row, durable session identity, backend epoch, `srq-*` request, matching `approval.pending` queue ID, exact full request and pending fingerprints, and the pinned core dangerous-command producer key before registration, before every poll claim, and again immediately before dispatch. The helper uses the real pinned `tools.approval_detection.detect_dangerous_command`; it does not stub or copy the classifier. It accepts only once/deny. Desktop calls `approval.respond` with the frozen runtime `session_id`, exact queue `request_id`, `choice`, and explicit `all:false`. Only a numeric `resolved===1` is applied; zero is expired, malformed/other/timeout is unknown. It never falls back to `request.answer`, retries an ambiguous RPC, or writes permanent/session allowlists. A coalesced follower remains subject to the core's fresh-prompt behavior for once.
+
+The native approval queue ID binds the core's first settlement; the current RPC contract exposes no server-side fingerprint CAS. Fresh snapshot checks are a client-side guard and must not be described as atomic CAS. `approval.pending` does not expose the enqueue timestamp, so local card expiry is bounded by the configured profile `approvals.timeout` and a currently pending queue; the native queue remains the decision authority and rejects a late tap with `resolved:0`. The clarify one-hour minimum is not reused.
+
+The receiver capability is enabled only when the ingress/helper/renderer package version agrees and the existing private-chat receiver heartbeat is live. No new Telegram polling consumer is created: approval callbacks and the known-card text consumer are installed on the same PTB `Application` from `reply_bridge.wire`. A restart/owner/boot change retires prior authority. Lease loss rejects a queued choice and makes an applying claim unknown; it is never replayed after reconnection. Unsupported generic, execute_code, plugin-rule, sudo, secret/vault, or compute-host approvals lacking an authoritative in-process queue remain notification-only.
+
+Review cards show the complete redacted literal command and description without Markdown stripping or truncation. Redaction omissions/collisions, non-NFC/unsafe controls, unavailable timeout, or a card above Telegram's single-message limit disable buttons; the fallback notification contains Desktop guidance, not a partial command presented as approval evidence. Sends use `protect_content:false`, a same-text edit with the keyboard retained, and no retry after an ambiguous send.
+
 ## Exact install, update, and rollback commands
 
 Replace each variable with a previously verified full SHA. These commands are documented only and were **not executed** in this task.
@@ -76,10 +88,10 @@ Installing a package is not activation. Python command registration/ingress enab
 
 ## Verification
 
-- Node: `node --check desktop/plugin.js` and `node --test plugin.test.mjs reply.test.mjs followup.test.mjs materialization.test.mjs`.
-- Python: `python -m unittest test_notifier test_reply_bridge test_followup_bridge test_native_install -v`; this runs every `test_notifier` case with the real pinned Hermes `SessionDB` and redactor, plus the existing reply/followup bridge suites and native install fixtures.
+- Node: `node --check desktop/plugin.js` and `node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs materialization.test.mjs`.
+- Python: `python -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install -v`; `test_approval_bridge` runs against the real pinned dangerous-command detector, queue settlement/coalesced follower behavior, native dispatcher, and actual PTB `Application.process_update`; its transport alone is mocked.
 - CI: `.github/workflows/tests.yml` runs those exact suites on Windows and Ubuntu, with `contents: read`, pinned action SHAs, Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b`, and the core `uv.lock` inside a job-owned environment. It does not deploy, restart, upload secrets, or claim GUI verification on another PC.
-- Fake-home native install tests use only a mock for Git transport. They exercise Hermes' actual install/publication/manifest/Doctor/context contracts and verify sentinels/IDs across fresh install, update and rollback. No live Telegram calls occur.
+- Fake-home native install tests use only a mock for Git transport. They exercise Hermes' actual install/publication/manifest/Doctor/context contracts, verify the new approval helper/capability across fresh install, update and rollback, and preserve sentinels/IDs. No live Telegram calls occur.
 
 ## State and rollback
 

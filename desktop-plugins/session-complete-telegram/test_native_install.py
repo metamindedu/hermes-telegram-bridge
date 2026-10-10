@@ -62,7 +62,7 @@ def _copy_candidate(destination: Path, version: str) -> Path:
         shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         manifest = target / "plugin.yaml"
         text = manifest.read_text(encoding="utf-8")
-        manifest.write_text(text.replace("version: '1.5.0'", f"version: '{version}'"), encoding="utf-8")
+        manifest.write_text(text.replace("version: '1.6.0'", f"version: '{version}'"), encoding="utf-8")
     return destination
 
 
@@ -85,8 +85,8 @@ class NativeInstallTests(unittest.TestCase):
         self.sentinel_bytes = b"preserve-existing-ledger-and-data\x00phase2"
         self.sentinel.write_bytes(self.sentinel_bytes)
         self.candidates = {
-            "v1": _copy_candidate(self.root / "candidate v1", "1.5.0"),
-            "v2": _copy_candidate(self.root / "candidate v2", "1.5.1"),
+            "v1": _copy_candidate(self.root / "candidate v1", "1.6.0"),
+            "v2": _copy_candidate(self.root / "candidate v2", "1.6.1"),
         }
         self.revisions = {
             "v1": "1" * 40,
@@ -217,10 +217,13 @@ class NativeInstallTests(unittest.TestCase):
         self._install_package("v1", ingress_path, force=False)
         self._assert_preserved()
         self._assert_package_ids()
+        self.assertTrue((self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").is_file())
+        self.assertIn("desktop-command-approval-v1", (self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").read_text(encoding="utf-8"))
 
         self._install_package("v2", frontend_path, force=True)
         self._install_package("v2", ingress_path, force=True)
-        self.assertIn("version: '1.5.1'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertIn("version: '1.6.1'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertTrue((self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").is_file())
         self._assert_preserved()
         self._assert_package_ids()
 
@@ -228,7 +231,8 @@ class NativeInstallTests(unittest.TestCase):
         # previous immutable ref; no bespoke deploy/rollback executor exists.
         self._install_package("v1", frontend_path, force=True)
         self._install_package("v1", ingress_path, force=True)
-        self.assertIn("version: '1.5.0'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertIn("version: '1.6.0'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertTrue((self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").is_file())
         self._assert_preserved()
         self._assert_package_ids()
 
@@ -528,6 +532,88 @@ class NativeInstallTests(unittest.TestCase):
                          [(200, "accepted_queued", None), (201, "rejected", None)])
         self.assertEqual(feedback, 2)
 
+    def test_registered_native_dispatcher_frames_real_approval_inbox_claim(self):
+        """Run approval_* through the actual registered CLI handler in a fake Hermes home."""
+        plugin, handler, parser = self._native_frontend_handler("phase2_real_approval_dispatch")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home)}):
+            notifier_module = importlib.import_module("phase2_real_approval_dispatch.notifier")
+            bridge = importlib.import_module("phase2_real_approval_dispatch.approval_bridge")
+        original_config = self.config.read_bytes()
+        self.addCleanup(self.config.write_bytes, original_config)
+        self.config.write_text(
+            "plugins:\n  enabled:\n    - desktop-clarify-telegram\napprovals:\n  timeout: 300\n",
+            encoding="utf-8")
+        (self.home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=77:synthetic-token\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
+        state = self.home / "plugin-data" / FRONTEND_ID
+        now = time.time()
+        bridge.bind_receiver(77, 99, None, "native-approval-boot", private_verified=True, state=state, now=now)
+        owner = "native-desktop-owner"
+        self.assertTrue(bridge.owner_heartbeat(owner, state=state, now=now)["feature_ready"])
+        command = "rm -rf approval-native-fixture"
+        dangerous, key, description = __import__("tools.approval_detection", fromlist=["detect_dangerous_command"]).detect_dangerous_command(command)
+        self.assertTrue(dangerous)
+        queue_id = "a" * 32
+        request = {"id":"srq-aabbcc112233", "method":"approval", "params":{
+            "session_id":"runtime-native", "request_id":queue_id, "command":command,
+            "description":description, "pattern_key":key, "pattern_keys":[key],
+            "allow_permanent":True, "allow_session":True,
+            "choices":["once","session","always","deny"]}}
+        pending = {k:request["params"][k] for k in ("request_id","command","description","pattern_key",
+            "pattern_keys","allow_permanent","allow_session")}
+        route = {"mode":"local", "connectionId":"native-local", "profile":"default", "targetProfile":"default"}
+        session = {"id":"runtime-native", "session_key":"durable-native", "status":"waiting"}
+        descriptor = {"owner":owner, "connectionId":route["connectionId"], "profile":route["profile"],
+            "targetProfile":route["targetProfile"], "sid":session["id"], "session_key":session["session_key"],
+            "epoch":"native-epoch", "request_id":request["id"], "queue_id":queue_id,
+            "request_fingerprint":bridge._digest(request), "pending_fingerprint":bridge._digest(pending)}
+        calls=[]
+        def telegram_stub(token, method, payload):
+            calls.append((method, payload))
+            if method == "sendMessage":
+                return {"ok":True,"result":{"message_id":901,"chat":{"id":99,"type":"private"},
+                    "text":payload["text"],"message_thread_id":None,"from":{"id":77,"is_bot":True},
+                    "reply_markup":payload.get("reply_markup")}}
+            return {"ok":True,"result":{"message_id":payload.get("message_id",901),"chat":{"id":99,"type":"private"}}}
+        with patch.object(notifier_module, "telegram", side_effect=telegram_stub):
+            heartbeat, _ = self._call_native(handler, parser, {"action":"approval_owner_heartbeat",
+                "capability":bridge.CAPABILITY,"owner":owner})
+            self.assertTrue(heartbeat["feature_ready"], heartbeat)
+            registered, output = self._call_native(handler, parser, {"action":"approval_register",
+                "capability":bridge.CAPABILITY,"owner":owner,"descriptor":descriptor,
+                "request":request,"pending":pending,"route":route,"session":session,"epoch":"native-epoch"})
+            self.assertTrue(registered["ok"], registered)
+            self.assertLessEqual(len(output), 48_000)
+            row = bridge.lookup_message(77,99,901,state=state)
+            self.assertTrue(row)
+            stored = bridge.connect(state)
+            try: card = dict(stored.execute("SELECT * FROM approvals WHERE id=?",(registered["id"],)).fetchone())
+            finally: stored.close()
+            identity = {"bot":77,"boot":"native-approval-boot","chat":99,"user":99,"topic":None,
+                "mid":901,"private":True,"human":True,"bot_author":True,"forwarded":False,
+                "edited":False,"inline":False,"inaccessible":False,"message_text":card["review_text"],"event":"native-tap"}
+            tapped = bridge.choose(card["token"], "once", identity, state=state, now=time.time()+0.1)
+            self.assertTrue(tapped.get("ok"), tapped)
+            observation = {"id":registered["id"],"request_fingerprint":descriptor["request_fingerprint"],
+                "pending_fingerprint":descriptor["pending_fingerprint"],"authority":bridge._digest(descriptor)}
+            polled, poll_output = self._call_native(handler, parser, {"action":"approval_poll",
+                "capability":bridge.CAPABILITY,"owner":owner,"observations":[observation],"unverified":[],"absent":[]})
+            self.assertLessEqual(len(poll_output),48_000)
+            self.assertTrue(polled["ok"],polled)
+            self.assertEqual(polled["items"][0]["choice"],"once")
+            self.assertEqual(polled["items"][0]["descriptor"]["queue_id"],queue_id)
+            self.assertEqual([method for method,_ in calls],["sendMessage","editMessageText","editMessageText"])
+            self.assertIs(calls[0][1]["protect_content"],False)
+
+    def test_native_loaded_handshake_hides_capability_on_helper_version_skew(self):
+        plugin, handler, parser = self._native_frontend_handler("phase2_approval_version_skew")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home)}):
+            bridge = importlib.import_module("phase2_approval_version_skew.approval_bridge")
+        with patch.object(bridge, "VERSION", "1.5.0"), patch.dict(os.environ, {"HERMES_HOME": str(self.home)}):
+            result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.0","profiles":[]})
+        self.assertEqual(result["version"], "1.6.0")
+        self.assertNotIn("desktop-command-approval-v1", result.get("capabilities", []))
+
     def test_profile_context_guards_refuse_foreign_and_named_homes(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
@@ -574,6 +660,30 @@ class NativeInstallTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "named_profile_home_refused"):
                 named_runtime.resolve_package_home(named_frontend / "__init__.py")
 
+    def test_ingress_factory_fails_closed_when_frontend_manifest_version_skews(self):
+        from hermes_cli.plugins import PluginContext, PluginManager
+        from hermes_cli.plugins_manifest import PluginManifest
+
+        self._install_package("v1", "plugins/desktop-clarify-telegram", force=False)
+        self._install_package("v1", "desktop-plugins/session-complete-telegram", force=False)
+        frontend_manifest = self.home / "plugins" / FRONTEND_ID / "plugin.yaml"
+        frontend_manifest.write_text(frontend_manifest.read_text(encoding="utf-8").replace(
+            "version: '1.6.0'", "version: '1.5.0'"), encoding="utf-8")
+        manager = PluginManager(scope_key=str(self.home))
+        ctx = PluginContext(PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user",
+                                           path=str(self.home / "plugins" / INGRESS_ID)), manager)
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home)}):
+            ingress = _load_package(self.home / "plugins" / INGRESS_ID, "phase2_factory_skew_fixture")
+            ingress.register(ctx)
+            factory, _owner = manager.get_platform_handler_factories("telegram")[0]
+            frontend = ingress._sibling_package(self.home.resolve())
+            reply_bridge = importlib.import_module(f"{frontend.__package__}.reply_bridge")
+            with patch.object(reply_bridge, "wire") as wire:
+                factory(object(), object())
+        self.assertEqual(wire.call_count, 1)
+        self.assertEqual(len(wire.call_args.args), 4)
+        self.assertIsNone(wire.call_args.args[3], "version-skewed helper must not receive approval capability")
+
     def test_sibling_loader_namespaces_same_machine_fake_homes(self):
         ingress_source = REPO / "plugins" / INGRESS_ID
         baseline_notifier = sys.modules.get("notifier")
@@ -588,7 +698,11 @@ class NativeInstallTests(unittest.TestCase):
             with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
                 frontend = loader._sibling_package(home.resolve())
                 module = importlib.import_module(f"{frontend.__package__}.notifier")
+                approval = importlib.import_module(f"{frontend.__package__}.approval_bridge")
             modules.append(module)
+            self.assertEqual(approval.CAPABILITY, "desktop-command-approval-v1")
+            self.assertEqual(approval.VERSION, module.VERSION)
+            self.assertIn("approval_bridge.py", loader._HELPER_FILES)
             self.assertEqual(module.ROOT, home.resolve())
             self.assertIn(f"_{'hermes_telegram_bridge_'}", module.__name__)
             self.assertIs(sys.modules.get("notifier"), baseline_notifier)

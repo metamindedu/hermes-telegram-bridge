@@ -18,6 +18,8 @@ The exact install/update/rollback syntax and separate enablement/restart gates l
 
 Ingress callbacks still run on the Gateway's existing Telegram `Application`; factory registration alone is not activation evidence. The native package ID `desktop-clarify-telegram` remains separate from the Desktop/CLI package ID `session-complete-telegram`, and their enablement must not be conflated.
 
+Version 1.6.0 adds a distinct, one-shot command-approval inbox only for the real in-process dangerous-command queue. Approval buttons are not another poller and cannot resolve generic approvals, `execute_code`, plugin rules, sudo or secrets. The exact queue ID is the core first-settlement key; the Desktop rechecks full snapshots before responding, but the RPC has no fingerprint-CAS field. Unsupported/compute-host approvals remain notifications. Old helper/ingress/renderer capability skew keeps the action surface disabled. Detailed state, lease, and release limits are in [[../operations|operations]].
+
 Code rollback and state rollback remain different. The shared `plugin-data/session-complete-telegram` directory, notification ledger, reply inbox, followup inbox, tombstones and credentials are never copied/reset by native package install/update/rollback. No state schema change or migration is introduced.
 
 Knowledge rules follow [[SCHEMA]], and navigation is maintained in [[index]].
