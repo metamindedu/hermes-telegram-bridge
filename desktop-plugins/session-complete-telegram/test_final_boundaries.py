@@ -101,6 +101,59 @@ class FinalBoundaryTests(LightCorrectionFixture):
                 await old_app.shutdown()
         asyncio.run(scenario())
 
+    def test_managed_corruption_before_factory_keeps_known_card_boundary(self):
+        async def scenario():
+            from gateway.platforms.base import BasePlatformAdapter
+            from telegram.ext import MessageHandler, filters
+            app,Update=await self.make_application();baseline=set(asyncio.all_tasks());later=[]
+            self.add_approval_tombstone();self.add_clarify_tombstone()
+            (self.managed/'config.yaml').write_text('plugins: [',encoding='utf-8')
+            adapter=SimpleNamespace(platform=SimpleNamespace(value='telegram'),name='fixture',_plugin_handler_native=None,_plugin_handlers_wired=None)
+            async def downstream(update,ctx):later.append(update.update_id)
+            try:
+                with patch.object(self.notifier,'credentials',return_value=(TOKEN,CHAT,None)),patch.object(self.notifier,'telegram',return_value={'ok':False}),patch('hermes_cli.plugins.get_plugin_manager',return_value=self.manager):
+                    BasePlatformAdapter._wire_plugin_handlers(adapter,app)
+                    app.add_handler(MessageHandler(filters.ALL,downstream),group=0)
+                    app.add_handler(MessageHandler(filters.ALL,downstream),group=1)
+                    await app.process_update(self.approval_text_update(Update,app,120,900))
+                    await app.process_update(self.clarify_text_update(Update,app,121,901))
+                self.assertEqual(later,[])
+                self.assertFalse(self.approval.receiver_info(state=self.state))
+            finally:
+                tasks=set(asyncio.all_tasks())-baseline
+                for t in tasks:t.cancel()
+                if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+                await app.shutdown()
+        asyncio.run(scenario())
+
+    def test_two_unattached_quarantine_failures_are_a_native_sdk_blocker(self):
+        async def scenario():
+            from gateway.platforms.base import BasePlatformAdapter
+            from telegram.ext import MessageHandler,filters
+            app,Update=await self.make_application();baseline=set(asyncio.all_tasks());later=[];attempts=[]
+            original=type(app).add_handler
+            self.add_approval_tombstone()
+            adapter=SimpleNamespace(platform=SimpleNamespace(value='telegram'),name='fixture',_plugin_handler_native=None,_plugin_handlers_wired=None)
+            def fail_guard(target,handler,group=0):
+                if target is app and group==-10000:
+                    attempts.append(1);raise RuntimeError('persistent attach refusal')
+                return original(target,handler,group=group)
+            async def downstream(update,ctx):later.append(update.update_id)
+            try:
+                with patch.object(self.notifier,'credentials',return_value=(TOKEN,CHAT,None)),patch.object(self.notifier,'telegram',return_value={'ok':False}),patch('hermes_cli.plugins.get_plugin_manager',return_value=self.manager):
+                    with patch.object(type(app),'add_handler',new=fail_guard):BasePlatformAdapter._wire_plugin_handlers(adapter,app)
+                    BasePlatformAdapter._wire_plugin_handlers(adapter,app)
+                    app.add_handler(MessageHandler(filters.ALL,downstream),group=0)
+                    await app.process_update(self.approval_text_update(Update,app,122,902))
+                self.assertEqual(len(attempts),2)
+                self.assertEqual(later,[], 'required consumption cannot be provided by current isolated factory SDK')
+            finally:
+                tasks=set(asyncio.all_tasks())-baseline
+                for t in tasks:t.cancel()
+                if tasks:await asyncio.gather(*tasks,return_exceptions=True)
+                await app.shutdown()
+        asyncio.run(scenario())
+
     def test_failed_clarify_rejection_notice_still_stops_other_groups(self):
         async def scenario():
             from telegram.ext import TypeHandler

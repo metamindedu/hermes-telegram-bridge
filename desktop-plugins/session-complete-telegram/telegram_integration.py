@@ -245,12 +245,20 @@ def _factory(ctx, captured_owner: object):
         if not raw.get("structural_valid"):
             logger.warning("Telegram gateway factory refused: native_plugin_config_invalid")
             return
+        if raw.get("migration_required"):
+            logger.warning("Telegram gateway factory refused: legacy_package_migration_required")
+            return
+        if not raw.get("primary_enabled"):
+            logger.warning("Telegram gateway factory refused: session_complete_plugin_disabled")
+            return
         effective, effective_reason = _native_effective_config(home)
         selection = _selection_reason(raw, effective)
         if effective is None:
-            logger.warning("Telegram gateway factory refused: %s", effective_reason)
-            return
-        if selection != "ready":
+            # The host can continue ordinary ingress when managed policy is
+            # invalid. Keep card consumers installed; all dynamic action gates
+            # still require a healthy native effective policy and deny here.
+            logger.warning("Telegram gateway interactions refused: %s", effective_reason)
+        elif selection != "ready":
             logger.warning("Telegram gateway factory refused: %s", selection)
             return
 
