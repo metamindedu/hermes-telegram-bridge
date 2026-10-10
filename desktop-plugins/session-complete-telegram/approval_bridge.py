@@ -19,8 +19,8 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.6.1"
-CAPABILITY = "desktop-command-approval-v2"
+VERSION = "1.7.0"
+CAPABILITY = "desktop-command-approval-v3"
 PREFIX = "hda:"
 LEASE = 45
 MAX_TTL = 31_536_000
@@ -471,8 +471,11 @@ def claim_valid(owner, approval_id, claim, descriptor, authority, deadline, *,
         if authority != expected_authority:
             return {"ok": True, "valid": False, "id": approval_id, "claim": claim,
                     "authority": authority, "deadline": deadline}
-        ingress = _sibling("reply_bridge")
-        if not ingress.enabled(root=root):
+        if __package__:
+            gateway = importlib.import_module('.telegram_integration', __package__)
+        else:
+            gateway = importlib.import_module('telegram_integration')
+        if not gateway.feature_enabled('approvals_enabled', root=root):
             return {"ok": True, "valid": False, "id": approval_id, "claim": claim,
                     "authority": authority, "deadline": deadline}
         c = connect_readonly(state)
@@ -1033,6 +1036,18 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     if action not in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
                        "approval_claim_valid"}:
         return {"ok": False, "reason": "unknown_approval_action"}
+    if __package__:
+        gateway = importlib.import_module('.telegram_integration', __package__)
+    else:
+        gateway = importlib.import_module('telegram_integration')
+    allowed, reason = gateway.feature_status('approvals_enabled', root=root)
+    if not allowed:
+        if action == "approval_poll":
+            return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
+        if action == "approval_claim_valid":
+            return {"ok": True, "valid": False, "id": req.get("id"), "claim": req.get("claim"),
+                    "authority": req.get("authority"), "deadline": req.get("deadline"), "reason": reason}
+        return {"ok": False, "feature_ready": False, "reason": reason}
     try:
         if action == "approval_claim_valid":
             return claim_valid(req.get("owner"), req.get("id"), req.get("claim"), req.get("descriptor"),
@@ -1040,15 +1055,11 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
         if action == "approval_owner_heartbeat":
             return owner_heartbeat(req.get("owner"), state=state)
         if action == "approval_register":
-            if not _sibling("reply_bridge").enabled(root=root):
-                return {"ok": False, "feature_ready": False, "reason": "disabled"}
             result = register(req, notifier, root=root, state=state, result_budget=result_budget)
             if result.get("status") in ("open", "queued", "applying", *TERMINAL):
                 flush(notifier, state=state)
             return result
         if action == "approval_poll":
-            if not _sibling("reply_bridge").enabled(root=root):
-                return {"ok": False, "feature_ready": False, "reason": "disabled", "items": []}
             result = poll(req.get("owner"), req.get("observations"), unverified=req.get("unverified"),
                           absent=req.get("absent"), state=state, result_budget=result_budget)
             flush(notifier, state=state)
@@ -1062,7 +1073,7 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
         return {"ok": False, "reason": "approval_store_unavailable"}
 
 
-def wire(application, notifier, bot, chat, topic, boot, *, enabled=lambda: True, state=STATE):
+def wire(application, notifier, bot, chat, topic, boot, *, approvals_enabled=lambda: False, state=STATE):
     """Attach approval callbacks to the existing PTB Application, never poll it."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
 
@@ -1097,7 +1108,7 @@ def wire(application, notifier, bot, chat, topic, boot, *, enabled=lambda: True,
             msg = getattr(query, "message", None)
             data = getattr(query, "data", None)
             match = re.fullmatch(r"hda:([A-Za-z0-9_-]{16,32}):([od])", data or "")
-            if (not enabled() or msg is None or getattr(query, "inline_message_id", None) is not None or
+            if (not approvals_enabled() or msg is None or getattr(query, "inline_message_id", None) is not None or
                     not isinstance(data, str) or len(data.encode("utf-8")) > 64 or match is None):
                 result = {"ok": False, "reason": "invalid_callback"}
             else:

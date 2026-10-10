@@ -4,9 +4,9 @@ The two **community** entries were submitted separately, one catalog file per PR
 - [#135956 — session-complete-telegram](https://github.com/NousResearch/hermes-agent/pull/135956)
 - [#135957 — desktop-clarify-telegram](https://github.com/NousResearch/hermes-agent/pull/135957)
 
-Both submissions are open and pin the publicly released MIT code `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` / version `1.6.1`. Submission is not admission: human maintainer review/merge and real discovery/install checks remain required. Direct pinned installation is already verified without GitHub credentials.
+This is a **historical v1.6.1 catalog submission record** only. The two old submissions pinned the public 1.6.1 source; they are not a v1.7.0 catalog admission or release. The unified 1.7.0 candidate is unreleased and has no published SHA/CI/catalog merge asserted here. Main owns any later PR updates after independent Heavy GO and separate release approval.
 
-The two open PRs' GitHub Actions currently report `action_required`: a repository maintainer must approve those fork workflows before CI can execute. No passing upstream catalog CI or maintainer admission is claimed.
+The v1.6.1 record noted `action_required` for the old fork workflows at that time. This task did not inspect or modify the upstream PRs or claim current CI/admission status.
 
 The official admission sources read for this preparation are the current [`plugin-catalog/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/README.md) and the [catalog submission guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission). A catalog entry is a trust signal only after maintainer review and merge; a template, direct Git install, or successful local test is not catalog admission or Nous endorsement.
 

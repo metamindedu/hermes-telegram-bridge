@@ -1,8 +1,8 @@
 import { host } from '@hermes/plugin-sdk'
 
 // App-level disk plugin: no profile configuration, agent prompt or core changes.
-export const VERSION = '1.6.1'
-export const APPROVAL_CAPABILITY = 'desktop-command-approval-v2'
+export const VERSION = '1.7.0'
+export const APPROVAL_CAPABILITY = 'desktop-command-approval-v3'
 export const APPROVAL_LEASE_MS = 45_000
 
 export function stableJSON(value) {

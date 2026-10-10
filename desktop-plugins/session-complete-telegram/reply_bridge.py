@@ -12,7 +12,6 @@ import sqlite3
 import time
 from pathlib import Path
 
-PLUGIN = 'desktop-clarify-telegram'
 PREFIX = 'hdq:'
 # Question-card TTL policy: follow the asking profile's clarify wait (the same
 # ``agent.clarify_timeout`` knob that decides how long the Desktop ask stays
@@ -121,13 +120,16 @@ def connect(state=STATE):
     return c
 
 
-def enabled(root=ROOT):
-    import yaml
-    try:
-        cfg = yaml.safe_load((Path(root) / 'config.yaml').read_text(encoding='utf-8-sig')) or {}
-        return PLUGIN in (cfg.get('plugins', {}).get('enabled') or [])
-    except Exception:
-        return False
+def _feature_status(root, ctx=None):
+    if __package__:
+        gateway = importlib.import_module('.telegram_integration', __package__)
+    else:
+        gateway = importlib.import_module('telegram_integration')
+    return gateway.feature_status('replies_enabled', root=root, ctx=ctx)
+
+
+def replies_enabled(root=ROOT):
+    return _feature_status(root)[0]
 
 
 def _retire(c, form_id, status):
@@ -573,7 +575,9 @@ def flush(notifier,*,state=STATE):
 def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     global _NOTIFIER
     _NOTIFIER = notifier
-    if not enabled(root=root):return {'ok':False,'reason':'bridge_disabled'}
+    allowed, reason = _feature_status(root)
+    if not allowed:
+        return {'ok': False, 'feature_ready': False, 'reason': reason}
     action=req['action']
     if action=='reply_register':
         checked=notifier.inspect_ask({'ask_method':'clarify','ask_id':req.get('ask',{}).get('id'),'ask_params':req.get('ask',{}).get('params',{}),'profile':req.get('descriptor',{}).get('targetProfile'),'session_key':req.get('descriptor',{}).get('session_key'),'desktop_observed':True},root=root)
@@ -589,50 +593,72 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     return result
 
 
-def wire(application,adapter,followup=None,approval=None):
-    """Native plugin factory: scoped PTB handlers, no additional update consumer."""
+def wire(application, adapter, followup=None, approval=None, *, replies_enabled=None, approvals_enabled=None):
+    """Install scoped consumers on the existing PTB Application, never a second poller."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
+    bot_data = getattr(application, "bot_data", None)
+    if isinstance(bot_data, dict) and bot_data.get("_newmetaw_session_complete_telegram_wired") is True:
+        return
     notifier = local_notifier()
     token,chat,topic=notifier.credentials()
-    # Refuse wiring on any adapter except the exact notification bot.
+    # Refuse wiring on any adapter except the exact configured notification bot.
     if application.bot.token!=token or chat<=0:return
     bot=int(token.split(':',1)[0]);boot=secrets.token_hex(16)
-    def enable_followup():
-        if followup is None or chat <= 0:return False
+
+    def reply_gate():
+        if callable(replies_enabled):
+            try:return replies_enabled() is True
+            except Exception:return False
+        return _feature_status(ROOT)[0]
+
+    def approval_gate():
+        if callable(approvals_enabled):
+            try:return approvals_enabled() is True
+            except Exception:return False
+        if __package__:
+            gateway = importlib.import_module('.telegram_integration', __package__)
+        else:
+            gateway = importlib.import_module('telegram_integration')
+        return gateway.feature_enabled('approvals_enabled', root=ROOT)
+
+    def verify_private_home():
         try:
             result=notifier.telegram(token,'getChat',{'chat_id':chat})
             value=result.get('result') or {}
             return bool(result.get('ok') and value.get('type')=='private' and value.get('id')==chat)
         except Exception:
             return False
+
     async def heartbeat_loop():
         private_verified=False
         verification=None
         retry_at=0
         try:
             while application.running:
-                if enabled():
+                replies_live=reply_gate()
+                approvals_live=approval_gate()
+                if replies_live:
                     # A new inbox must never take down the existing receiver.
                     try:await asyncio.to_thread(bind_receiver,bot,chat,topic,boot)
                     except Exception:pass
-                    if followup is not None:
-                        if verification is not None and verification.done():
-                            try:private_verified=verification.result()
-                            except Exception:private_verified=False
-                            verification=None
-                            retry_at=time.monotonic()+60
-                        if not private_verified and verification is None and time.monotonic()>=retry_at:
-                            verification=asyncio.create_task(asyncio.to_thread(enable_followup))
-                        if private_verified:
-                            try:await asyncio.to_thread(followup.bind_receiver,bot,chat,topic,boot,private_verified=True)
-                            except Exception:pass
-                    if private_verified and approval is not None:
-                        try:
-                            await asyncio.to_thread(approval.bind_receiver, bot, chat, topic, boot,
-                                private_verified=True, version=approval.VERSION, capability=approval.CAPABILITY)
-                        except Exception:
-                            # Approval inbox failure is isolated from clarify/followup heartbeats.
-                            pass
+                if (followup is not None and replies_live) or (approval is not None and approvals_live):
+                    if verification is not None and verification.done():
+                        try:private_verified=verification.result()
+                        except Exception:private_verified=False
+                        verification=None
+                        retry_at=time.monotonic()+60
+                    if not private_verified and verification is None and time.monotonic()>=retry_at:
+                        verification=asyncio.create_task(asyncio.to_thread(verify_private_home))
+                if private_verified and followup is not None and replies_live:
+                    try:await asyncio.to_thread(followup.bind_receiver,bot,chat,topic,boot,private_verified=True)
+                    except Exception:pass
+                if private_verified and approval is not None and approvals_live:
+                    try:
+                        await asyncio.to_thread(approval.bind_receiver, bot, chat, topic, boot,
+                            private_verified=True, version=approval.VERSION, capability=approval.CAPABILITY)
+                    except Exception:
+                        # Approval inbox failure is isolated from clarify/followup heartbeats.
+                        pass
                 await asyncio.sleep(8)
         finally:
             if verification is not None:
@@ -654,7 +680,7 @@ def wire(application,adapter,followup=None,approval=None):
         try:
             bits=query.data.split(':');fid=bits[1];index=int(bits[2]);action=bits[3];value=int(bits[4])
             msg=query.message
-            if not enabled() or msg is None:raise ValueError('unavailable')
+            if not reply_gate() or msg is None:raise ValueError('unavailable')
             ident=identity(msg,query.from_user,msg.message_id,msg.from_user)
             ident['event']='callback:'+query.id
             result=await asyncio.to_thread(intake,fid,index,action,value,ident)
@@ -674,7 +700,7 @@ def wire(application,adapter,followup=None,approval=None):
     async def text_reply(update,context):
         msg=update.message
         try:
-            if not enabled() or msg is None or update.edited_message is not None:raise ValueError('unavailable')
+            if not reply_gate() or msg is None or update.edited_message is not None:raise ValueError('unavailable')
             reply=msg.reply_to_message;found=lookup_reply(bot,msg.chat.id,reply.message_id)
             ident=identity(msg,msg.from_user,reply.message_id,reply.from_user)
             ident['event']=f'text:{msg.chat.id}:{msg.message_id}'
@@ -688,7 +714,7 @@ def wire(application,adapter,followup=None,approval=None):
         raise ApplicationHandlerStop
     if approval is not None:
         try:
-            approval.wire(application, notifier, bot, chat, topic, boot, enabled=enabled)
+            approval.wire(application, notifier, bot, chat, topic, boot, approvals_enabled=approval_gate)
         except Exception:
             # No approval failure can stop the existing clarify/followup handler setup.
             pass
@@ -696,4 +722,6 @@ def wire(application,adapter,followup=None,approval=None):
     application.add_handler(MessageHandler(ExactReply(),text_reply),group=0)
     if followup is not None:
         # Existing authoritative clarify mappings win even during a followup DB outage.
-        followup.wire(application,notifier,bot,chat,topic,boot,enabled=enabled)
+        followup.wire(application,notifier,bot,chat,topic,boot,enabled=reply_gate)
+    if isinstance(bot_data, dict):
+        bot_data["_newmetaw_session_complete_telegram_wired"] = True

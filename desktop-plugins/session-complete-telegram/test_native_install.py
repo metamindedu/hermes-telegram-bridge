@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -51,29 +52,52 @@ def _load_package(directory: Path, name: str):
     return module
 
 
-def _copy_candidate(destination: Path, version: str) -> Path:
+def _copy_candidate(destination: Path, version: str, *, include_legacy: bool = False) -> Path:
+    """Copy a package candidate into a disposable local Git-transport fixture."""
     destination.mkdir(parents=True)
-    for source, relative in (
-        (REPO / "desktop-plugins" / FRONTEND_ID, Path("desktop-plugins") / FRONTEND_ID),
-        (REPO / "plugins" / INGRESS_ID, Path("plugins") / INGRESS_ID),
-    ):
+    packages = [(REPO / "desktop-plugins" / FRONTEND_ID,
+                 Path("desktop-plugins") / FRONTEND_ID)]
+    if include_legacy:
+        packages.append((REPO / "plugins" / INGRESS_ID, Path("plugins") / INGRESS_ID))
+    for source, relative in packages:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        if version == "1.6.0":
+        manifest = target / "plugin.yaml"
+        text = manifest.read_text(encoding="utf-8")
+        manifest.write_text(text.replace("version: '1.7.0'", f"version: '{version}'"), encoding="utf-8")
+        if version != "1.7.0":
             for runtime_relative in (Path("desktop") / "plugin.js", Path("notifier.py"),
-                                     Path("approval_bridge.py"), Path("__init__.py")):
+                                     Path("approval_bridge.py")):
                 candidate = target / runtime_relative
                 if candidate.is_file():
                     source_text = candidate.read_text(encoding="utf-8")
-                    candidate.write_text(source_text.replace("1.6.1", "1.6.0")
-                                         .replace("desktop-command-approval-v2", "desktop-command-approval-v1"),
-                                         encoding="utf-8")
-        manifest = target / "plugin.yaml"
-        text = manifest.read_text(encoding="utf-8")
-        manifest.write_text(text.replace("version: '1.6.1'", f"version: '{version}'"), encoding="utf-8")
+                    source_text = source_text.replace("1.7.0", version)
+                    if version == "1.6.1":
+                        source_text = source_text.replace("desktop-command-approval-v3", "desktop-command-approval-v2")
+                    elif version == "1.6.0":
+                        source_text = source_text.replace("desktop-command-approval-v3", "desktop-command-approval-v1")
+                    candidate.write_text(source_text, encoding="utf-8")
     return destination
 
+
+def _copy_synthetic_legacy_candidate(destination: Path) -> Path:
+    """Extract the exact published v1.6.1 bytes; only homes/data are synthetic."""
+    revision = "1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca"
+    destination.mkdir(parents=True)
+    paths = subprocess.check_output([
+        "git", "-C", str(REPO), "ls-tree", "-r", "--name-only", revision, "--",
+        "desktop-plugins/session-complete-telegram", "plugins/desktop-clarify-telegram",
+    ]).decode("utf-8").splitlines()
+    if not paths:
+        raise AssertionError("immutable v1.6.1 fixture tree unavailable; fetch repository history")
+    for relative in paths:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output([
+            "git", "-C", str(REPO), "show", revision + ":" + relative,
+        ]))
+    return destination
 
 class NativeInstallTests(unittest.TestCase):
     def setUp(self):
@@ -92,30 +116,39 @@ class NativeInstallTests(unittest.TestCase):
         self.home.mkdir()
         self.config = self.home / "config.yaml"
         self.config_bytes = b"plugins:\n  enabled: []\nphase2_sentinel: do-not-change\n"
+        self.expected_config_bytes = self.config_bytes
         self.config.write_bytes(self.config_bytes)
         self.state = self.home / "plugin-data" / FRONTEND_ID
         self.state.mkdir(parents=True)
         self.sentinel = self.state / "sentinel.bin"
         self.sentinel_bytes = b"preserve-existing-ledger-and-data\x00phase2"
         self.sentinel.write_bytes(self.sentinel_bytes)
+        self.ledger_files = {}
         self.candidates = {
-            "v1": _copy_candidate(self.root / "candidate v1", "1.6.0"),
-            "v2": _copy_candidate(self.root / "candidate v2", "1.6.1"),
+            "old": _copy_synthetic_legacy_candidate(self.root / "candidate old two-package"),
+            "v3": _copy_candidate(self.root / "candidate unified 1.7.0", "1.7.0"),
         }
-        self.revisions = {
-            "v1": "1" * 40,
-            "v2": "2" * 40,
-        }
+        self.revisions = {"old": "1" * 40, "v3": "3" * 40}
 
     def _assert_pm_fixture_scope(self):
+        from hermes_constants import get_default_hermes_root, get_hermes_home
         from pm.environments import dependency_home_root
         from pm.plugins_state import dependency_homes
 
         fixture = self.root.resolve()
+        active_home = Path(get_hermes_home()).resolve()
+        default_home = Path(get_default_hermes_root()).resolve()
+        local_app_data = Path(os.environ["LOCALAPPDATA"]).resolve()
         dependency_root = dependency_home_root().resolve()
         homes = [Path(home).resolve() for home in dependency_homes()]
+        self.assertTrue(active_home.is_relative_to(fixture), active_home)
+        self.assertTrue(default_home.is_relative_to(fixture), default_home)
+        self.assertTrue(local_app_data.is_relative_to(fixture), local_app_data)
+        self.assertEqual(active_home, self.home.resolve())
+        self.assertEqual(local_app_data, self.local_app_data.resolve())
         self.assertTrue(dependency_root.is_relative_to(fixture), dependency_root)
         self.assertTrue(homes, "native PM must include its default dependency home")
+        self.assertEqual(homes[0], dependency_root, "PM default dependency home must be task-owned")
         self.assertTrue(all(home.is_relative_to(fixture) for home in homes), homes)
 
     def _release_fixture_pm_leases(self):
@@ -173,20 +206,19 @@ class NativeInstallTests(unittest.TestCase):
         return self.home / "plugins" / Path(package_dir).name
 
     def _assert_preserved(self):
-        self.assertEqual(self.config.read_bytes(), self.config_bytes)
+        self.assertEqual(self.config.read_bytes(), self.expected_config_bytes)
         self.assertEqual(self.sentinel.read_bytes(), self.sentinel_bytes)
+        for ledger, contents in self.ledger_files.items():
+            self.assertEqual(ledger.read_bytes(), contents, str(ledger))
 
     def _assert_package_ids(self):
         frontend = self.home / "plugins" / FRONTEND_ID
-        ingress = self.home / "plugins" / INGRESS_ID
         self.assertIn("name: session-complete-telegram", (frontend / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertIn("id: ID", (frontend / "desktop" / "plugin.js").read_text(encoding="utf-8"))
-        self.assertIn("name: desktop-clarify-telegram", (ingress / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertTrue((self.home / "plugin-data" / FRONTEND_ID).is_dir())
         self.assertTrue((self.home / "plugins" / FRONTEND_ID).is_dir())
-        self.assertTrue((self.home / "plugins" / INGRESS_ID).is_dir())
 
-    def _native_frontend_handler(self, module_name, candidate="v1"):
+    def _native_frontend_handler(self, module_name, candidate="v3"):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
 
@@ -236,66 +268,242 @@ class NativeInstallTests(unittest.TestCase):
             result = bridge.intake(form_id, index, "text", answer, identity, state=state)
             self.assertTrue(result["ok"], result)
 
-    def test_native_fresh_update_and_rollback_keep_ids_config_and_plugin_data(self):
+    def test_native_historical_two_package_to_unified_and_old_rollback_preserves_state(self):
+        import sqlite3
         frontend_path = "desktop-plugins/session-complete-telegram"
-        ingress_path = "plugins/desktop-clarify-telegram"
-        self._install_package("v1", frontend_path, force=False)
-        self._install_package("v1", ingress_path, force=False)
+        legacy_path = "plugins/desktop-clarify-telegram"
+        self.ledger_queries = {}
+        ledgers = (
+            (self.state / "reply-inbox" / "replies.sqlite3",
+             "CREATE TABLE tombstones(bot INTEGER, chat INTEGER, mid INTEGER, form_id TEXT, question_index INTEGER);"
+             "INSERT INTO tombstones VALUES(77,99,700,'fixture-tombstone',0);", "SELECT mid FROM tombstones", 700),
+            (self.state / "followup-inbox" / "followups.sqlite3",
+             "CREATE TABLE preservation_marker(value TEXT); INSERT INTO preservation_marker VALUES('followup-ledger');",
+             "SELECT value FROM preservation_marker", "followup-ledger"),
+            (self.state / "approval-inbox" / "approvals.sqlite3",
+             "CREATE TABLE preservation_marker(value TEXT); INSERT INTO preservation_marker VALUES('approval-ledger');",
+             "SELECT value FROM preservation_marker", "approval-ledger"),
+        )
+        for ledger, setup_sql, query, expected in ledgers:
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(ledger)
+            try:
+                connection.executescript(setup_sql)
+            finally:
+                connection.close()
+            self.ledger_files[ledger] = ledger.read_bytes()
+            self.ledger_queries[ledger] = (query, expected)
+
+        self._install_package("old", frontend_path, force=False)
+        self._install_package("old", legacy_path, force=False)
         self._assert_preserved()
         self._assert_package_ids()
-        self.assertTrue((self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").is_file())
-        self.assertIn("desktop-command-approval-v1", (self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").read_text(encoding="utf-8"))
+        self.assertIn("version: '1.6.1'", (self.home / "plugins" / INGRESS_ID / "plugin.yaml").read_text(encoding="utf-8"))
 
-        self._install_package("v2", frontend_path, force=True)
-        self._install_package("v2", ingress_path, force=True)
+        # A single native install updates only the primary package. The legacy
+        # package, config selection, and all durable state remain untouched.
+        self._install_package("v3", frontend_path, force=True)
+        self.assertIn("version: '1.7.0'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertTrue((self.home / "plugins" / INGRESS_ID / "__init__.py").is_file())
+        self._assert_preserved()
+        self._assert_package_ids()
+
+        # Exact old packaged rollback replaces only the primary managed folder;
+        # it does not reverse the user's config choice or erase old ledgers.
+        self._install_package("old", frontend_path, force=True)
         self.assertIn("version: '1.6.1'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
-        self.assertTrue((self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").is_file())
+        self.assertIn("version: '1.6.1'", (self.home / "plugins" / INGRESS_ID / "plugin.yaml").read_text(encoding="utf-8"))
         self._assert_preserved()
         self._assert_package_ids()
+        for ledger, (query, expected) in self.ledger_queries.items():
+            connection = sqlite3.connect(ledger)
+            try:
+                self.assertEqual(connection.execute(query).fetchone()[0], expected, str(ledger))
+            finally:
+                connection.close()
 
-        # Rollback is the same native pinned install transaction using the
-        # previous immutable ref; no bespoke deploy/rollback executor exists.
-        self._install_package("v1", frontend_path, force=True)
-        self._install_package("v1", ingress_path, force=True)
-        self.assertIn("version: '1.6.0'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
-        self.assertTrue((self.home / "plugins" / FRONTEND_ID / "approval_bridge.py").is_file())
-        self._assert_preserved()
-        self._assert_package_ids()
-
-    def test_native_plugin_doctor_accepts_both_installed_packages(self):
+    def test_native_fresh_single_install_and_plugin_doctor(self):
         from hermes_cli import plugins_cmd
 
-        self._install_package("v1", "desktop-plugins/session-complete-telegram", force=False)
-        self._install_package("v1", "plugins/desktop-clarify-telegram", force=False)
-        for plugin_id in (FRONTEND_ID, INGRESS_ID):
-            with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}), contextlib.redirect_stdout(io.StringIO()):
-                plugins_cmd.cmd_plugin_doctor(str(self.home / "plugins" / plugin_id), ci=True)
+        self._install_package("v3", "desktop-plugins/session-complete-telegram", force=False)
+        self._assert_package_ids()
+        self.assertFalse((self.home / "plugins" / INGRESS_ID).exists(), "fresh install must not install the legacy package")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self._assert_pm_fixture_scope()
+            plugins_cmd.cmd_plugin_doctor(str(self.home / "plugins" / FRONTEND_ID), ci=True)
         self._assert_preserved()
 
-    def test_real_plugin_context_registers_one_ingress_factory_only(self):
+    def test_one_real_native_context_registers_cli_and_one_telegram_factory(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
 
-        self._install_package("v1", "plugins/desktop-clarify-telegram", force=False)
-        target = self.home / "plugins" / INGRESS_ID
+        self._install_package("v3", "desktop-plugins/session-complete-telegram", force=False)
+        target = self.home / "plugins" / FRONTEND_ID
         manager = PluginManager(scope_key=str(self.home))
-        manifest = PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user", path=str(target))
+        manifest = PluginManifest(name=FRONTEND_ID, key=FRONTEND_ID, source="user", path=str(target))
         ctx = PluginContext(manifest, manager)
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
-            plugin = _load_package(target, "phase2_ingress_fixture")
+            plugin = _load_package(target, "unified_native_context_fixture")
             plugin.register(ctx)
+        self.assertIn(COMMAND_ID, manager._cli_commands)
         factories = manager.get_platform_handler_factories("telegram")
         self.assertEqual(len(factories), 1)
         factory, owner = factories[0]
-        self.assertEqual(owner, INGRESS_ID)
+        self.assertEqual(owner, FRONTEND_ID)
         self.assertEqual(factory.__name__, "telegram_factory")
-        self.assertEqual(manager.get_platform_handler_factories("telegram"), [(factory, INGRESS_ID)])
+
+        # The repository-only legacy compatibility stub cannot wire a duplicate.
+        legacy_target = REPO / "plugins" / INGRESS_ID
+        legacy = _load_package(legacy_target, "deprecated_native_context_fixture")
+        old_ctx = PluginContext(PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user",
+                                               path=str(legacy_target)), manager)
+        legacy.register(old_ctx)
+        self.assertEqual(manager.get_platform_handler_factories("telegram"), [(factory, FRONTEND_ID)])
+
+    def test_real_ptb_application_uses_independent_live_gates_and_never_duplicates_handlers(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from telegram import Update
+        from telegram.ext import Application, TypeHandler
+        from hermes_cli.plugins import PluginContext, PluginManager
+        from hermes_cli.plugins_manifest import PluginManifest
+
+        self._install_package("v3", "desktop-plugins/session-complete-telegram", force=False)
+        nl = chr(10)
+        self.config.write_text(nl.join(("plugins:", "  enabled: [session-complete-telegram]", "  entries:",
+            "    session-complete-telegram:", "      settings:", "        replies_enabled: false",
+            "        approvals_enabled: false", "")), encoding="utf-8")
+        self.expected_config_bytes = self.config.read_bytes()
+        target = self.home / "plugins" / FRONTEND_ID
+        manager = PluginManager(scope_key=str(self.home))
+        ctx = PluginContext(PluginManifest(name=FRONTEND_ID, key=FRONTEND_ID, source="user", path=str(target)), manager)
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
+            plugin = _load_package(target, "ptb_unified_gates_fixture")
+            plugin.register(ctx)
+            notifier_module = importlib.import_module("ptb_unified_gates_fixture.notifier")
+            reply_bridge = importlib.import_module("ptb_unified_gates_fixture.reply_bridge")
+            approval_bridge = importlib.import_module("ptb_unified_gates_fixture.approval_bridge")
+            followup_bridge = importlib.import_module("ptb_unified_gates_fixture.followup_bridge")
+            factory, owner = manager.get_platform_handler_factories("telegram")[0]
+        self.assertEqual(owner, FRONTEND_ID)
+
+        def write_flags(*, replies, approvals):
+            self._assert_preserved()
+            self.config.write_text(nl.join(("plugins:", "  enabled: [session-complete-telegram]", "  entries:",
+                "    session-complete-telegram:", "      settings:",
+                f"        replies_enabled: {str(replies).lower()}",
+                f"        approvals_enabled: {str(approvals).lower()}", "")), encoding="utf-8")
+            self.expected_config_bytes = self.config.read_bytes()
+
+        async def run():
+            app = Application.builder().token("77:synthetic-token").build()
+            with (
+                    patch.object(type(app.bot), "initialize", new=AsyncMock()),
+                    patch.object(type(app.bot), "shutdown", new=AsyncMock()),
+                    patch.object(notifier_module, "credentials", return_value=("77:synthetic-token", 99, None)),
+                    patch.object(notifier_module, "telegram", return_value={"ok": False}),
+            ):
+                await app.initialize()
+                before_tasks = set(asyncio.all_tasks())
+                factory(app, object())
+                handler_counts = {group: len(handlers) for group, handlers in app.handlers.items()}
+                factory(app, object())
+                self.assertEqual({group: len(handlers) for group, handlers in app.handlers.items()}, handler_counts)
+                later = []
+                async def downstream(update, context):
+                    later.append(update)
+                app.add_handler(TypeHandler(Update, downstream), group=1)
+
+                def callback_update(update_id, callback_id, data):
+                    return Update.de_json({"update_id": update_id, "callback_query": {
+                        "id": callback_id, "from": {"id": 99, "is_bot": False, "first_name": "owner"},
+                        "chat_instance": "fixture", "data": data,
+                        "message": {"message_id": 901, "date": 1,
+                            "chat": {"id": 99, "type": "private"},
+                            "from": {"id": 77, "is_bot": True, "first_name": "bot"},
+                            "text": "synthetic card"}}}, app.bot)
+
+                # Both gates are off at factory invocation, but handlers stay in
+                # place to consume stale callbacks/cards without agent fallthrough.
+                choose_calls = []
+                with (
+                        patch.object(approval_bridge, "choose", side_effect=lambda *a, **k: choose_calls.append(a) or {"ok": False}),
+                        patch.object(type(callback_update(1, "q-off", "hda:" + "a" * 32 + ":o").callback_query),
+                                     "answer", new=AsyncMock()) as denied_answer,
+                ):
+                    denied = callback_update(1, "q-off", "hda:" + "a" * 32 + ":o")
+                    await app.process_update(denied)
+                self.assertEqual(choose_calls, [])
+                self.assertGreater(denied_answer.await_count, 0)
+                self.assertEqual(later, [])
+
+                # Enabling replies after the handlers were wired activates only
+                # that gate; approvals remain off in this same Application.
+                write_flags(replies=True, approvals=False)
+                intake_calls = []
+                with (
+                        patch.object(reply_bridge, "intake", side_effect=lambda *a, **k: intake_calls.append(a) or {"ok": True}),
+                        patch.object(reply_bridge, "flush"),
+                ):
+                    clarify = callback_update(2, "q-reply", "hdq:" + "b" * 32 + ":0:select:1")
+                    with patch.object(type(clarify.callback_query), "answer", new=AsyncMock()) as reply_answer:
+                        await app.process_update(clarify)
+                self.assertEqual(len(intake_calls), 1)
+                self.assertEqual(reply_answer.await_args.args[0], "선택을 받았습니다.")
+                self.assertEqual(choose_calls, [], "reply enablement must not enable approvals")
+
+                # Conversely, approvals remain independently live when replies
+                # are switched off without replacing the resident handler set.
+                write_flags(replies=False, approvals=True)
+                with (
+                        patch.object(approval_bridge, "choose", side_effect=lambda *a, **k: choose_calls.append(a) or {"ok": False}),
+                        patch.object(type(callback_update(3, "q-approval", "hda:" + "c" * 32 + ":o").callback_query),
+                                     "answer", new=AsyncMock()) as approval_answer,
+                ):
+                    approval_update = callback_update(3, "q-approval", "hda:" + "c" * 32 + ":o")
+                    await app.process_update(approval_update)
+                self.assertEqual(len(choose_calls), 1)
+                self.assertGreater(approval_answer.await_count, 0)
+
+                # A stale completion-card reply is still stopped when replies
+                # are revoked, instead of reaching the general prompt handler.
+                write_flags(replies=False, approvals=False)
+                with followup_bridge.connect() as tombstone_db:
+                    tombstone_db.execute("INSERT INTO outbound VALUES(77,99,700,NULL,'legacy',?)", (time.time(),))
+                self.assertEqual(followup_bridge.lookup_outbound(77, 99, 700)["kind"], "legacy")
+                text = Update.de_json({"update_id": 4, "message": {"message_id": 902, "date": 1,
+                    "chat": {"id": 99, "type": "private"},
+                    "from": {"id": 99, "is_bot": False, "first_name": "owner"}, "text": "old reply",
+                    "reply_to_message": {"message_id": 700, "date": 1,
+                        "chat": {"id": 99, "type": "private"},
+                        "from": {"id": 77, "is_bot": True, "first_name": "bot"},
+                        "text": "✅ Hermes Desktop 세션 작업 종료"}}}, app.bot)
+                await app.process_update(text)
+                self.assertEqual(later, [])
+                with followup_bridge.connect() as tombstone_db:
+                    consumed = tombstone_db.execute(
+                        "SELECT kind FROM outbound WHERE bot=77 AND chat=99 AND mid=902").fetchone()
+                self.assertIsNotNone(consumed, "revoked stale-card reply must be tombstoned")
+                self.assertEqual(consumed["kind"], "legacy")
+                self.assertEqual(handler_counts, {group: len(handlers) for group, handlers in app.handlers.items() if group == 0})
+
+                extra_tasks = set(asyncio.all_tasks()) - before_tasks
+                for task in extra_tasks:
+                    task.cancel()
+                if extra_tasks:
+                    await asyncio.gather(*extra_tasks, return_exceptions=True)
+                await app.shutdown()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
+            asyncio.run(run())
+        self._assert_preserved()
 
     def test_real_frontend_cli_registration_parsing_and_single_action_dispatch(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
 
-        self._install_package("v1", "desktop-plugins/session-complete-telegram", force=False)
+        self._install_package("v3", "desktop-plugins/session-complete-telegram", force=False)
         target = self.home / "plugins" / FRONTEND_ID
         manager = PluginManager(scope_key=str(self.home))
         manifest = PluginManifest(name=FRONTEND_ID, key=FRONTEND_ID, source="user", path=str(target))
@@ -373,9 +581,9 @@ class NativeInstallTests(unittest.TestCase):
                         "params": {"session_id": "runtime-native", "question": "Disabled?"}}
         disabled = self._call_native(handler, parser, {"action": "reply_register",
             "descriptor": self._reply_request(disabled_ask, "owner-native"), "ask": disabled_ask})[0]
-        self.assertEqual(disabled, {"ok": False, "reason": "bridge_disabled"})
+        self.assertEqual(disabled, {"ok": False, "feature_ready": False, "reason": "session_complete_plugin_disabled"})
 
-        self.config.write_text("plugins:\n  enabled:\n    - desktop-clarify-telegram\n", encoding="utf-8")
+        self.config.write_text("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n", encoding="utf-8")
         (self.home / ".env").write_text(
             "TELEGRAM_BOT_TOKEN=77:synthetic-token\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
         db = SessionDB(self.home / "state.db")
@@ -491,7 +699,7 @@ class NativeInstallTests(unittest.TestCase):
 
     def test_registered_native_followup_settle_and_reject_dispatch_receipts(self):
         plugin, handler, parser = self._native_frontend_handler("phase2_real_followup_dispatch")
-        self.config.write_text("plugins:\n  enabled:\n    - desktop-clarify-telegram\n", encoding="utf-8")
+        self.config.write_text("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n", encoding="utf-8")
         (self.home / ".env").write_text(
             "TELEGRAM_BOT_TOKEN=77:synthetic-token\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
@@ -561,7 +769,7 @@ class NativeInstallTests(unittest.TestCase):
     def test_malformed_timeout_native_receipt_drives_command_free_checkask(self):
         """Actual registered CLI receipts feed the real renderer, not a preset error category."""
         import subprocess
-        plugin, handler, parser = self._native_frontend_handler('native_timeout_review_boundary',candidate='v2')
+        plugin, handler, parser = self._native_frontend_handler('native_timeout_review_boundary',candidate='v3')
         with patch.dict(os.environ, {'HERMES_HOME':str(self.home),'LOCALAPPDATA':str(self.local_app_data)}):
             notice_module=importlib.import_module('native_timeout_review_boundary.notifier')
             bridge=importlib.import_module('native_timeout_review_boundary.approval_bridge')
@@ -604,7 +812,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 patch.object(notice_module,'telegram',side_effect=telegram_stub):
             for index,block in enumerate(('malformed',['malformed'])):
                 with self.subTest(block=block):
-                    self.config.write_text('plugins:\n  enabled: [desktop-clarify-telegram]\napprovals: '+json.dumps(block)+'\n',encoding='utf-8')
+                    self.config.write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals: '+json.dumps(block)+'\n',encoding='utf-8')
                     queue_id=('a' if index==0 else 'b')*32
                     request={'id':('srq-aabbcc112233' if index==0 else 'srq-112233aabbcc'),'method':'approval','params':{
                         'session_id':'runtime-native','request_id':queue_id,'command':command,'description':description,
@@ -638,20 +846,22 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                     payload={'entry':(self.home/'plugins'/FRONTEND_ID/'desktop/plugin.js').as_uri(),'owner':owner,
                         'route':route,'session':session,'request':request,'pending':pending,'command':command,
                         'heartbeat':heartbeat,'registration':registration,'notice':notice}
+                    child_env = dict(os.environ)
+                    child_env.update({"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)})
                     result=subprocess.run(['node','--input-type=module','-e',script],input=json.dumps(payload),
-                        text=True,capture_output=True,timeout=20)
+                        text=True,capture_output=True,timeout=20,env=child_env)
                     self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
     def test_registered_native_dispatcher_frames_real_approval_inbox_claim(self):
         """Run approval_* through the actual registered CLI handler in a fake Hermes home."""
-        plugin, handler, parser = self._native_frontend_handler("phase2_real_approval_dispatch",candidate="v2")
+        plugin, handler, parser = self._native_frontend_handler("phase2_real_approval_dispatch",candidate="v3")
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
             notifier_module = importlib.import_module("phase2_real_approval_dispatch.notifier")
             bridge = importlib.import_module("phase2_real_approval_dispatch.approval_bridge")
         original_config = self.config.read_bytes()
         self.addCleanup(self.config.write_bytes, original_config)
         self.config.write_text(
-            "plugins:\n  enabled:\n    - desktop-clarify-telegram\napprovals:\n  timeout: 300\n",
+            "plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals:\n  timeout: 300\n",
             encoding="utf-8")
         (self.home / ".env").write_text(
             "TELEGRAM_BOT_TOKEN=77:synthetic-token\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
@@ -760,12 +970,13 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             try:inbox.execute('UPDATE approvals SET expires=? WHERE id=?',(before_row['expires'],claim['id']))
             finally:inbox.close()
 
-            live_config="plugins:\n  enabled:\n    - desktop-clarify-telegram\napprovals:\n  timeout: 300\n"
-            self.config.write_text("plugins:\n  enabled: []\napprovals:\n  timeout: 300\n",encoding="utf-8")
+            live_config="plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n        approvals_enabled: true\napprovals:\n  timeout: 300\n"
+            self.config.write_text("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n        approvals_enabled: false\napprovals:\n  timeout: 300\n",encoding="utf-8")
             disabled,_=self._call_native(handler,parser,{"action":"approval_claim_valid","capability":bridge.CAPABILITY,
                 "owner":owner,"id":claim['id'],"claim":claim['claim'],"descriptor":claim['descriptor'],
                 "authority":authority,"deadline":claim['deadline']})
             self.assertIs(disabled.get('valid'),False,disabled)
+            self.assertEqual(disabled.get('reason'),'approvals_disabled')
             self.config.write_text(live_config,encoding="utf-8")
             self.assertTrue(bridge.bind_receiver(77,99,None,"native-approval-boot-after-claim",
                 private_verified=True,state=state,now=time.time()))
@@ -782,141 +993,165 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             self.assertIs(calls[0][1]["protect_content"],False)
 
     def test_native_loaded_handshake_hides_capability_on_helper_version_skew(self):
-        plugin, handler, parser = self._native_frontend_handler("phase2_approval_version_skew")
+        _plugin, handler, parser = self._native_frontend_handler("phase2_approval_version_skew")
+        config = ("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n"
+                  "    session-complete-telegram:\n      settings:\n        approvals_enabled: true\n").encode()
+        self.config.write_bytes(config)
+        self.expected_config_bytes = config
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
             bridge = importlib.import_module("phase2_approval_version_skew.approval_bridge")
-        with patch.object(bridge, "VERSION", "1.5.0"), patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
-            result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.0","profiles":[]})
-        self.assertEqual(result["version"], "1.6.0")
-        self.assertNotIn("desktop-command-approval-v1", result.get("capabilities", []))
+        with patch.object(bridge, "VERSION", "1.6.1"), patch.object(bridge, "CAPABILITY", "desktop-command-approval-v2"), \
+                patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
+            result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.1","profiles":[]})
+        self.assertEqual(result["version"], "1.7.0")
+        self.assertEqual(result["capabilities"], [])
 
     def test_new_helper_loaded_handshake_rejects_old_renderer_contract(self):
-        plugin, handler, parser = self._native_frontend_handler("phase2_new_handshake_fixture", candidate="v2")
+        _plugin, handler, parser = self._native_frontend_handler("phase2_new_handshake_fixture", candidate="v3")
+        config = ("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n"
+                  "    session-complete-telegram:\n      settings:\n        approvals_enabled: true\n").encode()
+        self.config.write_bytes(config)
+        self.expected_config_bytes = config
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
-            result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.0","profiles":[]})
-        self.assertEqual(result, {"ok":True,"version":"1.6.1","capabilities":["desktop-command-approval-v2"]})
-        old_renderer_accepts = result.get("version") == "1.6.0" and "desktop-command-approval-v1" in result["capabilities"]
-        self.assertFalse(old_renderer_accepts)
+            result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.1","profiles":[]})
+        self.assertEqual(result["version"], "1.7.0")
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v3"])
+        self.assertNotEqual((result["version"], "desktop-command-approval-v3"),
+                            ("1.6.1", "desktop-command-approval-v2"))
 
-    def test_profile_context_guards_refuse_foreign_and_named_homes(self):
-        from hermes_cli.plugins import PluginContext, PluginManager
-        from hermes_cli.plugins_manifest import PluginManifest
+    def test_primary_runtime_location_and_home_guards_refuse_foreign_and_named_homes(self):
+        self._install_package("v3", "desktop-plugins/session-complete-telegram", force=False)
+        target = self.home / "plugins" / FRONTEND_ID
+        _load_package(target, "primary_runtime_home_guard_fixture")
+        runtime = importlib.import_module("primary_runtime_home_guard_fixture.runtime")
 
-        self._install_package("v1", "plugins/desktop-clarify-telegram", force=False)
-        self._install_package("v1", "desktop-plugins/session-complete-telegram", force=False)
-        ingress_target = self.home / "plugins" / INGRESS_ID
-        frontend_target = self.home / "plugins" / FRONTEND_ID
-        ctx = PluginContext(PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user"),
-                            PluginManager(scope_key=str(self.home)))
-        ingress = _load_package(ingress_target, "phase2_home_guard_fixture")
-
-        other = self.root / "other home"
-        other.mkdir()
-        with patch.dict(os.environ, {"HERMES_HOME": str(other)}):
+        foreign = self.root / "foreign home"
+        foreign.mkdir()
+        with patch.dict(os.environ, {"HERMES_HOME": str(foreign)}):
             with self.assertRaisesRegex(RuntimeError, "foreign_hermes_home_refused"):
-                ingress._validated_home(ctx)
+                runtime.resolve_package_home(target / "__init__.py")
 
-        named_home = self.root / "global home" / "profiles" / "claire"
-        named_package = named_home / "plugins" / INGRESS_ID
-        named_package.mkdir(parents=True)
-        shutil.copytree(ingress_target, named_package, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        named_ingress = _load_package(named_package, "phase2_named_home_guard_fixture")
-        named_ctx = PluginContext(PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user"),
-                                  PluginManager(scope_key=str(named_home)))
+        named_home = self.root / "global home" / "profiles" / "arbitrary-user"
+        named_package = named_home / "plugins" / FRONTEND_ID
+        named_package.parent.mkdir(parents=True)
+        shutil.copytree(target, named_package, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        _load_package(named_package, "primary_named_home_guard_fixture")
+        named_runtime = importlib.import_module("primary_named_home_guard_fixture.runtime")
         with patch.dict(os.environ, {"HERMES_HOME": str(named_home)}):
             with self.assertRaisesRegex(RuntimeError, "named_profile_home_refused"):
-                named_ingress._validated_home(named_ctx)
+                named_runtime.resolve_package_home(named_package / "__init__.py")
 
-        _load_package(frontend_target, "phase2_frontend_home_guard_fixture")
-        runtime = importlib.import_module("phase2_frontend_home_guard_fixture.runtime")
-        with patch.dict(os.environ, {"HERMES_HOME": str(other)}):
-            with self.assertRaisesRegex(RuntimeError, "foreign_hermes_home_refused"):
-                runtime.resolve_package_home(frontend_target / "__init__.py")
-
-        named_frontend = named_home / "plugins" / FRONTEND_ID
-        named_frontend.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(frontend_target, named_frontend, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        _load_package(named_frontend, "phase2_named_frontend_guard_fixture")
-        named_runtime = importlib.import_module("phase2_named_frontend_guard_fixture.runtime")
-        with patch.dict(os.environ, {"HERMES_HOME": str(named_home)}):
-            with self.assertRaisesRegex(RuntimeError, "named_profile_home_refused"):
-                named_runtime.resolve_package_home(named_frontend / "__init__.py")
-
-    def test_cached_v1_ingress_cannot_enable_approval_against_v2_frontend(self):
+        misplaced = self.root / "misplaced" / FRONTEND_ID
+        misplaced.parent.mkdir()
+        shutil.copytree(target, misplaced, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home)}):
+            with self.assertRaisesRegex(RuntimeError, "native_plugin_location_invalid"):
+                runtime.resolve_package_home(misplaced / "__init__.py")
+        self.assertFalse((foreign / "plugin-data").exists())
+        self.assertFalse((named_home / "plugin-data").exists())
+    def test_legacy_enabled_blocks_factory_and_all_helper_readiness(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
 
-        self._install_package("v1", "plugins/desktop-clarify-telegram", force=False)
-        self._install_package("v2", "desktop-plugins/session-complete-telegram", force=False)
+        self._install_package("v3", "desktop-plugins/session-complete-telegram", force=False)
+        self._install_package("old", "plugins/desktop-clarify-telegram", force=False)
+        self.config.write_text(
+            "plugins:\n  enabled: [session-complete-telegram, desktop-clarify-telegram]\n"
+            "  entries:\n    session-complete-telegram:\n      settings:\n"
+            "        replies_enabled: true\n        approvals_enabled: true\n",
+            encoding="utf-8")
+        self.expected_config_bytes = self.config.read_bytes()
+        target = self.home / "plugins" / FRONTEND_ID
         manager = PluginManager(scope_key=str(self.home))
-        ctx = PluginContext(PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user",
-                                           path=str(self.home / "plugins" / INGRESS_ID)), manager)
+        ctx = PluginContext(PluginManifest(name=FRONTEND_ID, key=FRONTEND_ID, source="user", path=str(target)), manager)
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
-            ingress = _load_package(self.home / "plugins" / INGRESS_ID, "phase2_cached_v1_ingress_fixture")
-            self.assertEqual(ingress.FRONTEND_VERSION, "1.6.0")
-            ingress.register(ctx)
-            factory, _owner = manager.get_platform_handler_factories("telegram")[0]
-            frontend = ingress._sibling_package(self.home.resolve())
-            notifier = importlib.import_module(f"{frontend.__package__}.notifier")
-            approval = importlib.import_module(f"{frontend.__package__}.approval_bridge")
-            self.assertEqual(notifier.VERSION, "1.6.1")
-            self.assertEqual(approval.CAPABILITY, "desktop-command-approval-v2")
-            reply_bridge = importlib.import_module(f"{frontend.__package__}.reply_bridge")
-            with patch.object(reply_bridge, "wire") as wire:
+            plugin = _load_package(target, "legacy_overlap_guard_fixture")
+            plugin.register(ctx)
+            factory, owner = manager.get_platform_handler_factories("telegram")[0]
+            self.assertEqual(owner, FRONTEND_ID)
+            gateway = importlib.import_module("legacy_overlap_guard_fixture.telegram_integration")
+            with self.assertLogs("hermes.plugin.session_complete_telegram", level="WARNING") as logs:
                 factory(object(), object())
-        self.assertEqual(wire.call_count, 1)
-        self.assertIsNone(wire.call_args.args[3], "cached 1.6.0 ingress must not grant v2 approval capability")
+            self.assertTrue(any("legacy_package_migration_required" in line for line in logs.output))
 
-    def test_ingress_factory_fails_closed_when_frontend_manifest_version_skews(self):
+            registration = manager._cli_commands[COMMAND_ID]
+            parser = argparse.ArgumentParser()
+            registration["setup_fn"](parser)
+            self.assertEqual(self._call_native(registration["handler_fn"], parser,
+                {"action": "reply_poll", "owner": "fixture", "observations": [], "unverified": []})[0],
+                {"ok": False, "feature_ready": False, "reason": "legacy_package_migration_required"})
+            self.assertEqual(self._call_native(registration["handler_fn"], parser,
+                {"action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v3",
+                 "owner": "fixture"})[0],
+                {"ok": False, "feature_ready": False, "reason": "legacy_package_migration_required"})
+        self.assertEqual(manager.get_platform_handler_factories("telegram"), [(factory, FRONTEND_ID)])
+        self._assert_preserved()
+
+    def test_mixed_v2_receiver_helper_and_renderer_contracts_are_denied(self):
+        plugin, handler, parser = self._native_frontend_handler("phase2_new_handshake_fixture", candidate="v3")
+        config = ("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n"
+                  "    session-complete-telegram:\n      settings:\n        approvals_enabled: true\n").encode()
+        self.config.write_bytes(config)
+        self.expected_config_bytes = config
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
+            notifier_module = importlib.import_module("phase2_new_handshake_fixture.notifier")
+            bridge = importlib.import_module("phase2_new_handshake_fixture.approval_bridge")
+            result, _ = self._call_native(handler, parser, {"action": "loaded", "version": "1.6.1", "profiles": []})
+            old_helper = notifier_module.dispatch_request({
+                "action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v2", "owner": "old-owner"
+            }, root=self.home, state=self.state, native=True)
+        self.assertEqual(result["version"], "1.7.0")
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v3"])
+        self.assertNotEqual(result["version"], "1.6.1")
+        self.assertEqual(old_helper, {"ok": False, "reason": "capability_mismatch"})
+        self.assertEqual(bridge.VERSION, "1.7.0")
+        self.assertEqual(bridge.CAPABILITY, "desktop-command-approval-v3")
+    def test_legacy_compatibility_package_is_deprecated_and_registers_no_factory(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
 
-        self._install_package("v1", "plugins/desktop-clarify-telegram", force=False)
-        self._install_package("v1", "desktop-plugins/session-complete-telegram", force=False)
-        frontend_manifest = self.home / "plugins" / FRONTEND_ID / "plugin.yaml"
-        frontend_manifest.write_text(frontend_manifest.read_text(encoding="utf-8").replace(
-            "version: '1.6.0'", "version: '1.5.0'"), encoding="utf-8")
         manager = PluginManager(scope_key=str(self.home))
-        ctx = PluginContext(PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user",
-                                           path=str(self.home / "plugins" / INGRESS_ID)), manager)
+        legacy_path = REPO / "plugins" / INGRESS_ID
+        manifest = PluginManifest(name=INGRESS_ID, key=INGRESS_ID, source="user", path=str(legacy_path))
+        ctx = PluginContext(manifest, manager)
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
-            ingress = _load_package(self.home / "plugins" / INGRESS_ID, "phase2_factory_skew_fixture")
-            ingress.register(ctx)
-            factory, _owner = manager.get_platform_handler_factories("telegram")[0]
-            frontend = ingress._sibling_package(self.home.resolve())
-            reply_bridge = importlib.import_module(f"{frontend.__package__}.reply_bridge")
-            with patch.object(reply_bridge, "wire") as wire:
-                factory(object(), object())
-        self.assertEqual(wire.call_count, 1)
-        self.assertEqual(len(wire.call_args.args), 4)
-        self.assertIsNone(wire.call_args.args[3], "version-skewed helper must not receive approval capability")
+            legacy = _load_package(legacy_path, "deprecated_legacy_stub_fixture")
+            legacy.register(ctx)
+        self.assertEqual(manager.get_platform_handler_factories("telegram"), [])
+        self.assertEqual(manager._cli_commands, {})
+        text = (legacy_path / "plugin.yaml").read_text(encoding="utf-8")
+        self.assertIn("Deprecated compatibility stub", text)
+        self._assert_preserved()
 
-    def test_sibling_loader_namespaces_same_machine_fake_homes(self):
-        ingress_source = REPO / "plugins" / INGRESS_ID
-        baseline_notifier = sys.modules.get("notifier")
-        loader = _load_package(ingress_source, "phase2_loader_test")
-        homes = [self.root / "alternate home one", self.root / "alternate home two"]
-        modules = []
-        for index, home in enumerate(homes):
+    def test_internal_modules_are_relative_and_do_not_publish_global_aliases(self):
+        baseline_modules = {name: sys.modules.get(name) for name in ("notifier", "reply_bridge", "followup_bridge",
+                                                                      "approval_bridge", "telegram_integration")}
+        baseline_path = list(sys.path)
+        package_modules = []
+        for index, label in enumerate(("internal-home-one", "internal-home-two")):
+            home = self.root / label
             package = home / "plugins" / FRONTEND_ID
             package.parent.mkdir(parents=True)
             shutil.copytree(REPO / "desktop-plugins" / FRONTEND_ID, package,
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
-                frontend = loader._sibling_package(home.resolve())
-                module = importlib.import_module(f"{frontend.__package__}.notifier")
-                approval = importlib.import_module(f"{frontend.__package__}.approval_bridge")
-            modules.append(module)
-            self.assertEqual(approval.CAPABILITY, "desktop-command-approval-v2")
-            self.assertEqual(approval.VERSION, module.VERSION)
-            self.assertIn("approval_bridge.py", loader._HELPER_FILES)
-            self.assertEqual(module.ROOT, home.resolve())
-            self.assertIn(f"_{'hermes_telegram_bridge_'}", module.__name__)
-            self.assertIs(sys.modules.get("notifier"), baseline_notifier)
-        self.assertIsNot(modules[0], modules[1])
-        self.assertNotEqual(modules[0].__name__, modules[1].__name__)
+            module_name = f"_relative_package_fixture_{index}"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home), "LOCALAPPDATA": str(self.local_app_data)}):
+                plugin = _load_package(package, module_name)
+                notifier_module = importlib.import_module(f"{module_name}.notifier")
+                reply_module = importlib.import_module(f"{module_name}.reply_bridge")
+                followup_module = importlib.import_module(f"{module_name}.followup_bridge")
+                approval_module = importlib.import_module(f"{module_name}.approval_bridge")
+                gateway_module = importlib.import_module(f"{module_name}.telegram_integration")
+            package_modules.append((notifier_module, reply_module, followup_module, approval_module, gateway_module))
+            self.assertEqual(notifier_module.VERSION, "1.7.0")
+            self.assertEqual(approval_module.CAPABILITY, "desktop-command-approval-v3")
+            self.assertEqual(approval_module.VERSION, notifier_module.VERSION)
+            self.assertEqual(notifier_module.ROOT, home.resolve())
+            self.assertTrue(all(module.__name__.startswith(module_name + ".") for module in package_modules[-1]))
+            self.assertFalse((home / "plugin-data").exists(), "declaration/import must not access bridge state")
+        self.assertNotEqual(package_modules[0][0].__name__, package_modules[1][0].__name__)
+        self.assertEqual(sys.path, baseline_path, "package imports must not widen global import paths")
+        self.assertTrue(all(sys.modules.get(name) is baseline for name, baseline in baseline_modules.items()))
 
 
 if __name__ == "__main__":

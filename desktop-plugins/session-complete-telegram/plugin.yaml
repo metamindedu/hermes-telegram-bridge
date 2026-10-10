@@ -1,7 +1,16 @@
 name: session-complete-telegram
-version: '1.6.1'
+version: '1.7.0'
 requires_hermes: '>=0.21.5'
-description: Registers the fixed default-home CLI command used by the Desktop completion notifier.
+description: Sends settled Desktop completion notices and optionally handles replies or one-time command approvals through your existing default-home Telegram setup.
+config_schema:
+  replies_enabled:
+    type: bool
+    default: false
+    description: Accept clarify answers and replies to completion cards from the configured private Telegram home.
+  approvals_enabled:
+    type: bool
+    default: false
+    description: Show Allow Once and Deny buttons for eligible local Desktop command approvals.
 python_dependencies:
   - markdown-it-py==4.2.0
   - PyYAML==6.0.3

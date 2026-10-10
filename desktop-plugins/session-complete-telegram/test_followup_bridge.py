@@ -129,8 +129,8 @@ class FollowupTests(unittest.TestCase):
     if len(ticks)>=12:app.running=False
     await real_sleep(0)
    before=set(asyncio.all_tasks())
-   with patch.object(rb,'_NOTIFIER',notifier),patch.object(rb,'enabled',return_value=True),patch.object(rb,'bind_receiver',side_effect=lambda *a:ticks.append(1)),patch.object(rb,'time',SimpleNamespace(monotonic=lambda:clock[0])),patch.object(rb.asyncio,'to_thread',thread),patch.object(rb.asyncio,'sleep',sleep):
-    rb.wire(app,None,follow)
+   with patch.object(rb,'_NOTIFIER',notifier),patch.object(rb,'bind_receiver',side_effect=lambda *a:ticks.append(1)),patch.object(rb,'time',SimpleNamespace(monotonic=lambda:clock[0])),patch.object(rb.asyncio,'to_thread',thread),patch.object(rb.asyncio,'sleep',sleep):
+    rb.wire(app,None,follow,replies_enabled=lambda:True)
     created=set(asyncio.all_tasks())-before
     await asyncio.gather(*created)
    self.assertEqual(len(ticks),12);self.assertEqual(len(probes),2);self.assertGreaterEqual(len(attempts),2);self.assertEqual(wired,[1])
@@ -160,13 +160,12 @@ class FollowupTests(unittest.TestCase):
    from types import SimpleNamespace
    context=ExitStack();self.addCleanup(context.close);clarify=[];before=set(asyncio.all_tasks())
    context.enter_context(patch.object(rb,'_NOTIFIER',Notifier))
-   context.enter_context(patch.object(rb,'enabled',return_value=True))
    context.enter_context(patch.object(rb.secrets,'token_hex',return_value='boot'))
    context.enter_context(patch.object(rb,'lookup_reply',side_effect=lambda bot,chat,mid:('form',0) if mid==50 else None))
    context.enter_context(patch.object(rb,'intake',side_effect=lambda *a:(clarify.append(a) or {'ok':True})))
    context.enter_context(patch.object(rb,'flush'))
    follow=SimpleNamespace(wire=lambda *a,**kw:b.wire(*a,state=self.state,**kw))
-   rb.wire(app,None,follow)
+   rb.wire(app,None,follow,replies_enabled=lambda:True)
    app.add_handler(MessageHandler(filters.ALL,ordinary),group=0);app.add_handler(MessageHandler(filters.ALL,ordinary),group=99);app.add_error_handler(error)
    base={'message_id':210,'date':1,'chat':{'id':99,'type':'private'},'from':{'id':99,'is_bot':False,'first_name':'owner'},'text':'followup','reply_to_message':{'message_id':100,'date':1,'chat':{'id':99,'type':'private'},'from':{'id':77,'is_bot':True,'first_name':'bot'}}}
    for i,kind in enumerate(['text','edited','media','command','unauth','legacy','outage','clarify_outage']):

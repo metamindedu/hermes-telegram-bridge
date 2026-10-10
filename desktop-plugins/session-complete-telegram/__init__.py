@@ -131,6 +131,11 @@ def register(ctx) -> None:
         handler_fn=run_bound,
         description="Fixed local bridge command used by the Session Completion → Telegram Desktop plugin.",
     )
+    # One native package owns both the fixed Desktop CLI and the existing
+    # Telegram Gateway factory. The declaration performs no home/config/state IO.
+    from .telegram_integration import register as register_gateway
+
+    register_gateway(ctx)
 
 
 __all__ = ["register"]

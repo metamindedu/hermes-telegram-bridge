@@ -11,7 +11,7 @@ class ApprovalBridgeTests(unittest.TestCase):
     def setUp(self):
         self.temp=test_support.temporary_directory(prefix='approval-bridge-');self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)/'home';self.root.mkdir()
-        (self.root/'config.yaml').write_text('plugins:\n  enabled:\n    - desktop-clarify-telegram\napprovals:\n  timeout: 300\n',encoding='utf-8')
+        (self.root/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals:\n  timeout: 300\n',encoding='utf-8')
         self.state=self.root/'plugin-data'/'session-complete-telegram';self.now=time.time();self.owner='desktop-owner-fixture'
         self.route={'mode':'local','connectionId':'local-connection','profile':'default','targetProfile':'default'}
         self.session={'id':'runtime-fixture','session_key':'durable-fixture','status':'waiting'}
@@ -190,14 +190,14 @@ class ApprovalBridgeTests(unittest.TestCase):
         for block in ('malformed', ['malformed'], False, 0, '', [], None):
             with self.subTest(block=block):
                 (self.root/'config.yaml').write_text(
-                    'plugins:\n  enabled: [desktop-clarify-telegram]\napprovals: '+json.dumps(block)+'\n',encoding='utf-8')
+                    'plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals: '+json.dumps(block)+'\n',encoding='utf-8')
                 result=notifier.dispatch_request(req,root=self.root,state=self.state,native=True,result_budget=24*1024)
                 self.assertEqual(result,{'ok':False,'reason':'timeout_unavailable'})
                 self.assertEqual(self.calls,[])
                 c=b.connect(self.state)
                 try:self.assertEqual(c.execute('SELECT count(*) FROM approvals').fetchone()[0],0)
                 finally:c.close()
-        (self.root/'config.yaml').write_text('plugins:\n  enabled: [desktop-clarify-telegram]\n',encoding='utf-8')
+        (self.root/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\n',encoding='utf-8')
         self.assertEqual(b._approval_timeout('default',notifier,self.root),300)
 
     def test_actual_timeout_is_used_without_clarify_ttl_floor(self):
@@ -350,7 +350,7 @@ class ApprovalBridgeTests(unittest.TestCase):
             app=Application.builder().token('77:synthetic-token').build()
             with patch.object(type(app.bot),'initialize',new=AsyncMock()), patch.object(type(app.bot),'shutdown',new=AsyncMock()):
                 await app.initialize()
-                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',enabled=lambda:True,state=self.state))
+                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',approvals_enabled=lambda:True,state=self.state))
                 later=[]
                 async def downstream(update,context):later.append(update)
                 app.add_handler(TypeHandler(Update,downstream),group=1)
@@ -393,7 +393,7 @@ class ApprovalBridgeTests(unittest.TestCase):
             app=Application.builder().token('77:synthetic-token').build()
             with patch.object(type(app.bot),'initialize',new=AsyncMock()), patch.object(type(app.bot),'shutdown',new=AsyncMock()):
                 await app.initialize()
-                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',enabled=lambda:True,state=self.state))
+                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',approvals_enabled=lambda:True,state=self.state))
                 later=[]
                 async def downstream(update,context):later.append(update)
                 app.add_handler(TypeHandler(Update,downstream),group=1)
@@ -484,9 +484,9 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.assertEqual(self.row(item['id'])['status'],'applying','read gate must neither retire nor renew')
         self.assertEqual(self.row(item['id']),{**before,'deadline':item['deadline'],'expires':self.row(item['id'])['expires']})
 
-    def test_claim_gate_barrier_rejects_real_sqlite_boot_change_and_ingress_disable_without_replay(self):
+    def test_claim_gate_barrier_rejects_boot_change_and_approval_revocation_without_replay(self):
         import threading
-        for index,cause in enumerate(('boot-change','ingress-disable')):
+        for index,cause in enumerate(('boot-change','approval-disable')):
             if index:
                 self.now=time.time()
                 self.assertTrue(b.bind_receiver(77,99,None,'boot-fixture',private_verified=True,
@@ -521,13 +521,13 @@ class ApprovalBridgeTests(unittest.TestCase):
                     state=self.state,now=time.time()))
                 self.assertEqual(self.row(item['id'])['status'],'unknown')
             else:
-                (self.root/'config.yaml').write_text('plugins:\n  enabled: []\napprovals:\n  timeout: 300\n',encoding='utf-8')
+                (self.root/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n        approvals_enabled: false\napprovals:\n  timeout: 300\n',encoding='utf-8')
                 self.assertEqual(self.row(item['id'])['status'],'applying')
             resume.set();thread.join(timeout=5);self.assertFalse(thread.is_alive())
             self.assertEqual(len(receipts),1,cause);self.assertIs(receipts[0].get('valid'),False,cause)
             self.assertEqual(respond,[],cause)
-            if cause=='ingress-disable':
-                (self.root/'config.yaml').write_text('plugins:\n  enabled:\n    - desktop-clarify-telegram\napprovals:\n  timeout: 300\n',encoding='utf-8')
+            if cause=='approval-disable':
+                (self.root/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals:\n  timeout: 300\n',encoding='utf-8')
             replay=notifier.dispatch_request({'action':'approval_poll','capability':b.CAPABILITY,'owner':self.owner,
                 'observations':[observation],'unverified':[],'absent':[]},root=self.root,state=self.state,
                 native=True,result_budget=24*1024)
@@ -656,7 +656,7 @@ class ApprovalBridgeTests(unittest.TestCase):
             app=Application.builder().token('77:synthetic-token').build()
             with patch.object(type(app.bot),'initialize',new=AsyncMock()),patch.object(type(app.bot),'shutdown',new=AsyncMock()):
                 await app.initialize()
-                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',enabled=lambda:True,state=self.state))
+                self.assertTrue(b.wire(app,notifier,77,99,None,'boot-fixture',approvals_enabled=lambda:True,state=self.state))
                 later=[]
                 async def downstream(update,context):later.append(update)
                 app.add_handler(TypeHandler(Update,downstream),group=1)

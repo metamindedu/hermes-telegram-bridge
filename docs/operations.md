@@ -1,22 +1,21 @@
-# Phase 2 source verification, native install, and activation boundary
+# Unified package candidate, native install, and activation boundary
 
 ## Ownership and current state
 
-The repository is the source of truth. The official native packages are the two existing directories installed from the same immutable Git commit:
+The repository is the source of truth. The unreleased v1.7.0 candidate has one installable package directory:
 
-- `metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram` → package/ID `session-complete-telegram`.
-- `metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram` → package/ID `desktop-clarify-telegram`.
+- `metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram` → stable package/ID `session-complete-telegram`.
 
-Hermes resolves `owner/repo/subdir` through its native installer. The first package includes both the Python CLI registration and `desktop/plugin.js`; the Desktop shell materializes that JS half by its existing package mechanism. The second package registers one factory on the existing Telegram `Application`. The Gateway remains the only Telegram update/polling owner.
+The package contains the fixed CLI, `desktop/plugin.js`, and one native Telegram handler factory registered through the public SDK. The factory wires only the existing configured Telegram `Application`; no second poller, core override, global alias, or broad `sys.path` change is introduced. `plugins/desktop-clarify-telegram/` stays in the repository only as a deprecated inert/no-factory compatibility stub, not as a second install requirement.
 
-Phase 2 authorizes source/tests/docs/CI, isolated fake-home installation checks and development-branch commit/push/PR delivery. It does not authorize production installation/config/credentials/data changes, Gateway/Desktop activation or live Telegram sends. Independent Heavy review, exact remote SHA, CI and actual private pinned install must be verified before completion; task-owned fixture writes are not production activation.
+This task authorizes candidate source/tests/docs/workflow edits and isolated fake-home verification only. It does not authorize production installation/config/credentials/data changes, Gateway/Desktop activation, commit/push, or live Telegram sends. Independent Heavy review and release approval remain required. v1.6.1 at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` is historical and used two packages; v1.7.0 is unreleased and has no asserted SHA, CI, catalog admission, or production activation.
 
 ## Required pre-install candidate checks (future separately authorized release)
 
-1. Pin both subdirectory installs to the same reviewed 40-character commit SHA. Verify the SHA exists on the intended repository/ref before invoking Hermes.
+Pin the single primary package subdirectory to one reviewed full SHA. Verify the SHA exists on the intended repository/ref before invoking Hermes.
 2. Preserve the exact package IDs and global state root `plugin-data/session-complete-telegram`. Do not copy or reset its SQLite files; there is no schema/data migration.
-3. Run the pinned-core CI commands and native Plugin Doctor on both package directories. Install/Doctor tests use isolated fake homes; their local Git transport mock is not evidence that the private remote install has run.
-4. Confirm install commands leave `plugins.enabled` unchanged. The frontend/CLI, ingress and Desktop renderer have independent enablement surfaces; do not infer one from another.
+3. Run pinned-core CI and native Plugin Doctor on the primary package. Install/Doctor tests use isolated fake homes; the local Git transport mock is not a private-remote installation.
+4. Confirm the install command leaves `plugins.enabled` and `plugins.entries.session-complete-telegram.settings` unchanged. The native package and Desktop renderer have independent enablement surfaces; `replies_enabled` and `approvals_enabled` are separate default-off switches.
 
 ## Native CLI transport limits
 
@@ -26,7 +25,7 @@ Phase 2 authorizes source/tests/docs/CI, isolated fake-home installation checks 
 - The Desktop assembles a bounded chunk count/byte total, verifies exact SHA-256 bytes and strict JSON shape, then repeats the existing live immutable identity/deadline checks before one `request.answer`. Missing, malformed, corrupt or expired fragment data settles the attempted claim as unknown/expired and is never replayed.
 - Native `approval_poll` measures the exact complete `{ok,items,terminal}` UTF-8 JSON projection before changing one queued row to `applying`. It observes all active rows first, returns at most one claim, and returns/defer terminal IDs without consuming a claim when the combined frame would overflow. Registration rejects a single non-fitting approval before sending buttons and routes it to command-free Desktop guidance.
 
-## Native command approval inbox (1.6.1)
+## Native command approval inbox (1.7.0 candidate; unreleased)
 
 The separate `approval-inbox/approvals.sqlite3` is not a schema extension to the clarify or followup stores. Its callback namespace is `hda:` with an opaque random token and a one-character `o` (once) / `d` (deny) action; command, session, queue IDs and credentials are never in callback data. Only the exact default bot, private-home owner, chat, topic, original bot-authored message ID and unchanged full card text are actionable. Inline/inaccessible/forwarded/edited/foreign/expired/duplicate taps are rejected without creating a receipt or changing approval state. Known/tombstoned approval-card text replies are consumed and never interpreted as approval or agent input.
 
@@ -34,7 +33,7 @@ The monitor requires a fresh local route, waiting runtime row, durable session i
 
 The native approval queue ID binds the core's first settlement; the current RPC contract exposes no server-side fingerprint CAS. After the post-claim snapshot, a read-only native `approval_claim_valid` action checks the exact owner/card ID/claim/frozen descriptor authority, applying row, live receiver boot/version/capability/destination, owner lease, claim deadline, absolute expiry, and current ingress enablement. The renderer validates its typed receipt and rechecks stop/deadline immediately before `approval.respond`. This is the last fresh local gate, not an atomic server-side fingerprint CAS or cross-service exactly-once guarantee. `approval.pending` does not expose the enqueue timestamp, so local card expiry is bounded by the configured profile `approvals.timeout` and a currently pending queue; the native queue remains the decision authority and rejects a late tap with `resolved:0`. The clarify one-hour minimum is not reused.
 
-The receiver capability is enabled only when the ingress/helper/renderer package version agrees and the existing private-chat receiver heartbeat is live. No new Telegram polling consumer is created: approval callbacks and the known-card text consumer are installed on the same PTB `Application` from `reply_bridge.wire`. A restart/owner/boot change retires prior authority. Lease loss rejects a queued choice and makes an applying claim unknown; it is never replayed after reconnection. Unsupported generic, execute_code, plugin-rule, sudo, secret/vault, or compute-host approvals lacking an authoritative in-process queue remain notification-only.
+The receiver capability is enabled only when the unified helper/renderer version agrees and the existing private-chat receiver heartbeat is live. The candidate advertises `desktop-command-approval-v3`; old v2 receivers/helpers/renderers do not grant capability. No new Telegram polling consumer is created: approval callbacks and known-card text consumers are installed on the same PTB `Application` by the primary package. A normal safe Gateway restart loads new handler code; source replacement or plugin rediscovery alone is not an activation guarantee.
 
 Review cards show the complete redacted literal command and description without Markdown stripping or truncation. Redaction omissions/collisions, non-NFC/unsafe controls, unavailable timeout, or a card above Telegram's single-message limit disable buttons; the fallback notification contains Desktop guidance, not a partial command presented as approval evidence. Sends use `protect_content:false`, a same-text edit with the keyboard retained, and no retry after an ambiguous send.
 
@@ -47,32 +46,32 @@ Fresh install into the default/global home without enabling either agent plugin:
 ```bash
 CANDIDATE_SHA=<verified-40-character-commit-sha>
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
-hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
+
 ```
 
-Update both existing package directories to one new candidate while preserving their enablement selection:
+Update the one primary package directory to a reviewed candidate while preserving config and state:
 
 ```bash
 NEW_SHA=<verified-new-40-character-commit-sha>
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$NEW_SHA" --force --no-enable --yes-deps
-hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$NEW_SHA" --force --no-enable --yes-deps
+
 ```
 
-Rollback both packages to the previously reviewed commit through the same native installer transaction:
+Rollback the primary package through the native installer to the previously reviewed immutable commit. A rollback to v1.6.1 restores the historical two-package runtime and uses that release’s separate legacy procedure:
 
 ```bash
 PREVIOUS_SHA=<verified-previous-40-character-commit-sha>
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$PREVIOUS_SHA" --force --no-enable --yes-deps
-hermes --profile default plugins install metamindedu/hermes-telegram-bridge/plugins/desktop-clarify-telegram --ref "$PREVIOUS_SHA" --force --no-enable --yes-deps
+
 ```
 
-Package-owned Python dependencies are declared explicitly in plugin.yaml (markdown-it-py, PyYAML and python-telegram-bot for the completion package; python-telegram-bot for ingress). Hermes PM owns installation and dependency consent; --yes-deps is explicit consent for the reviewed declarations, not permission for another candidate. --no-enable --yes-deps preserves selection instead of activating the packages. Do not use --no-deps or disabled dependency checks for an actual production rollout.
+The primary package keeps its exact declared Python dependency pins (markdown-it-py, PyYAML and python-telegram-bot). Hermes PM owns installation and dependency consent; --yes-deps is explicit consent for the reviewed declarations, not permission for another candidate. --no-enable --yes-deps preserves selection instead of activating the packages. Do not use --no-deps or disabled dependency checks for an actual production rollout.
 
-After a separately approved install, native verification uses the normal Doctor contract:
+After a separately approved candidate install, verify the primary package with the normal Doctor contract:
 
 ```bash
 hermes --profile default plugins doctor session-complete-telegram --ci
-hermes --profile default plugins doctor desktop-clarify-telegram --ci
+
 ```
 
 ## Separate activation gate (not performed)

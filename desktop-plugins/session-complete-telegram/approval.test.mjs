@@ -227,9 +227,9 @@ test('approval_claim_valid is explicitly dispatched but remains a read-only non-
   await assert.rejects(monitor.helper(request),error=>error?.ambiguousWrite===false)
 })
 
-test('new pre-dispatch authorization contract requires 1.6.1 approval-v2 handshake', () => {
-  assert.equal(VERSION,'1.6.1')
-  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v2')
+test('new pre-dispatch authorization contract requires 1.7.0 approval-v3 handshake', () => {
+  assert.equal(VERSION,'1.7.0')
+  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v3')
 })
 
 test('claim validity is the last fresh gate before approval.respond and accepts only an exact typed receipt', async () => {

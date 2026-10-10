@@ -535,8 +535,8 @@ class BridgeTests(unittest.TestCase):
             async def error(update,context):errors.append(type(context.error).__name__)
             app.add_error_handler(error)
             lookup=b.lookup_reply;take=b.intake
-            with patch.object(notifier,'credentials',return_value=('77:test',99,None)),patch.object(b.secrets,'token_hex',return_value='boot'),patch.object(b,'enabled',return_value=True),patch.object(b,'lookup_reply',side_effect=lambda bot,chat,mid:lookup(bot,chat,mid,self.state)),patch.object(b,'intake',side_effect=lambda *a:take(*a,state=self.state,now=self.now)),patch.object(b,'flush'):
-                b.wire(app,None);app.add_handler(MessageHandler(filters.ALL,ordinary),group=0)
+            with patch.object(notifier,'credentials',return_value=('77:test',99,None)),patch.object(b.secrets,'token_hex',return_value='boot'),patch.object(b,'lookup_reply',side_effect=lambda bot,chat,mid:lookup(bot,chat,mid,self.state)),patch.object(b,'intake',side_effect=lambda *a:take(*a,state=self.state,now=self.now)),patch.object(b,'flush'):
+                b.wire(app,None,replies_enabled=lambda:True);app.add_handler(MessageHandler(filters.ALL,ordinary),group=0)
                 base={'message_id':200,'date':1,'chat':{'id':99,'type':'private'},'from':{'id':99,'is_bot':False,'first_name':'owner'},'reply_to_message':{'message_id':100,'date':1,'chat':{'id':99,'type':'private'},'from':{'id':77,'is_bot':True,'first_name':'test'}}}
                 for i,kind in enumerate(('text','command','photo','edited')):
                     msg=copy.deepcopy(base)
@@ -561,8 +561,8 @@ class BridgeTests(unittest.TestCase):
             app=SimpleNamespace(bot=SimpleNamespace(token='77:test'),running=False,add_handler=lambda h,group:handlers.append(h))
             tasks=set(asyncio.all_tasks())
             lookup=b.lookup_reply;intake=b.intake
-            with patch.object(notifier,'credentials',return_value=('77:test',99,None)),patch.object(b.secrets,'token_hex',return_value='boot'),patch.object(b,'enabled',return_value=True),patch.object(b,'lookup_reply',side_effect=lambda bot,chat,mid:lookup(bot,chat,mid,self.state)),patch.object(b,'intake',side_effect=lambda *a:intake(*a,state=self.state,now=self.now)),patch.object(b,'flush'):
-                b.wire(app,None)
+            with patch.object(notifier,'credentials',return_value=('77:test',99,None)),patch.object(b.secrets,'token_hex',return_value='boot'),patch.object(b,'lookup_reply',side_effect=lambda bot,chat,mid:lookup(bot,chat,mid,self.state)),patch.object(b,'intake',side_effect=lambda *a:intake(*a,state=self.state,now=self.now)),patch.object(b,'flush'):
+                b.wire(app,None,replies_enabled=lambda:True)
                 self.assertEqual(len(handlers),2)
                 ordinary=SimpleNamespace(reply_to_message=None)
                 self.assertFalse(handlers[1].filters.filter(ordinary))

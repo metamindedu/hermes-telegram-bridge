@@ -80,14 +80,29 @@ class CatalogRegistrationTests(unittest.TestCase):
         return json.loads(base64.urlsafe_b64decode(lines[1] + '=' * (-len(lines[1]) % 4)))
 
     def test_uninstalled_recording_context_declares_both_without_home_or_state_access(self):
-        for package, parent in [(FRONTEND, 'desktop-plugins'), (INGRESS, 'plugins')]:
-            module = self.load(REPO / parent / package, package.replace('-', '_'))
-            ctx = RecordingContext()
-            with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
-                module.register(ctx)
-            self.assertEqual(len(ctx.commands), int(package == FRONTEND))
-            self.assertEqual(len(ctx.factories), int(package == INGRESS))
-            self.assertEqual(list(self.home.iterdir()), [])
+        module = self.load(REPO / 'desktop-plugins' / FRONTEND, 'single_primary')
+        ctx = RecordingContext(FRONTEND)
+        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+            module.register(ctx)
+        self.assertEqual([item['name'] for item in ctx.commands], ['desktop-telegram-bridge'])
+        self.assertEqual(len(ctx.factories), 1)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+        legacy = self.load(REPO / 'plugins' / INGRESS, 'deprecated_legacy')
+        old_ctx = RecordingContext(INGRESS)
+        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+            legacy.register(old_ctx)
+        self.assertEqual(old_ctx.commands, [])
+        self.assertEqual(old_ctx.factories, [])
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_primary_manifest_declares_default_off_independent_native_settings(self):
+        import yaml
+        manifest = yaml.safe_load((REPO / 'desktop-plugins' / FRONTEND / 'plugin.yaml').read_text(encoding='utf-8'))
+        self.assertEqual(manifest['config_schema']['replies_enabled']['type'], 'bool')
+        self.assertIs(manifest['config_schema']['replies_enabled']['default'], False)
+        self.assertEqual(manifest['config_schema']['approvals_enabled']['type'], 'bool')
+        self.assertIs(manifest['config_schema']['approvals_enabled']['default'], False)
 
     def test_recording_cli_owner_cannot_execute_even_at_valid_location(self):
         module = self.load(self.install(FRONTEND), 'frontend_recording')
@@ -110,35 +125,44 @@ class CatalogRegistrationTests(unittest.TestCase):
         self.assertFalse((self.home / 'plugin-data').exists())
         self.assertEqual(list(foreign.iterdir()), [])
 
-    def test_recording_and_foreign_ingress_factory_refuse_before_sibling_load(self):
-        module = self.load(self.install(INGRESS), 'ingress_foreign')
+    def test_primary_factory_refuses_unowned_and_foreign_contexts_before_imports(self):
+        target = self.install(FRONTEND)
+        module = self.load(target, 'unified_gateway_guard')
+        gateway = __import__(module.__name__ + '.telegram_integration', fromlist=['telegram_integration'])
         foreign = self.root / 'foreign home'
         foreign.mkdir()
-        for owner, active, reason in [('hermes_validate_probe_plugin', self.home, 'native_plugin_owner_mismatch'),
-                                      (INGRESS, foreign, 'foreign_hermes_home_refused')]:
-            with self.subTest(owner=owner), patch.dict(os.environ, {'HERMES_HOME': str(active)}):
-                ctx = RecordingContext(owner)
-                module.register(ctx)
-                with patch.object(module, '_sibling_package', side_effect=AssertionError('unauthorized sibling access')) as load:
-                    with self.assertRaisesRegex(RuntimeError, reason):
-                        ctx.factories[0](object(), object())
-                    load.assert_not_called()
+
+        wrong = RecordingContext('hermes_validate_probe_plugin')
+        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+            module.register(wrong)
+            with patch.object(gateway, 'resolve_package_home', side_effect=AssertionError('owner guard missed')) as resolve:
+                wrong.factories[0](object(), object())
+                resolve.assert_not_called()
+
+        ctx = RecordingContext(FRONTEND)
+        with patch.dict(os.environ, {'HERMES_HOME': str(foreign)}):
+            module.register(ctx)
+            with patch.object(gateway, 'resolve_package_home', wraps=gateway.resolve_package_home) as resolve:
+                ctx.factories[0](object(), object())
+                resolve.assert_called_once()
         self.assertFalse((self.home / 'plugin-data').exists())
+        self.assertFalse((foreign / 'plugin-data').exists())
         self.assertEqual(list(foreign.iterdir()), [])
 
     def test_named_profile_factory_and_cli_cannot_run_after_registration(self):
         named = self.home / 'profiles' / 'arbitrary-user'
         named.mkdir(parents=True)
         with patch.dict(os.environ, {'HERMES_HOME': str(named)}):
-            for package in [FRONTEND, INGRESS]:
-                module = self.load(self.install(package, named), 'named_' + package.replace('-', '_'))
-                ctx = RecordingContext(package)
-                module.register(ctx)
-                if package == FRONTEND:
-                    self.assertIs(self.invoke(ctx.commands[0])['ok'], False)
-                else:
-                    with self.assertRaisesRegex(RuntimeError, 'named_profile_home_refused'):
-                        ctx.factories[0](object(), object())
+            module = self.load(self.install(FRONTEND, named), 'named_primary')
+            ctx = RecordingContext(FRONTEND)
+            module.register(ctx)
+            self.assertIs(self.invoke(ctx.commands[0])['ok'], False)
+            ctx.factories[0](object(), object())
+
+            legacy = self.load(REPO / 'plugins' / INGRESS, 'named_legacy')
+            old_ctx = RecordingContext(INGRESS)
+            legacy.register(old_ctx)
+            self.assertEqual(old_ctx.factories, [])
         self.assertFalse((named / 'plugin-data').exists())
 
 

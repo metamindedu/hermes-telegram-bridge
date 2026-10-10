@@ -36,3 +36,10 @@
 
 - Recorded the durable distinction between immutable package/catalog source pins and later default-branch publication-status documentation.
 - Public MIT source and anonymous pinned installation were verified separately from upstream fork-workflow approval, maintainer admission, discoverability and production activation. See `../catalog-submission.md` for the actual submission record; this wiki is not runtime evidence.
+
+## 2026-10-10 update | Unified one-package candidate (unreleased)
+
+- The approved design keeps `session-complete-telegram` as the stable native/Desktop/CLI ID and moves Gateway factory wiring into its package; the legacy `desktop-clarify-telegram` source is inert and must be explicitly disabled before the new factory/helper readiness is allowed.
+- Native `replies_enabled` and `approvals_enabled` are independent default-off settings at the primary package's `plugins.entries` settings path. Strict raw config/type validation fails closed; outbound notifications remain independent. Stale/tombstoned card replies remain consumed on the existing PTB Application.
+- The 1.7.0 candidate uses approval-v3; old v2 cached receiver/helper/renderer combinations are denied. The historical public v1.6.1 pin remains unchanged. This source task did not publish a SHA, merge catalog work, or activate production.
+- Install/update/rollback preserve the stable ID and all user config, ledgers, SQLite state and tombstones; no schema migration or automatic legacy config edit is planned. See `../operations.md` and `../public-install.md` for the candidate boundary.

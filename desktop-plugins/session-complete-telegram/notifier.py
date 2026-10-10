@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 
 def _active_hermes_home():
@@ -554,18 +554,34 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
         elif action == "attention":
             result = deliver_attention(req, root=root, state=state)
         elif action in ("reply_register", "reply_poll", "reply_settle", "reply_fragment"):
+            gateway = _sibling_module("telegram_integration")
+            allowed, reason = gateway.feature_status("replies_enabled", root=root)
+            if not allowed:
+                return {"ok": False, "feature_ready": False, "reason": reason}
             reply_bridge = _sibling_module("reply_bridge")
             result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                          result_budget=result_budget if native else None)
         elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice", "approval_claim_valid"}:
+            if action != "approval_notice":
+                gateway = _sibling_module("telegram_integration")
+                allowed, reason = gateway.feature_status("approvals_enabled", root=root)
+                if not allowed:
+                    if action == "approval_poll":
+                        return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
+                    if action == "approval_claim_valid":
+                        return {"ok": True, "valid": False, "id": req.get("id"), "claim": req.get("claim"),
+                                "authority": req.get("authority"), "deadline": req.get("deadline"),
+                                "reason": reason}
+                    return {"ok": False, "feature_ready": False, "reason": reason}
             approval_bridge = _sibling_module("approval_bridge")
             result = approval_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                             result_budget=result_budget if native else None)
         elif isinstance(action, str) and action.startswith("followup_"):
+            gateway = _sibling_module("telegram_integration")
+            allowed, reason = gateway.feature_status("replies_enabled", root=root)
+            if not allowed:
+                return {"ok": False, "feature_ready": False, "reason": reason}
             followup_bridge = _sibling_module("followup_bridge")
-            reply_bridge = _sibling_module("reply_bridge")
-            if not reply_bridge.enabled(root=root):
-                return {"ok": False, "feature_ready": False, "reason": "disabled"}
             owner = req.get("owner")
             if action == "followup_owner_heartbeat":
                 result = followup_bridge.heartbeat_owner(owner, state=state)
@@ -599,13 +615,24 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             diagnostic("desktop_loaded", {"version": VERSION, "plugin_version": req.get("version"),
                 "profiles": req.get("profiles", []), "quiet_seconds": QUIET_SECONDS}, state=state)
             capabilities = []
+            approval_enabled = False
+            approval_reason = "approval_feature_unavailable"
             try:
+                gateway = _sibling_module("telegram_integration")
+                approval_enabled, approval_reason = gateway.feature_status("approvals_enabled", root=root)
                 approval_bridge = _sibling_module("approval_bridge")
-                if approval_bridge.VERSION == VERSION and approval_bridge.CAPABILITY == "desktop-command-approval-v2":
+                # Code/protocol support is stable across feature toggles. The
+                # renderer caches this handshake; action authority is checked
+                # afresh by owner heartbeat/register/poll/claim-validity gates.
+                if (approval_bridge.VERSION == VERSION and
+                        approval_bridge.CAPABILITY == "desktop-command-approval-v3"):
                     capabilities.append(approval_bridge.CAPABILITY)
             except Exception:
-                pass
-            result = {"ok": True, "version": VERSION, "capabilities": capabilities}
+                approval_enabled = False
+            result = {"ok": True, "version": VERSION, "capabilities": capabilities,
+                      "approval_feature_reason": approval_reason}
+            # A disabled feature/migration block is not a missing code protocol;
+            # it never authorizes intake or an approval decision.
         elif action == "diagnostic":
             data = {k: req[k] for k in ("profile", "session_key", "reason", "version") if k in req}
             diagnostic("last_check", data, state=state)
