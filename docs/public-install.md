@@ -41,6 +41,10 @@ Neither switch disables outbound completion/attention notifications, and neither
 
 The factory and handlers are loaded by the existing Telegram Gateway. If the native package is newly enabled or source was upgraded, use the Gateway's normal safe restart so it loads the registered factory; settings changes are checked live by existing handlers, but enabling a disabled package or replacing source is not a factory hot reload. No second poller is created.
 
+## When Gateway initialization fails
+
+If the receiver is unavailable or plugin handlers failed to load, do not reply to old cards: Hermes may process that text as ordinary Telegram chat. Bridge actions still require live authorization; the plugin does not stop the whole Gateway or guarantee general-input filtering when the host cannot install its guard. Use Desktop and recover the existing Gateway normally, then use a new verified card. This SDK boundary is disclosed in [SECURITY.md](../SECURITY.md#gateway-sdk-boundary); no core modification is required to install this package.
+
 ## Explicit migration from the old two-package release
 
 The repository retains `desktop-clarify-telegram` only as a deprecated inert compatibility stub. If that ID remains enabled, the unified factory and helper readiness fail closed with `legacy_package_migration_required` to prevent overlap with an installed or already-resident v1.6.1 factory.

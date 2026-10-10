@@ -24,4 +24,8 @@ Code rollback and state rollback remain different. The shared `plugin-data/sessi
 
 Catalog snapshot immutability and publication status must remain separate: keep both package entries pinned to the exact reviewed source, and publish later availability/PR-status documentation on the default branch without moving that package pin or its release tag. Public source and anonymous direct install do not imply human-maintainer catalog admission, search visibility or live Gateway activation. See [[../catalog-submission|catalog submissions]] and [[../public-install|public installation]].
 
+## SDK boundary accepted for the single-package release
+
+The user chose the existing public SDK without a new SDK/core development project. Successfully installed consumers reject recognized old-card replies; if the SDK cannot attach a guard, the bridge refuses readiness but cannot stop ordinary Gateway input. This limit must be prominent in install/security documentation, and a native dispatcher/PTB characterization test must verify both actual host fallthrough and denied bridge authority. It is not a sandbox or platform-wide fail-closed claim. Bridge ownership, consent, exact queue/request binding, one-shot claims, state preservation and no ambiguous replay remain required. See [[../operations|operations]] and [[../public-install|public installation]] for safe recovery guidance.
+
 Knowledge rules follow [[SCHEMA]], and navigation is maintained in [[index]].

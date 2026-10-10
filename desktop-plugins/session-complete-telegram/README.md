@@ -18,6 +18,10 @@ There is one installable package. Native settings `replies_enabled` and `approva
 
 The v1.7.0 candidate install, explicit legacy-ID migration, rollback and activation boundaries are in [`../../docs/operations.md`](../../docs/operations.md). Source edits and task-owned fake-home tests do not install, enable, configure, activate or restart a production home.
 
+## Gateway SDK limitation
+
+The bridge's live authorization checks remain mandatory, but it does not control all ordinary Telegram input. Known-card rejection requires its handlers to be successfully installed. If the host fails to attach even the reject-only guard, the bridge refuses interaction readiness; Hermes may still treat a plain-text old-card reply as ordinary chat. Do not reply to old cards during initialization/receiver failure: use Desktop and normally recover the existing Gateway before using new cards. No SDK/core patch, private handler-store override, second poller or forced Gateway stop is part of this package. This limit also applies while the plugin is disabled/uninstalled. The detailed security disclosure is in the repository's `SECURITY.md`, section **Gateway SDK boundary**.
+
 ## Behavior
 
 - Applies to every local profile surfaced by the Desktop connection registry,

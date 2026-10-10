@@ -126,7 +126,7 @@ class FinalBoundaryTests(LightCorrectionFixture):
                 await app.shutdown()
         asyncio.run(scenario())
 
-    def test_two_unattached_quarantine_failures_are_a_native_sdk_blocker(self):
+    def test_persistent_guard_attach_failure_refuses_bridge_but_host_ingress_is_out_of_scope(self):
         async def scenario():
             from gateway.platforms.base import BasePlatformAdapter
             from telegram.ext import MessageHandler,filters
@@ -146,7 +146,20 @@ class FinalBoundaryTests(LightCorrectionFixture):
                     app.add_handler(MessageHandler(filters.ALL,downstream),group=0)
                     await app.process_update(self.approval_text_update(Update,app,122,902))
                 self.assertEqual(len(attempts),2)
-                self.assertEqual(later,[], 'required consumption cannot be provided by current isolated factory SDK')
+                # User-approved SDK boundary: retain the demonstrated native
+                # fallthrough, not a skip/expectedFailure or a fabricated guard.
+                # The plugin does not own general platform admission. It MUST
+                # still refuse bridge readiness and grant no approval authority.
+                self.assertEqual(later,[122], 'native host continues ordinary ingress without an installed guard')
+                self.assertFalse(app.handlers.get(-10000))
+                self.assertIsNot(app.bot_data[self.reply._WIRING_STATE].get('ready'), True)
+                self.assertIsNone(self.approval.receiver_info(state=self.state))
+                denied = self.approval.owner_heartbeat('synthetic-desktop-owner', state=self.state)
+                self.assertIs(denied['feature_ready'], False)
+                self.assertEqual(denied['reason'], 'receiver_unavailable')
+                with self.approval.connect(self.state) as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM owners').fetchone()[0], 0)
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM approvals').fetchone()[0], 0)
             finally:
                 tasks=set(asyncio.all_tasks())-baseline
                 for t in tasks:t.cancel()

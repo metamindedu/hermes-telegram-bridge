@@ -43,3 +43,9 @@
 - Native `replies_enabled` and `approvals_enabled` are independent default-off settings at the primary package's `plugins.entries` settings path. Strict raw config/type validation fails closed; outbound notifications remain independent. Stale/tombstoned card replies remain consumed on the existing PTB Application.
 - The 1.7.0 candidate uses approval-v3; old v2 cached receiver/helper/renderer combinations are denied. The historical public v1.6.1 pin remains unchanged. This source task did not publish a SHA, merge catalog work, or activate production.
 - Install/update/rollback preserve the stable ID and all user config, ledgers, SQLite state and tombstones; no schema migration or automatic legacy config edit is planned. See `../operations.md` and `../public-install.md` for the candidate boundary.
+
+## 2026-10-10 update | Existing-SDK scope clarification
+
+- User chose one package with existing public APIs, without SDK development. Keep bridge authorization fail-closed, but do not promise to stop ordinary Telegram input when the host cannot install its guard.
+- Keep initialization-failure behavior as an executed native dispatcher/PTB characterization test that also verifies no bridge readiness or approval authority. Preserve earlier failed tests and candidate NO-GO results; the accepted scope changed, not historical evidence.
+- Document the limitation and Desktop/normal-Gateway recovery path in public setup/security guidance; retain owner/consent/queue/no-replay and user-state preservation requirements.

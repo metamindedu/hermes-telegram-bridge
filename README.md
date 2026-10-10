@@ -12,6 +12,10 @@ This is an independently authored NewMetaW project, not a fork of `telegram-noti
 
 **Optional command approvals:** `approvals_enabled` (default `false`) controls **Allow Once / Deny** buttons for eligible local Desktop command approvals. The 1.7.0 candidate requires the `desktop-command-approval-v3` versioned handshake; old cached v2 receivers/helpers/renderers do not match. A click remains bound to the exact owner/card/route/session/request/queue, grants no session/permanent permission, and never proves command completion.
 
+## Gateway failure boundary
+
+The plugin uses the existing Hermes SDK; it neither patches core nor adds a poller. Its own interactions require installed handlers, a fresh receiver and exact live authorization. Recognized old-card text is rejected **when those consumers are installed**. If the host cannot install even the reject-only handler, the bridge refuses readiness, but Hermes may still route a card reply as ordinary Telegram chat. The plugin does not stop or control the whole Gateway. Do not reply to old cards during a Gateway/plugin failure; use Desktop and restore the normal Gateway before retrying. See [the security boundary](SECURITY.md#gateway-sdk-boundary) for the precise limitation.
+
 ## Data and trust
 
 The Desktop component reads persisted session titles, final replies, and clarify requests from local profiles under the same default Hermes home. Completion previews are redacted and bounded, but redaction is not an absolute guarantee. Sending a card transmits its contents to Telegram at `api.telegram.org`. Cards are copyable and forwardable (`protect_content: false`). Local SQLite ledgers retain delivery/deduplication records and some message-ID tombstones; temporary clarify content expires and is purged after its retention window. The plugin uses the user's own existing default-home Telegram setup; it does not copy, write, or rotate the bot token. No telemetry is sent to NewMetaW. Read [SECURITY.md](SECURITY.md) before installing.

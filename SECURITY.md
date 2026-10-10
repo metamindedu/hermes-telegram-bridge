@@ -14,6 +14,14 @@ Local SQLite files below `plugin-data/session-complete-telegram/` hold delivery/
 
 The source sends no telemetry to NewMetaW. The only intended external service call in the sender is to the user's configured Telegram Bot API at `api.telegram.org`.
 
+## Gateway SDK boundary
+
+Bridge authorization and whole-platform input admission are different. The plugin retains exact owner/card/session/request/queue checks, independent default-off consent, live leases and last claim validity, one-shot decisions, `all:false`, and no ambiguous replay. Invalid/unreadable managed policy denies bridge actions; an enabled, correctly owned factory still attempts to install known-card consumers so a policy error does not itself remove that boundary.
+
+Known-card rejection requires those handlers to be installed on the existing Telegram application. After an initial installation exception, the plugin checks the exact public handler registration; it retains an attached guard, or attempts one bounded local pre-attachment retry. If neither attempt attaches the reject-only handler, the plugin logs failure and refuses interaction readiness. It does not grant approval authority or submit a bridge answer. The current Hermes host isolates factory failures and may continue **ordinary Telegram input**, including a plain-text reply to an old card. This is a documented SDK lifecycle limit, not a guarantee that the platform stopped, and ordinary input is not a plugin approval receipt. The general agent remains subject to its own normal authorization rules.
+
+The user-approved release scope excludes a core/SDK patch, a private handler-store override, a second poller, unbounded retries, or stopping the shared Gateway to turn this limit into a platform-wide guarantee. Do not answer old cards while the receiver is unavailable or Gateway/plugin initialization has failed. Use Desktop, inspect the initialization error, and perform a normal safe Gateway recovery before using new cards. Disabling/uninstalling the package likewise does not make the plugin an input firewall for the remaining Gateway.
+
 ## Reporting a vulnerability
 
 Please do not include bot tokens, `.env` or `config.yaml` contents, private session dumps, database files, or unredacted Telegram messages in a report.
