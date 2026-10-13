@@ -2,7 +2,7 @@
 
 ## Release status
 
-Public MIT **1.7.0** is one installable package pinned at `13c08c022965a589e87fe7198ab1a93201539d7e` ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.7.0)). Independent source review, Python182/Node127, exact Windows/Ubuntu CI and anonymous native one-package installation passed. Catalog PR #135956 awaits maintainer admission/merge; the obsolete companion PR #135957 is closed. Direct pinned installation is available before catalog search. Historical **1.6.1** remains at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` and used two packages. For the author default installation, package enablement, both opt-ins, Desktop loading, Gateway restart and one real test notification were separately verified while config/auth/DB records were preserved. The actual manual user reply and Allow Once/Deny click paths require the user to exercise their own live card; they are not inferred.
+Public MIT **1.8.0** is one installable package pinned at `4874276f519f68fdbacb9767f70c5ed760b5c6fb` ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.8.0)). Exact-source independent review, Python214/Node149, native React DOM6 and Windows/Ubuntu CI passed. Catalog PR #135956 tracks this pin but still requires maintainer admission/merge; obsolete companion #135957 is closed. Direct pinned installation is available before catalog search. Historical 1.7.0 remains at `13c08c022965a589e87fe7198ab1a93201539d7e`; its anonymous installation/test-send evidence is not a new 1.8.0 live roundtrip. The author 1.8.0 installation has separate package/Doctor/native CLI, settings, receiver-heartbeat and config/auth preservation checks. Actual installed GUI interaction and human reply/approval clicks remain unverified; heartbeat does not prove message delivery.
 
 The candidate keeps the stable native ID `session-complete-telegram`, Desktop ID, fixed CLI command `desktop-telegram-bridge`, and `plugin-data/session-complete-telegram` state root. Hermes compatibility remains declared as `>=0.21.5`; this floor does not guarantee compatibility with every newer core. The reproducible test contract is Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` with its locked environment.
 
@@ -18,7 +18,7 @@ The candidate keeps the stable native ID `session-complete-telegram`, Desktop ID
 There is **one** install command. Keep the full immutable release SHA:
 
 ```bash
-CANDIDATE_SHA=13c08c022965a589e87fe7198ab1a93201539d7e
+CANDIDATE_SHA=4874276f519f68fdbacb9767f70c5ed760b5c6fb
 hermes --profile default plugins install metamindedu/hermes-telegram-bridge/desktop-plugins/session-complete-telegram --ref "$CANDIDATE_SHA" --no-enable --yes-deps
 ```
 
@@ -32,12 +32,14 @@ The one native package registers the fixed CLI command and a Telegram handler fa
 hermes --profile default plugins enable session-complete-telegram
 ```
 
-In the package's native **Plugins settings** page, two independent switches are available and both default to **off**:
+The dedicated **Telegram Bridge** settings page exposes the common `service_enabled` switch and five effective modules: completion notifications, attention notifications, clarify replies, completion-card followups and command approvals. Seven native boolean settings back these controls; see [all defaults and parent gates](modular-settings.md#controls-and-preserved-defaults).
 
-- `replies_enabled`: clarify answers and ordinary completion-card followups.
-- `approvals_enabled`: eligible **Allow Once / Deny** command-approval buttons.
+The existing interaction consents remain independent and **off by default**:
 
-Neither switch disables outbound completion/attention notifications, and neither switch inherits consent from the old package ID. The existing configured private-home owner, exact card, live route/session/request/queue checks and no-replay protections remain required. Approval capability uses `desktop-command-approval-v3`; an old cached v2 receiver, helper, or renderer fails closed. Approval never grants session/permanent permission and a delivered decision does not prove command completion.
+- `replies_enabled`: required for clarify answers and ordinary completion-card followups.
+- `approvals_enabled`: required for eligible **Allow Once / Deny** command-approval buttons.
+
+The common service/native selection and relevant parent-notification switches must also be enabled. Installing code never grants these consents or inherits them from the old package ID. Turning a module off retires affected cards; turning it back on does not revive them or replay consumed input. The configured private-home owner, exact card/live route/session/request/queue checks and no-replay protections remain mandatory. Approval capability uses `desktop-command-approval-v4`; mixed older/newer action-handshake components fail closed. Approval never grants session/permanent permission, and delivery is not command completion.
 
 The factory and handlers are loaded by the existing Telegram Gateway. If the native package is newly enabled or source was upgraded, use the Gateway's normal safe restart so it loads the registered factory; settings changes are checked live by existing handlers, but enabling a disabled package or replacing source is not a factory hot reload. No second poller is created.
 

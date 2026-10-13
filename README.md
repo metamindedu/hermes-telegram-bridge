@@ -4,9 +4,9 @@ Community-authored plugins that connect Hermes Desktop notifications and selecte
 
 This is an independently authored NewMetaW project, not a fork of `telegram-notify`, not part of Hermes core, and not an official Nous Research product or endorsement. The unified candidate uses ONE installable package, `session-complete-telegram`, for the Desktop component, fixed native CLI command, and optional handlers on the existing Telegram Gateway application. It never starts another polling client. `desktop-clarify-telegram` remains only as a deprecated inert compatibility stub; it is not a required package.
 
-## Modular-settings development candidate
+## Modular settings — public v1.8.0
 
-The 1.8.0 working candidate adds a dedicated **Telegram Bridge** settings page, a common service switch and five separately selectable modules. It preserves the existing default-off replies/approvals consent and all local ownership/no-replay boundaries. See [modular settings and activation](docs/modular-settings.md). This section does not change the public 1.7.0 release pin below or claim the new candidate is already published or active.
+The public 1.8.0 release adds a dedicated **Telegram Bridge** settings page, a common service switch and five separately selectable modules. It preserves the existing default-off replies/approvals consent and all local ownership/no-replay boundaries. The exact release pin is `4874276f519f68fdbacb9767f70c5ed760b5c6fb`; see [modular settings and activation](docs/modular-settings.md). Publication, catalog admission, installation and live activation remain separate states.
 
 ## What it does
 
@@ -14,7 +14,7 @@ The 1.8.0 working candidate adds a dedicated **Telegram Bridge** settings page, 
 - Sends input-needed notices for supported pending requests. Optional clarify answers and completion-card followups are controlled by `replies_enabled` (default `false`). A reply is accepted only for the matching live request and configured private-home owner.
 - Uses local routes only. Remote/foreign homes, unrelated chats, and replies not attached to a verified card are outside the supported path.
 
-**Optional command approvals:** `approvals_enabled` (default `false`) controls **Allow Once / Deny** buttons for eligible local Desktop command approvals. The 1.7.0 candidate requires the `desktop-command-approval-v3` versioned handshake; old cached v2 receivers/helpers/renderers do not match. A click remains bound to the exact owner/card/route/session/request/queue, grants no session/permanent permission, and never proves command completion.
+**Optional command approvals:** `approvals_enabled` (default `false`) controls **Allow Once / Deny** buttons for eligible local Desktop command approvals. The 1.8.0 release requires the `desktop-command-approval-v4` versioned handshake; mixed older/newer receiver/helper/renderer components deny the versioned action handshake. A click remains bound to the exact owner/card/route/session/request/queue, grants no session/permanent permission, and never proves command completion.
 
 ## Gateway failure boundary
 
@@ -30,9 +30,9 @@ The current messages and question cards are primarily Korean; this release does 
 
 The minimum tested/declared Hermes compatibility floor is **0.21.5**. Reproducible CI uses the exact immutable Hermes core commit `74306c1d1b080837744faca3e371267dd09dda4b` and that checkout's `uv.lock`; a SemVer floor alone does not prove compatibility with every core generation. CI tests Windows and Ubuntu with Python 3.14 and Node 24. Physical macOS and a separate user's Hermes Desktop GUI have not been verified by those tests.
 
-Version **1.7.0** is the public MIT **one-package** release at **`13c08c022965a589e87fe7198ab1a93201539d7e`** ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.7.0)). Independent source review is GO C0/H0/M0/L0 under the documented SDK boundary; Python182/Node127, exact-SHA Windows/Ubuntu CI and anonymous one-package install/Doctor/native CLI passed. Historical **1.6.1** remains pinned at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` and used two packages. The author default installation was separately migrated to the exact 1.7.0 package on 2026-10-10: source, native runtime, both interactive opt-ins and a fresh Telegram test send were verified, and prior ledgers/config/credentials were preserved. A user reply/approval-click round trip remains a real user interaction, not inferred from installation. Documentation at the immutable package pin retains its pre-publication status; current availability is recorded here.
+Version **1.8.0** is the public MIT **one-package** release at **`4874276f519f68fdbacb9767f70c5ed760b5c6fb`** ([release](https://github.com/metamindedu/hermes-telegram-bridge/releases/tag/v1.8.0)). The exact package has independent source GO C0/H0/M0/L0, Python214/Node149, actual native React DOM6 and successful Windows/Ubuntu commit-bound CI. The author installation separately verified matching package bytes, Doctor/native CLI, all seven settings and five effective modules, receiver heartbeat and unchanged profile config/auth. Actual installed GUI interaction and a human Telegram reply/approval roundtrip remain unverified; heartbeat is not delivery proof. Historical public **1.7.0** stays at `13c08c022965a589e87fe7198ab1a93201539d7e`, and **1.6.1** at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` used two packages. The earlier anonymous 1.7.0 installation and real test notification remain historical evidence, not new 1.8.0 roundtrip evidence. Immutable package docs retain their preparation-time status; current availability is recorded here.
 
-The owner updated [catalog PR #135956](https://github.com/NousResearch/hermes-agent/pull/135956) to this single release pin and withdrew companion [#135957](https://github.com/NousResearch/hermes-agent/pull/135957). Maintainer approval/merge and official search visibility remain pending; direct installation is available now. Public release is not proof of production activation or a live Telegram round trip.
+The owner submission [catalog PR #135956](https://github.com/NousResearch/hermes-agent/pull/135956) tracks this single 1.8.0 release pin; the obsolete companion [#135957](https://github.com/NousResearch/hermes-agent/pull/135957) is withdrawn. Maintainer review/merge and official search visibility remain pending; direct installation is available now. A submitted update is not official catalog admission, and a public release is not proof of live Telegram interaction.
 
 ## Install
 

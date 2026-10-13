@@ -1,4 +1,6 @@
-# Modular settings (1.8.0 candidate)
+# Modular settings — public v1.8.0
+
+Public immutable package pin: `4874276f519f68fdbacb9767f70c5ed760b5c6fb`. This current default-branch guide records the published release; docs frozen inside that pin keep their original preparation-time language. Catalog submission, maintainer admission, installation and actual live interaction are separate gates.
 
 ## Scope
 

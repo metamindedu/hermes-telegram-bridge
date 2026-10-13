@@ -1,5 +1,7 @@
 # Unified package candidate, native install, and activation boundary
 
+> **Current release:** public v1.8.0 at `4874276f519f68fdbacb9767f70c5ed760b5c6fb`. Use [current public installation](public-install.md) and [modular settings](modular-settings.md) for current controls/v4 handshake. The phase-3 candidate descriptions below preserve historical 1.7.0 preparation and are not current publication status. This catalog/docs update does not install code, change user settings or restart a Gateway.
+
 ## Ownership and current state
 
 The repository is the source of truth. The unreleased v1.7.0 candidate has one installable package directory:

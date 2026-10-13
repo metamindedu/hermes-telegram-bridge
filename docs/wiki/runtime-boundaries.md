@@ -1,7 +1,7 @@
 ---
 title: Source and runtime boundaries
 created: 2026-10-10
-updated: 2026-10-10
+updated: 2026-10-13
 type: concept
 tags: [operations, ownership, deployment, privacy]
 ---
@@ -23,6 +23,10 @@ Version 1.7.0 is the one-package public release pinned at `13c08c022965a589e87fe
 Code rollback and state rollback remain different. The shared `plugin-data/session-complete-telegram` directory, notification ledger, reply inbox, followup inbox, tombstones and credentials are never copied/reset by native package install/update/rollback. No state schema change or migration is introduced.
 
 Catalog snapshot immutability and publication status must remain separate: keep both package entries pinned to the exact reviewed source, and publish later availability/PR-status documentation on the default branch without moving that package pin or its release tag. Public source and anonymous direct install do not imply human-maintainer catalog admission, search visibility or live Gateway activation. See [[../catalog-submission|catalog submissions]] and [[../public-install|public installation]].
+
+## Modular release and catalog update boundaries
+
+Public v1.8.0 uses `desktop-command-approval-v4` with the common service and parent-module gates while retaining default-off replies/approvals consent. Catalog SHA bumps require a fresh upstream review even when the owner has already published and installed the source. Update the existing unmerged single-package submission; never silently move historical release tags, change the fork main, or claim search admission from a successful branch push. Current pin/status belongs in [[../public-install|public installation]] and [[../catalog-submission|catalog submission]], not copied runtime observations.
 
 ## SDK boundary accepted for the single-package release
 

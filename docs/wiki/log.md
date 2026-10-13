@@ -56,3 +56,9 @@
 - Owner updated #135956 to the single1.7.0 entry and closed obsolete companion #135957 without merge. Upstream maintainer admission/search and production activation remain distinct pending gates; public release does not imply either.
 - Retain the documented SDK initialization limit and earlier failed-candidate evidence. No SDK development or automatic config/auth/DB migration is part of this release.
 - On 2026-10-10 the author default installation was separately migrated to 13c08c0: one source package plus Desktop entry, both opt-ins, preserved four docs/credentials/ledgers, shared-Gateway safe restart and a verified real Telegram test send. A manual reply and approval-click round trip remains user-dependent.
+
+## 2026-10-13 update | Modular release and catalog pin synchronization
+
+- Public v1.8.0 stays pinned to 4874276f519f68fdbacb9767f70c5ed760b5c6fb; later default-branch docs do not move that source/tag.
+- Synchronize the existing unmerged single-package catalog submission, all public install pins and five-module/default-off consent guidance. Upstream admission/search and live interaction remain separate gates.
+- Preserve historical 1.7.0 evidence and the SDK limitation; this publication metadata update does not modify package code, live settings, credentials, data or Gateway processes.
