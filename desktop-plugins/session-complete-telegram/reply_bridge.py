@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import importlib
 import json
 import logging
@@ -168,7 +169,7 @@ def _feature_status(root, ctx=None):
         gateway = importlib.import_module('.telegram_integration', __package__)
     else:
         gateway = importlib.import_module('telegram_integration')
-    return gateway.feature_status('replies_enabled', root=root, ctx=ctx)
+    return gateway.feature_status('clarify_replies_enabled', root=root, ctx=ctx)
 
 
 def replies_enabled(root=ROOT):
@@ -177,6 +178,29 @@ def replies_enabled(root=ROOT):
 
 def _retire(c, form_id, status):
     c.execute("UPDATE forms SET status=?,answer=NULL,answers='{}',selected='{}',claim=NULL,dirty=1 WHERE id=?", (status, form_id))
+
+
+def retire_unexecuted(*, state=STATE, now=None):
+    """Cancel pending forms; preserve tombstone/card lookup and never replay a claim."""
+    path = Path(state) / 'reply-inbox' / 'replies.sqlite3'
+    if not path.is_file():
+        return 0
+    now = time.time() if now is None else now
+    c = connect(state)
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        rows = c.execute("SELECT id,status FROM forms WHERE status IN ('posting','open','queued','applying')").fetchall()
+        for row in rows:
+            status = 'unknown' if row['status'] in ('posting','applying') else (
+                'rejected' if row['status'] == 'queued' else 'expired')
+            _retire(c, row['id'], status)
+        c.commit()
+        return len(rows)
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 def _prune(c, now):
@@ -538,6 +562,67 @@ def read_fragment(owner, fid, claim, digest, index, *, state=STATE, now=None):
         c.close()
 
 
+def claim_valid(owner, fid, claim, descriptor, authority, deadline, *, root=ROOT, state=STATE, now=None, ctx=None):
+    """Read-only last native gate for one exact clarify claim, descriptor and lease."""
+    now = time.time() if now is None else now
+    receipt = {"ok": True, "valid": False, "id": fid, "claim": claim,
+               "authority": authority, "deadline": deadline}
+    allowed, reason = _feature_status(root, ctx=ctx)
+    if not allowed:
+        return {**receipt, "reason": reason}
+    if (not isinstance(owner, str) or not owner or len(owner) > 100 or
+            not isinstance(fid, str) or not fid or len(fid) > 100 or
+            not isinstance(claim, str) or not claim or len(claim) > 100 or
+            not isinstance(descriptor, dict) or len(canonical(descriptor)) > 30_000 or
+            not isinstance(authority, str) or len(authority) != 64 or
+            any(ch not in "0123456789abcdef" for ch in authority) or
+            type(deadline) not in (int, float)):
+        return {**receipt, "reason": "invalid_claim"}
+    try:
+        digest = hashlib.sha256(canonical(descriptor).encode("utf-8", errors="strict")).hexdigest()
+        if not hmac.compare_digest(digest, authority):
+            return {**receipt, "reason": "invalid_claim"}
+    except (TypeError, ValueError, RecursionError, UnicodeError):
+        return {**receipt, "reason": "invalid_claim"}
+    path = Path(state) / "reply-inbox" / "replies.sqlite3"
+    if not path.is_file():
+        return {**receipt, "reason": "claim_unavailable"}
+    try:
+        c = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=3,
+                            isolation_level=None)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA query_only=ON")
+        row = c.execute("SELECT id,owner,descriptor,boot,status,claim,seen,expires FROM forms WHERE id=?",
+                        (fid,)).fetchone()
+        receiver_row = c.execute("SELECT value FROM receiver WHERE key='live'").fetchone()
+        if not row or not receiver_row:
+            return {**receipt, "reason": "claim_unavailable"}
+        try:
+            stored_descriptor = json.loads(row["descriptor"])
+            live = json.loads(receiver_row["value"])
+            age = now - float(live["at"])
+            expected_deadline = min(float(row["expires"]), float(row["seen"]) + LEASE)
+            requested_deadline = float(deadline)
+        except (TypeError, ValueError, KeyError, OverflowError, RecursionError):
+            return {**receipt, "reason": "claim_invalid"}
+        valid = (row["id"] == fid and row["owner"] == owner and
+                 stored_descriptor == descriptor and descriptor.get("owner") == owner and
+                 row["status"] == "applying" and row["claim"] == claim and
+                 isinstance(live, dict) and isinstance(live.get("boot"), str) and
+                 live.get("boot") == row["boot"] and 0 <= age <= LEASE and
+                 0 <= now - float(row["seen"]) <= LEASE and
+                 float(row["expires"]) > now and expected_deadline > now and
+                 requested_deadline == expected_deadline)
+        return {**receipt, "valid": bool(valid), "reason": "ready" if valid else "claim_invalid"}
+    except Exception:
+        return {**receipt, "reason": "claim_unavailable"}
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
 def settle(fid,claim,status,*,state=STATE):
     if status not in ('applied','expired','unknown','rejected'):raise ValueError('invalid_status')
     c=connect(state)
@@ -549,7 +634,10 @@ def settle(fid,claim,status,*,state=STATE):
     finally:c.close()
 
 
-def publish(fid,notifier,*,state=STATE):
+def publish(fid,notifier,*,state=STATE,root=None):
+    if not notifier.action_enabled('clarify_replies_enabled',root=root):
+        retire_unexecuted(state=state)
+        return {'ok':False,'feature_ready':False,'reason':'clarify_replies_disabled'}
     row=read_form(fid,state);token,chat,topic=notifier.credentials()
     if not row or row['status']!='posting':return
     if row['chat']!=chat or row['topic']!=topic:raise ValueError('destination_changed')
@@ -564,6 +652,9 @@ def publish(fid,notifier,*,state=STATE):
         row['status']='open';markup=keyboard(row,i)
         payload={'chat_id':chat,'text':text,'reply_markup':markup,'protect_content':False,'disable_notification':False,'link_preview_options':{'is_disabled':True}}
         if topic is not None:payload['message_thread_id']=topic
+        if not notifier.action_enabled('clarify_replies_enabled',root=root):
+            retire_unexecuted(state=state)
+            return {'ok':False,'feature_ready':False,'reason':'clarify_replies_disabled'}
         response=notifier.telegram(token,'sendMessage',payload)
         msg=response.get('result') or {}
         if not response.get('ok') or msg.get('chat',{}).get('id')!=chat or msg.get('text')!=text or not msg.get('message_id'):
@@ -579,9 +670,15 @@ def publish(fid,notifier,*,state=STATE):
             c.execute('INSERT OR IGNORE INTO tombstones VALUES(?,?,?,?,?)',(row['bot'],chat,msg['message_id'],fid,i))
             c.execute('UPDATE forms SET mids=?,texts=? WHERE id=?',(canonical(mids),canonical(texts),fid));c.commit()
         finally:c.close()
+        if not notifier.action_enabled('clarify_replies_enabled',root=root):
+            retire_unexecuted(state=state)
+            return {'ok':False,'feature_ready':False,'reason':'clarify_replies_disabled'}
         # Read-back exact message; keep the keyboard during verification.
         notifier.telegram(token,'editMessageText',{'chat_id':chat,'message_id':msg['message_id'],'text':text,'reply_markup':markup,'link_preview_options':{'is_disabled':True}})
         if i+1<len(qs):time.sleep(1.05)
+    if not notifier.action_enabled('clarify_replies_enabled',root=root):
+        retire_unexecuted(state=state)
+        return {'ok':False,'feature_ready':False,'reason':'clarify_replies_disabled'}
     c=connect(state)
     with c:c.execute("UPDATE forms SET status='open' WHERE id=? AND status='posting'",(fid,))
     c.close()
@@ -593,9 +690,12 @@ def flush(notifier,*,state=STATE):
         _prune(c,time.time())
         rows=[dict(r) for r in c.execute('SELECT * FROM forms WHERE dirty=1 LIMIT 20')]
     finally:c.close()
-    if not rows:return
+    if not rows or not notifier.action_enabled('clarify_replies_enabled'):
+        return
     token,chat,topic=notifier.credentials()
     for row in rows:
+        if not notifier.action_enabled('clarify_replies_enabled'):
+            break
         if (row['chat'],row['topic'])!=(chat,topic):continue
         done=True;answers=json.loads(row['answers']);qs=json.loads(row['questions'])
         for index,mid in json.loads(row['mids']).items():
@@ -607,6 +707,8 @@ def flush(notifier,*,state=STATE):
             elif status=='unknown':tail='\n\n⚠️ 반영 여부를 확인하지 못했습니다. Desktop에서 확인해 주세요.'
             elif status in ('expired','rejected'):tail='\n\n⌛ 종료되었거나 만료된 질문입니다. Desktop에서 확인해 주세요.'
             else:tail=''
+            if not notifier.action_enabled('clarify_replies_enabled'):
+                return
             response=notifier.telegram(token,'editMessageText',{'chat_id':chat,'message_id':mid,'text':text+tail,'reply_markup':keyboard(row,i),'link_preview_options':{'is_disabled':True}})
             done=done and (response.get('ok') is True or (response.get('error_code')==400 and 'not modified' in str(response.get('description',''))))
         if done:
@@ -618,15 +720,15 @@ def flush(notifier,*,state=STATE):
 def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     global _NOTIFIER
     _NOTIFIER = notifier
+    action=req.get('action') if isinstance(req,dict) else None
     allowed, reason = _feature_status(root)
-    if not allowed:
+    if not allowed and action != 'reply_settle':
         return {'ok': False, 'feature_ready': False, 'reason': reason}
-    action=req['action']
     if action=='reply_register':
         checked=notifier.inspect_ask({'ask_method':'clarify','ask_id':req.get('ask',{}).get('id'),'ask_params':req.get('ask',{}).get('params',{}),'profile':req.get('descriptor',{}).get('targetProfile'),'session_key':req.get('descriptor',{}).get('session_key'),'desktop_observed':True},root=root)
         if not checked.get('ok'):return checked
         result=register(req,state=state,root=root)
-        if result.get('new'):publish(result['id'],notifier,state=state)
+        if result.get('new'):publish(result['id'],notifier,state=state,root=root)
     elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'),state=state,result_budget=result_budget)
     elif action=='reply_fragment':
         return read_fragment(req.get('owner'),req.get('id'),req.get('claim'),req.get('sha256'),req.get('index'),state=state)
@@ -636,7 +738,7 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     return result
 
 
-def wire(application, adapter, followup=None, approval=None, *, replies_enabled=None, approvals_enabled=None):
+def wire(application, adapter, followup=None, approval=None, *, replies_enabled=None, followups_enabled=None, approvals_enabled=None):
     """Install scoped consumers transactionally on the existing PTB Application."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
     bot_data = getattr(application, "bot_data", None)
@@ -782,6 +884,16 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
             except Exception:return False
         return _feature_status(ROOT)[0]
 
+    def followup_gate():
+        if callable(followups_enabled):
+            try:return followups_enabled() is True
+            except Exception:return False
+        if __package__:
+            gateway = importlib.import_module(".telegram_integration", __package__)
+        else:
+            gateway = importlib.import_module("telegram_integration")
+        return gateway.feature_enabled("completion_followups_enabled", root=ROOT)
+
     def approval_gate():
         if callable(approvals_enabled):
             try:return approvals_enabled() is True
@@ -807,11 +919,12 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         try:
             while application.running:
                 replies_live=reply_gate()
+                followups_live=followup_gate()
                 approvals_live=approval_gate()
                 if replies_live:
                     try:await asyncio.to_thread(bind_receiver,bot,chat,topic,boot)
                     except Exception:pass
-                if (followup is not None and replies_live) or (approval is not None and approvals_live):
+                if (followup is not None and followups_live) or (approval is not None and approvals_live):
                     if verification is not None and verification.done():
                         try:private_verified=verification.result()
                         except Exception:private_verified=False
@@ -819,7 +932,7 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
                         retry_at=time.monotonic()+60
                     if not private_verified and verification is None and time.monotonic()>=retry_at:
                         verification=asyncio.create_task(asyncio.to_thread(verify_private_home))
-                if private_verified and followup is not None and replies_live:
+                if private_verified and followup is not None and followups_live:
                     try:await asyncio.to_thread(followup.bind_receiver,bot,chat,topic,boot,private_verified=True)
                     except Exception:pass
                 if private_verified and approval is not None and approvals_live:
@@ -876,11 +989,11 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
             ident['event']=f'text:{msg.chat.id}:{msg.message_id}'
             ident['forwarded']=ident['forwarded'] or bool(getattr(reply,'forward_origin',None))
             result=await asyncio.to_thread(intake,found[0],found[1],'text',msg.text,ident)
-            if not result.get('ok'):
+            if not result.get('ok') and reply_gate():
                 await msg.reply_text('Desktop 연결을 확인한 뒤 다시 답장해 주세요.' if result.get('reason')=='lease_stale' else '이미 답했거나 만료된 질문입니다. Desktop에서 확인해 주세요.')
             await asyncio.to_thread(flush,notifier)
         except Exception:
-            if msg is not None:
+            if msg is not None and reply_gate():
                 try:
                     await msg.reply_text('답변을 반영하지 못했습니다. Desktop에서 확인해 주세요.')
                 except Exception:
@@ -899,7 +1012,7 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         _add_owned_handler(application,MessageHandler(ExactReply(),text_reply),0,owned_handlers)
         if followup is not None:
             result=followup.wire(application,notifier,bot,chat,topic,boot,
-                enabled=reply_gate,_owned_handlers=owned_handlers)
+                enabled=followup_gate,_owned_handlers=owned_handlers)
             if result is not True:raise RuntimeError("followup_consumer_install_incomplete")
         ready_coro=ready()
         try:task=asyncio.get_running_loop().create_task(ready_coro)

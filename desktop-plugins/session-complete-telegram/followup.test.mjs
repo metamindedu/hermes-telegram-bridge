@@ -1,7 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {registerHooks} from 'node:module'
-registerHooks({resolve(s,c,n){return s==='@hermes/plugin-sdk'?{url:'data:text/javascript,export const host={}',shortCircuit:true}:n(s,c)}})
+registerHooks({resolve(s,c,n){
+  if(s==='@hermes/plugin-sdk')return{url:'data:text/javascript,export const host={}',shortCircuit:true}
+  if(s==='react/jsx-runtime')return{url:'data:text/javascript,export const jsx=(type,props,key)=>({type,props,key})',shortCircuit:true}
+  return n(s,c)
+}})
 const {CompletionMonitor}=await import('./desktop/plugin.js')
 function fixture(){
  const route={mode:'local',connectionId:'local',profile:'default',targetProfile:'default'}

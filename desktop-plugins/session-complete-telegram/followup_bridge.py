@@ -5,6 +5,7 @@ No Telegram polling, second Application, or message send lives in this module.
 """
 from __future__ import annotations
 import json
+import math
 import secrets
 import sqlite3
 import time
@@ -26,6 +27,8 @@ VERSION = 1
 BINDING_TTL = 24 * 60 * 60
 LEASE = 45
 MAX_TEXT = 2000
+_INITIAL_REGISTRATION_EPOCH = "initial"
+_EXPECTED_EPOCH_UNSET = object()
 
 
 def canonical(value):
@@ -74,13 +77,85 @@ def connect(state=STATE):
     return c
 
 
+def _valid_registration_epoch(value):
+    return type(value) is str and len(value) == 32 and all(char in "0123456789abcdef" for char in value)
+
+
+def _registration_epoch(c):
+    """Read the reserved revocation marker; malformed metadata is never authority."""
+    rows = c.execute("""SELECT bot,chat,mid,binding_id,kind,created FROM outbound
+      WHERE bot<=0 OR chat<=0 OR mid<=0 OR kind='revocation'
+         OR typeof(bot)!='integer' OR typeof(chat)!='integer' OR typeof(mid)!='integer'""").fetchall()
+    if not rows:
+        return _INITIAL_REGISTRATION_EPOCH
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    created = row["created"]
+    if (type(row["bot"]) is not int or row["bot"] != 0 or
+            type(row["chat"]) is not int or row["chat"] != 0 or
+            type(row["mid"]) is not int or row["mid"] != 0 or
+            not _valid_registration_epoch(row["binding_id"]) or row["kind"] != "revocation" or
+            type(created) not in (int, float) or not math.isfinite(created)):
+        return None
+    return row["binding_id"]
+
+
+def capture_registration_epoch(*, state):
+    """Read the current registration generation without creating inbox state.
+
+    ``initial`` is the stable legacy generation when no revocation marker exists.
+    ``None`` means an existing store or marker was malformed/unreadable and must
+    be treated as fail-closed by ``register_completion``.
+    """
+    path = Path(state) / "followup-inbox" / "followups.sqlite3"
+    if not path.is_file():
+        return _INITIAL_REGISTRATION_EPOCH
+    try:
+        c = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                            timeout=2, isolation_level=None)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA query_only=ON")
+        try:
+            return _registration_epoch(c)
+        finally:
+            c.close()
+    except Exception:
+        return None
+
+
 def _expire(c, now):
     c.execute("UPDATE receipts SET status='unknown',text=NULL,claim=NULL,updated=? WHERE status IN ('applying','submitting') AND updated<?", (now, now-LEASE))
     c.execute("""UPDATE receipts SET status='expired',text=NULL,updated=? WHERE status='pending' AND binding_id IN
       (SELECT id FROM bindings WHERE status!='active' OR expires<=? OR owner_seen<?)""", (now, now, now-LEASE))
-    # A transport lease gates this delivery attempt, not the card's lifetime.
     # The original owner may renew before TTL; never revive terminal bindings.
     c.execute("UPDATE bindings SET status='expired' WHERE status='active' AND expires<=?", (now,))
+
+
+def retire_unexecuted(*, state=STATE, now=None):
+    """Expire bindings, reject queued text, and preserve attempted claims as unknown."""
+    path = Path(state) / 'followup-inbox' / 'followups.sqlite3'
+    if not path.is_file():
+        return 0
+    now = time.time() if now is None else now
+    c = connect(state)
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        bindings = c.execute("UPDATE bindings SET status='expired' WHERE status='active'").rowcount
+        rejected = c.execute("UPDATE receipts SET status='rejected',text=NULL,claim=NULL,updated=? WHERE status='pending'", (now,)).rowcount
+        c.execute("UPDATE receipts SET status='unknown',text=NULL,claim=NULL,updated=? WHERE status IN ('applying','submitting')", (now,))
+        # Reserved metadata uses impossible Telegram coordinates (0,0,0). It
+        # shares the existing outbound primary key and never creates a binding.
+        epoch = secrets.token_hex(16)
+        c.execute("INSERT OR REPLACE INTO outbound VALUES(0,0,0,?,'revocation',?)", (epoch, now))
+        c.commit()
+        return max(0, bindings) + max(0, rejected)
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
 
 
 def bind_receiver(bot, chat, topic, boot, *, private_verified=False, state=STATE, now=None):
@@ -133,8 +208,33 @@ def heartbeat_owner(owner, *, state=STATE, now=None):
         c.close()
 
 
-def register_completion(descriptor, *, bot, chat, topic, message_id, state=STATE, now=None):
-    """Create an actionable capability only after a verified send, with live feature handshake."""
+def _receiver_mapping_matches(live, bot, chat, topic):
+    return bool(
+        live and type(live["bot"]) is int and live["bot"] > 0 and
+        type(live["chat"]) is int and live["chat"] > 0 and
+        type(live["owner_user"]) is int and live["owner_user"] > 0 and
+        live["bot"] == bot and live["chat"] == chat and live["owner_user"] == chat and
+        live["topic"] == topic and live["private_verified"] == 1 and live["feature"] == VERSION
+    )
+
+
+def _receiver_is_live(live, now):
+    return bool(live and 0 <= now-live["seen"] <= LEASE)
+
+
+def _record_reject_only(c, bot, chat, message_id, now):
+    c.execute("INSERT INTO outbound VALUES(?,?,?,NULL,'legacy',?)", (bot, chat, message_id, now))
+
+
+def register_completion(descriptor, *, bot, chat, topic, message_id, state=STATE, now=None,
+                        expected_epoch=_EXPECTED_EPOCH_UNSET, policy=None):
+    """Bind a sent card only within the captured revocation generation and live policy.
+
+    The optional keyword arguments preserve pre-revocation unit callers. Omitting
+    ``expected_epoch`` means the legacy ``initial`` generation only; after any
+    retirement the sent card is mapped reject-only instead of gaining authority.
+    Runtime producers must supply a captured epoch and current policy callback.
+    """
     now = time.time() if now is None else now
     required = ("owner", "connectionId", "profile", "targetProfile", "sid", "session_key", "epoch", "started_at", "final_row_id")
     if not isinstance(descriptor, dict) or any(k not in descriptor for k in required):
@@ -143,19 +243,58 @@ def register_completion(descriptor, *, bot, chat, topic, message_id, state=STATE
         return {"ok": False, "reason": "invalid_descriptor"}
     if type(descriptor["final_row_id"]) is not int or not descriptor["owner"] or descriptor["targetProfile"] != descriptor["profile"]:
         return {"ok": False, "reason": "identity_mismatch"}
-    if type(bot) is not int or type(chat) is not int or type(message_id) is not int or message_id <= 0:
+    if (type(bot) is not int or bot <= 0 or type(chat) is not int or chat <= 0 or
+            type(message_id) is not int or message_id <= 0):
         return {"ok": False, "reason": "invalid_send_mapping"}
     c = connect(state)
     try:
         c.execute("BEGIN IMMEDIATE")
         live = c.execute("SELECT * FROM receiver WHERE singleton=1").fetchone()
-        if not live or not live["private_verified"] or live["feature"] != VERSION or live["bot"] != bot or live["chat"] != chat or live["topic"] != topic or not (0 <= now-live["seen"] <= LEASE):
+        # Only a positively validated receiver mapping may retain a sent card.
+        # Freshness/policy failures below keep it reject-only, never actionable.
+        if not _receiver_mapping_matches(live, bot, chat, topic):
             c.rollback()
             return {"ok": False, "reason": "feature_unavailable"}
-        owner = c.execute("SELECT seen FROM owners WHERE owner=?", (descriptor["owner"],)).fetchone()
-        if not owner or now-owner["seen"] < 0 or now-owner["seen"] > LEASE:
-            c.rollback()
-            return {"ok": False, "reason": "owner_unavailable"}
+
+        policy_ok = True
+        if policy is not None:
+            try:
+                policy_ok = callable(policy) and policy() is True
+            except Exception:
+                policy_ok = False
+        try:
+            current_epoch = _registration_epoch(c)
+        except Exception:
+            current_epoch = None
+        expected = _INITIAL_REGISTRATION_EPOCH if expected_epoch is _EXPECTED_EPOCH_UNSET else expected_epoch
+        expected_valid = (type(expected) is str and
+                          (expected == _INITIAL_REGISTRATION_EPOCH or _valid_registration_epoch(expected)))
+        if current_epoch is None:
+            denied_reason = "revocation_state_invalid"
+        elif not expected_valid:
+            denied_reason = "invalid_expected_epoch"
+        elif current_epoch != expected:
+            denied_reason = "registration_revoked"
+        elif not policy_ok:
+            denied_reason = "feature_disabled"
+        elif not _receiver_is_live(live, now):
+            denied_reason = "feature_unavailable"
+        else:
+            owner = c.execute("SELECT seen FROM owners WHERE owner=?", (descriptor["owner"],)).fetchone()
+            if not owner or now-owner["seen"] < 0 or now-owner["seen"] > LEASE:
+                denied_reason = "owner_unavailable"
+            else:
+                denied_reason = None
+
+        if denied_reason is not None:
+            try:
+                _record_reject_only(c, bot, chat, message_id, now)
+            except sqlite3.IntegrityError:
+                c.rollback()
+                return {"ok": False, "reason": "duplicate_outbound"}
+            c.commit()
+            return {"ok": False, "reason": denied_reason}
+
         binding_id = secrets.token_hex(16)
         bound_descriptor = {**descriptor, "receiver_boot": live["boot"], "bot": bot,
                             "owner_user": live["owner_user"], "chat": chat, "topic": topic,
@@ -178,6 +317,12 @@ def lookup_outbound(bot, chat, mid, *, state=STATE):
     try:
         r = c.execute("SELECT * FROM outbound WHERE bot=? AND chat=? AND mid=?", (bot, chat, mid)).fetchone()
         if not r:
+            return None
+        # The reserved (0,0,0) epoch marker and every malformed/non-positive
+        # destination are metadata or invalid rows, never Telegram cards.
+        if (r["kind"] == "revocation" or type(r["bot"]) is not int or r["bot"] <= 0 or
+                type(r["chat"]) is not int or r["chat"] <= 0 or
+                type(r["mid"]) is not int or r["mid"] <= 0):
             return None
         binding = c.execute("SELECT * FROM bindings WHERE id=?", (r["binding_id"],)).fetchone() if r["binding_id"] else None
         return {"kind": r["kind"], "binding": dict(binding) if binding else None}
@@ -309,9 +454,17 @@ def claim(owner, bot, chat, inbound_id, binding_id, expected_descriptor, *, stat
         c.close()
 
 
-def begin_submit(owner, bot, chat, inbound_id, claim_id, *, state=STATE, now=None):
+def begin_submit(owner, bot, chat, inbound_id, claim_id, *, state=STATE, now=None, policy=None):
     """Durably record unknown-before-write; crashes can never return this text to pending."""
     now = time.time() if now is None else now
+    def policy_live():
+        if policy is None:
+            return True
+        try:
+            return policy() is True
+        except Exception:
+            return False
+    policy_ok = policy_live()
     c = connect(state)
     try:
         c.execute("BEGIN IMMEDIATE")
@@ -325,6 +478,11 @@ def begin_submit(owner, bot, chat, inbound_id, claim_id, *, state=STATE, now=Non
             live['boot'] != json.loads(row['descriptor'])['receiver_boot']):
             c.commit()
             return {"ok": False, "reason": "claim_lost"}
+        if not policy_ok or not policy_live():
+            c.execute("UPDATE receipts SET status='unknown',text=NULL,claim=NULL,updated=? WHERE bot=? AND chat=? AND message_id=? AND claim=? AND status='applying'",
+                      (now, bot, chat, inbound_id, claim_id))
+            c.commit()
+            return {"ok": False, "reason": "feature_disabled"}
         c.execute("UPDATE receipts SET status='submitting',updated=? WHERE bot=? AND chat=? AND message_id=? AND claim=?",
                   (now, bot, chat, inbound_id, claim_id))
         c.commit()
@@ -385,8 +543,9 @@ def consume_known(bot, chat, inbound_id, *, state=STATE, now=None):
         c.close()
 
 
-def notify_receipt(owner,bot,chat,mid,notifier,*,state=STATE):
+def notify_receipt(owner,bot,chat,mid,notifier,*,state=STATE,root=None):
     """One attempt at generic owner feedback; never echo the prompt or secrets."""
+    if not notifier.action_enabled('completion_followups_enabled',root=root):return
     token,target,topic=notifier.credentials()
     if target != chat or int(token.split(':',1)[0]) != bot:return
     words={'accepted_streaming':'✅ 원래 Desktop 세션에 후속 메시지를 입력했습니다.',
@@ -402,6 +561,7 @@ def notify_receipt(owner,bot,chat,mid,notifier,*,state=STATE):
         c.commit()
     payload={'chat_id':chat,'text':words[row['status']],'reply_parameters':{'message_id':mid,'allow_sending_without_reply':False}}
     if topic is not None:payload['message_thread_id']=topic
+    if not notifier.action_enabled('completion_followups_enabled',root=root):return
     notifier.telegram(token,'sendMessage',payload)
 
 
@@ -479,7 +639,7 @@ def wire(application, notifier, bot, chat, topic, boot, *, state=STATE, enabled=
                         if getattr(user, "is_bot", True):
                             identity["user_id"] = None
                         result=ingest(bot, chat_id, reply.message_id, getattr(update, "update_id", None), found["binding"]["id"], identity, state=state)
-                        if user and user.id == chat == chat_id and not result.get('duplicate'):
+                        if user and user.id == chat == chat_id and not result.get('duplicate') and enabled() is True:
                             try:
                                 await msg.reply_text('후속 메시지를 받았습니다. Desktop 연결을 확인 중입니다.' if result.get('ok') else '이 완료 알림으로 후속 입력을 할 수 없습니다. Desktop에서 확인해 주세요.')
                             except Exception:pass
@@ -492,4 +652,4 @@ def wire(application, notifier, bot, chat, topic, boot, *, state=STATE, enabled=
     return True
 
 
-__all__ = ["BINDING_TTL", "LEASE", "MAX_TEXT", "STATE", "bind_receiver", "canonical", "claim", "connect", "consume_known", "consume_legacy", "heartbeat_owner", "ingest", "lookup_outbound", "ready", "receiver_info", "register_completion", "settle", "notify_receipt", "wire"]
+__all__ = ["BINDING_TTL", "LEASE", "MAX_TEXT", "STATE", "bind_receiver", "canonical", "capture_registration_epoch", "claim", "connect", "consume_known", "consume_legacy", "heartbeat_owner", "ingest", "lookup_outbound", "ready", "receiver_info", "register_completion", "settle", "notify_receipt", "wire"]

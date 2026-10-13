@@ -1,8 +1,10 @@
 import { host } from '@hermes/plugin-sdk'
+import * as UI from '@hermes/plugin-sdk'
+import { jsx } from 'react/jsx-runtime'
 
-// App-level disk plugin: no profile configuration, agent prompt or core changes.
-export const VERSION = '1.7.0'
-export const APPROVAL_CAPABILITY = 'desktop-command-approval-v3'
+// App-level disk plugin: explicit settings writes use the fixed native helper.
+export const VERSION = '1.8.0'
+export const APPROVAL_CAPABILITY = 'desktop-command-approval-v4'
 export const APPROVAL_LEASE_MS = 45_000
 
 export function stableJSON(value) {
@@ -218,7 +220,7 @@ const HELPER_WRITE_ACTIONS = new Set([
   'send', 'attention', 'reply_register', 'reply_poll', 'reply_settle', 'reply_fragment',
   'approval_owner_heartbeat', 'approval_register', 'approval_poll', 'approval_settle', 'approval_notice',
   'followup_claim', 'followup_begin_submit', 'followup_reject', 'followup_settle',
-  'loaded', 'diagnostic'
+  'loaded', 'diagnostic', 'settings_set'
 ])
 
 export class NativeHelperError extends Error {
@@ -1090,6 +1092,13 @@ export class CompletionMonitor {
           const identityMatches = isFragment || stableJSON(item.descriptor) === stableJSON(bridge.descriptor)
           if (identityMatches && await this.replySnapshot(bridge)) {
             if (validReplyResult(bridge, result) && Number.isFinite(item.deadline) && Date.now() < item.deadline * 1000) {
+              const authority = await approvalFingerprint(bridge.descriptor)
+              const gate = await this.helper({action:'reply_claim_valid', owner:this.replyOwner,
+                id:item.id, claim:item.claim, descriptor:bridge.descriptor, authority, deadline:item.deadline})
+              if (!exactKeys(gate, ['ok','valid','id','claim','authority','deadline','reason']) ||
+                  gate.ok !== true || gate.valid !== true || gate.id !== item.id || gate.claim !== item.claim ||
+                  gate.authority !== authority || gate.deadline !== item.deadline || gate.reason !== 'ready' ||
+                  this.stopped || Date.now() >= item.deadline * 1000) throw new Error('reply claim no longer authorized')
               // Set unknown BEFORE a write: a timeout can mean the response was applied.
               status = 'unknown'
               const receipt = await this.api.requestProfile(bridge.route, 'request.answer', {id:bridge.descriptor.request_id, result}, 15_000)
@@ -1117,6 +1126,152 @@ export class CompletionMonitor {
   }
 }
 
+export const SETTINGS_ROWS = Object.freeze([
+  {key:'service_enabled', label:'전체 알림과 Telegram 입력 사용', description:'모든 기능의 공통 스위치입니다. 꺼도 아래 개별 선택값은 보존됩니다.'},
+  {key:'completion_notifications_enabled', module:'completion_notifications', label:'작업 완료 알림', description:'작업과 대기 항목이 정리된 뒤 60초간 조용하면 완료 카드를 보냅니다.'},
+  {key:'attention_notifications_enabled', module:'attention_notifications', label:'질문·승인 대기 알림', description:'사용자 입력이 필요해 작업이 멈추면 알려줍니다.'},
+  {key:'clarify_replies_enabled', module:'clarify_replies', label:'Telegram에서 질문에 답하기', description:'현재 질문 카드에 대한 답변만 해당 Desktop 질문에 전달합니다.'},
+  {key:'completion_followups_enabled', module:'completion_followups', label:'완료 카드로 후속 요청하기', description:'완료 카드에 답장하여 같은 작업에 후속 요청을 보냅니다.'},
+  {key:'approvals_enabled', module:'approvals', label:'명령 한 번 허용·거절', description:'일회성 허용·거절만 제공합니다. 영구 허용이나 자동 승인을 켜지 않습니다.'},
+  {key:'replies_enabled', label:'Telegram 답장 입력 허용', description:'질문 답변·후속 요청의 공통 허용 조건입니다. 기존 답장 허용값을 그대로 보존합니다.'}
+])
+const SETTINGS_MODULES = Object.freeze(SETTINGS_ROWS.filter(row => row.module).map(row => row.module))
+
+export function validateSettingsStatus(value) {
+  const object = v => v && typeof v === 'object' && !Array.isArray(v)
+  if (!object(value) || value.version !== VERSION || typeof value.ok !== 'boolean' ||
+      typeof value.read_only !== 'boolean' || typeof value.selection_reason !== 'string' ||
+      !object(value.settings) || !object(value.effective) || !object(value.receiver) ||
+      typeof value.receiver.heartbeat_ready !== 'boolean' ||
+      SETTINGS_ROWS.some(row => typeof value.settings[row.key] !== 'boolean') ||
+      SETTINGS_MODULES.some(key => typeof value.effective[key] !== 'boolean')) {
+    throw new NativeHelperError('설정 응답을 확인할 수 없습니다. 설치 버전과 연결을 확인해 주세요.')
+  }
+  return value
+}
+
+export async function readBridgeSettings(monitor) {
+  if (monitor.stopped) throw new NativeHelperError('플러그인이 비활성화되었습니다.')
+  await monitor.refreshRoutes(true)
+  return validateSettingsStatus(await monitor.helper({action:'settings_status'}))
+}
+
+export async function writeBridgeSetting(monitor, request) {
+  if (monitor.stopped || monitor.settingsBusy || monitor.settingsNeedsRefresh || !request ||
+      !SETTINGS_ROWS.some(row => row.key === request.key) ||
+      typeof request.value !== 'boolean' || typeof request.expected !== 'boolean') {
+    throw new NativeHelperError('현재 설정을 변경할 수 없습니다.')
+  }
+  const frozen = Object.freeze({action:'settings_set', key:request.key,
+    value:request.value, expected:request.expected})
+  monitor.settingsBusy = true
+  let dispatched = false
+  try {
+    // Fresh read first, but never rebase a user's click onto a changed baseline.
+    const fresh = await readBridgeSettings(monitor)
+    if (!fresh.ok || !['ready','service_disabled'].includes(fresh.selection_reason)) {
+      throw new NativeHelperError('설정이 읽기 전용입니다. 플러그인 선택과 연결을 확인해 주세요.')
+    }
+    if (fresh.settings[frozen.key] !== frozen.expected) {
+      monitor.settingsNeedsRefresh = true
+      throw new NativeHelperError('다른 화면에서 설정이 바뀌었습니다. 새로고침 후 다시 선택해 주세요.')
+    }
+    if (monitor.stopped) throw new NativeHelperError('플러그인이 비활성화되었습니다.')
+    // One native write, no automatic retry or fallback transport.
+    dispatched = true
+    const reply = validateSettingsStatus(await monitor.helper(frozen))
+    if (!reply.ok || reply.write_status !== 'verified' || reply.readback?.key !== frozen.key ||
+        reply.readback?.value !== frozen.value || reply.cleanup?.ok !== true ||
+        reply.settings[frozen.key] !== frozen.value) {
+      throw new NativeHelperError('변경 결과를 확정하지 못했습니다. 새로고침하여 실제 값을 확인해 주세요.', true)
+    }
+    return reply
+  } catch (error) {
+    if (dispatched) {
+      monitor.settingsNeedsRefresh = true
+      throw new NativeHelperError('변경 결과를 확정하지 못했습니다. 재시도하지 말고 새로고침하여 실제 값을 확인해 주세요.', true)
+    }
+    throw error
+  } finally { monitor.settingsBusy = false }
+}
+
+function BridgeSettingsPage({monitor}) {
+  const queryKey = [ID, VERSION, 'settings']
+  const query = UI.useQuery({queryKey, queryFn:() => readBridgeSettings(monitor),
+    retry:false, staleTime:0, refetchInterval:60_000})
+  const client = UI.useQueryClient()
+  const mutation = UI.useMutation({mutationFn:request => writeBridgeSetting(monitor, request), retry:false,
+    onSuccess:reply => { client.setQueryData(queryKey, reply); void client.invalidateQueries({queryKey}) }})
+  const refresh = UI.useMutation({mutationFn:() => readBridgeSettings(monitor), retry:false,
+    onSuccess:reply => {
+      monitor.settingsNeedsRefresh = false
+      mutation.reset()
+      client.setQueryData(queryKey, reply)
+    }})
+  const snapshot = query.data
+  const verified = snapshot?.ok === true && snapshot.version === VERSION && !query.error
+  const editable = verified && ['ready','service_disabled'].includes(snapshot.selection_reason) &&
+    !monitor.stopped && !monitor.settingsNeedsRefresh && !mutation.isPending && !refresh.isPending && !query.isFetching
+  const reasonText = snapshot?.selection_reason === 'ready' ? '기존 허용 조건을 충족합니다.' :
+    snapshot?.selection_reason === 'service_disabled' ? '전체 스위치가 꺼져 있습니다. 개별 선택값은 보존됩니다.' :
+    '원본 설정·플러그인 선택·연결을 확인할 수 없어 변경을 차단했습니다.'
+  const row = entry => jsx(UI.ToggleRow, {
+    label:entry.label, description:entry.description,
+    checked:verified && snapshot.settings[entry.key] === true,
+    disabled:!editable,
+    onChange:value => mutation.mutate(Object.freeze({key:entry.key, value, expected:snapshot.settings[entry.key]})),
+    below:entry.module ? jsx('div', {className:'mt-1 text-xs text-muted-foreground', children:
+      !verified ? '상태 확인 대기' : snapshot.effective[entry.module] ? '설정상 사용 가능' :
+      snapshot.settings[entry.key] ? '선택값 켜짐 · 공통 스위치 또는 허용 조건으로 실행 차단' : '개별 기능 꺼짐'}) : null
+  }, entry.key)
+  const section = (title, entries) => jsx('section', {className:'mb-6', children:[
+    jsx('h2', {className:'mb-2 text-sm font-medium', children:title}, title),
+    ...entries.map(row)
+  ]}, title)
+  const error = mutation.error || refresh.error || query.error
+  return jsx('div', {className:'max-w-3xl px-5 py-4', children:[
+    jsx('div', {className:'mb-5 flex flex-wrap items-center gap-3', children:[
+      jsx('h1', {className:'text-base font-medium', children:'Telegram Bridge'}, 'title'),
+      jsx(UI.Badge, {variant:'muted', children:!verified ? '상태 미확인' :
+        snapshot.settings.service_enabled ? '전체 켜짐' : '전체 꺼짐'}, 'master'),
+      jsx(UI.Button, {type:'button', size:'sm', variant:'outline', disabled:mutation.isPending || refresh.isPending || query.isFetching,
+        onClick:() => refresh.mutate(), children:'새로고침'}, 'refresh')
+    ]}, 'header'),
+    jsx('p', {className:'mb-4 text-sm text-muted-foreground', children:
+      '이 로컬 앱의 모든 프로필에 공통 적용됩니다. 하나를 변경할 때마다 실제 저장값을 다시 확인합니다.'}, 'scope'),
+    jsx('div', {className:'mb-5 rounded-md border border-border px-3 py-3 text-sm', children:[
+      jsx('div', {children:verified ? `설정 도우미 ${snapshot.version} · 수신 신호 ${snapshot.receiver.heartbeat_ready ? '확인됨' : '미확인 또는 입력 기능 꺼짐'}` :
+        '설정 조회 중이거나 조회에 실패했습니다. 꺼짐으로 단정하지 않습니다.'}, 'status'),
+      jsx('p', {className:'mt-2 text-xs text-muted-foreground', children:reasonText}, 'reason'),
+      jsx('p', {className:'mt-2 text-xs text-muted-foreground', children:
+        '수신 신호는 Telegram 실제 전송·명령 실행 성공의 증거가 아닙니다. Gateway 장애 중에는 오래된 카드에 답하지 마세요.'}, 'health-boundary')
+    ]}, 'diagnostics'),
+    error ? jsx('div', {role:'alert', className:'mb-4 rounded-md border border-border px-3 py-3 text-sm', children:
+      error instanceof NativeHelperError ? error.message : '설정을 확인하지 못했습니다. 새로고침하여 실제 값을 확인해 주세요.'}, 'error') : null,
+    section('전체 제어', [SETTINGS_ROWS[0]]),
+    section('알림', SETTINGS_ROWS.slice(1,3)),
+    section('Telegram 입력', SETTINGS_ROWS.slice(3,6)),
+    section('답장 공통 허용', [SETTINGS_ROWS[6]]),
+    jsx('p', {className:'text-xs text-muted-foreground', children:
+      'Desktop 플러그인 자체를 끄면 이 전용 화면도 내려갑니다. 다시 켜기는 기본 설정의 플러그인 목록에서 할 수 있습니다.'}, 'desktop-toggle-note'),
+    jsx(UI.Button, {type:'button', variant:'text', size:'sm', onClick:() => host.navigate(UI.pluginSettingsHref ? UI.pluginSettingsHref() : '/settings?tab=plugins'),
+      children:'Desktop 플러그인 목록 열기'}, 'desktop-toggle')
+  ]})
+}
+
+export function registerBridgeSettings(ctx, monitor) {
+  const render = () => jsx(BridgeSettingsPage, {monitor})
+  if (typeof ctx.registerSettingsPage === 'function' && typeof UI.pluginSettingsHref === 'function') {
+    ctx.registerSettingsPage({id:'telegram', title:'Telegram Bridge', icon:'bell', render})
+  } else if (UI.ROUTES_AREA && UI.SIDEBAR_NAV_AREA && typeof ctx.register === 'function') {
+    // Older supported SDKs retain a dedicated route without a core patch.
+    const path = '/telegram-bridge-settings'
+    ctx.register({id:'telegram-settings-route', area:UI.ROUTES_AREA, data:{path}, render})
+    ctx.register({id:'telegram-settings-nav', area:UI.SIDEBAR_NAV_AREA,
+      data:{path,label:'Telegram Bridge',codicon:'bell'}})
+  }
+}
+
 export default {
   id: ID,
   name: 'Session Completion → Telegram',
@@ -1125,6 +1280,7 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     const monitor = new CompletionMonitor(host, ctx)
+    registerBridgeSettings(ctx, monitor)
     ctx.onEvent('*', event => monitor.onEvent(event))
     ctx.onDispose(() => monitor.dispose())
     ctx.setInterval(() => void monitor.sweep(), ATTENTION_POLL_MS)

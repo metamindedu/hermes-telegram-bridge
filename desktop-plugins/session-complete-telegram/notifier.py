@@ -20,7 +20,22 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
+
+
+def _action_status(name, root=None, ctx=None):
+    """Fresh server-side policy read used immediately before every outbound side effect."""
+    try:
+        root = ROOT if root is None else root
+        gateway = _sibling_module("telegram_integration")
+        return gateway.feature_status(name, root=root, ctx=ctx)
+    except Exception:
+        return False, "native_plugin_config_invalid"
+
+
+def action_enabled(name, root=None, ctx=None):
+    return _action_status(name, root=root, ctx=ctx)[0]
+
 
 
 def _active_hermes_home():
@@ -417,8 +432,11 @@ def probe(root=ROOT):
     return {"ok": bool(me.get("ok") and chat.get("ok")), "bot_authenticated": bool(me.get("ok")), "home_reachable": bool(chat.get("ok")), "home_type": chat.get("result", {}).get("type"), "version": VERSION}
 
 
-def _send_verified(key, profile, session_key, text, root, state, api):
-    """Claim once, send once, verify by same-text edit; never retry ambiguous sends."""
+def _send_verified(key, profile, session_key, text, root, state, api, *, gate, ctx=None):
+    """Claim once, recheck the module immediately before each Telegram write, never retry."""
+    allowed, reason = _action_status(gate, root=root, ctx=ctx)
+    if not allowed:
+        return {"ok": False, "feature_ready": False, "reason": reason}
     token, target, topic = credentials(root)
     with state_db(state) as c:
         c.execute("BEGIN IMMEDIATE")
@@ -426,6 +444,11 @@ def _send_verified(key, profile, session_key, text, root, state, api):
         if existing:
             return {"ok": existing[0] == "sent", "duplicate": True, "status": existing[0], "message_id": existing[1], "verified": bool(existing[2])}
         c.execute("INSERT INTO deliveries(dedupe_key,profile,session_key,status,created) VALUES(?,?,?,?,?)", (key, profile, session_key, "sending", time.time()))
+    allowed, reason = _action_status(gate, root=root, ctx=ctx)
+    if not allowed:
+        with state_db(state) as c:
+            c.execute("UPDATE deliveries SET status='failed' WHERE dedupe_key=? AND status='sending'", (key,))
+        return {"ok": False, "feature_ready": False, "reason": reason, "status": "failed"}
     payload = {"chat_id": target, "text": text, "disable_notification": False, "protect_content": False, "link_preview_options": {"is_disabled": True}}
     if topic is not None:
         payload["message_thread_id"] = topic
@@ -434,7 +457,7 @@ def _send_verified(key, profile, session_key, text, root, state, api):
     sent = bool(answer.get("ok") and message.get("message_id") and message.get("chat", {}).get("id") == target and message.get("text") == text)
     mid = message.get("message_id") if sent else None
     verified = False
-    if sent:
+    if sent and _action_status(gate, root=root, ctx=ctx)[0]:
         # Bot API has no getMessage. An idempotent same-text edit addresses the
         # exact message: "not modified" proves it still exists with this text.
         check = api(token, "editMessageText", {"chat_id": target, "message_id": mid, "text": text, "link_preview_options": {"is_disabled": True}})
@@ -464,8 +487,8 @@ def legacy_message_id(message_id, state=STATE):
         return False
 
 
-def _register_followup_binding(req, checked, result, *, root, state):
-    """Bind only a newly sent, same-text-verified completion and a live v1 receiver."""
+def _register_followup_binding(req, checked, result, *, root, state, ctx=None, expected_epoch=None):
+    """Bind a verified send only under its pre-send epoch and current module policy."""
     descriptor = req.get("followup")
     if (not isinstance(descriptor, dict) or result.get("duplicate") or result.get("status") != "sent" or
             result.get("verified") is not True or result.get('followup_verified') is not True or not result.get("message_id")):
@@ -486,7 +509,8 @@ def _register_followup_binding(req, checked, result, *, root, state):
             return result
         bot = int(token.split(":", 1)[0])
         binding = followup_bridge.register_completion(descriptor, bot=bot, chat=chat, topic=topic,
-                                                       message_id=int(result["message_id"]), state=state)
+            message_id=int(result["message_id"]), state=state, expected_epoch=expected_epoch,
+            policy=lambda: action_enabled("completion_followups_enabled", root=root, ctx=ctx))
         if binding.get("ok"):
             result["binding_id"] = binding["binding_id"]
     except Exception:
@@ -495,14 +519,32 @@ def _register_followup_binding(req, checked, result, *, root, state):
     return result
 
 
-def deliver(req, *, root=ROOT, state=STATE, api=telegram, test=False):
-    checked = {"ok": True, "lineage": "installation-test", "profile": "default", "title": "설치 확인"} if test else inspect_session(req, root=root, include_preview=True)
+def deliver(req, *, root=ROOT, state=STATE, api=telegram, test=False, ctx=None):
+    completion_allowed, completion_reason = _action_status(
+        "completion_notifications_enabled", root=root, ctx=ctx)
+    if test:
+        if not completion_allowed:
+            return {"ok": False, "feature_ready": False, "reason": completion_reason}
+        checked = {"ok": True, "lineage": "installation-test", "profile": "default", "title": "설치 확인"}
+    else:
+        attention_allowed, attention_reason = _action_status(
+            "attention_notifications_enabled", root=root, ctx=ctx)
+        # Both native/raw/effective policy checks precede any durable session read.
+        # Either notification class may authorize classification, but only the
+        # exact persisted-final class may pass its fresh delivery gate below.
+        if not completion_allowed and not attention_allowed:
+            return {"ok": False, "feature_ready": False, "reason": completion_reason}
+        checked = inspect_session(req, root=root, include_preview=completion_allowed)
     if not checked["ok"]:
         # A settled turn that ended with a question is input-needed: notify as an
         # attention question, never as success completion and never silently.
         if not test and checked.get("reason") == "awaiting_answer":
-            return deliver_attention({**req, "kind": "question"}, root=root, state=state, api=api)
+            if attention_allowed:
+                return deliver_attention({**req, "kind": "question"}, root=root, state=state, api=api, ctx=ctx)
+            return {"ok": False, "feature_ready": False, "reason": attention_reason}
         return checked
+    if not completion_allowed:
+        return {"ok": False, "feature_ready": False, "reason": completion_reason}
     profile, lineage = checked["profile"], checked["lineage"]
     # One claim per fully settled final response, not the session lifetime.
     # Preserve legacy installation-test identity and all prior ledger rows.
@@ -516,11 +558,25 @@ def deliver(req, *, root=ROOT, state=STATE, api=telegram, test=False):
         # Only the validated persisted final is previewed, never earlier turns,
         # hidden reasoning, tool output, or untrusted renderer-supplied text.
         text = notification_text(checked)
-    result = _send_verified(key, profile, lineage, text, root, state, api)
-    return _register_followup_binding(req, checked, result, root=root, state=state) if not test else result
+    registration_epoch = None
+    if (not test and isinstance(req.get('followup'), dict) and
+            action_enabled('completion_followups_enabled', root=root, ctx=ctx) and
+            (Path(state) / 'followup-inbox' / 'followups.sqlite3').is_file()):
+        try:
+            registration_epoch = _sibling_module('followup_bridge').capture_registration_epoch(state=state)
+        except Exception:
+            # No fresh capability may be inferred from missing/unreadable evidence.
+            registration_epoch = None
+    result = _send_verified(key, profile, lineage, text, root, state, api,
+                            gate="completion_notifications_enabled", ctx=ctx)
+    return _register_followup_binding(req, checked, result, root=root, state=state,
+        ctx=ctx, expected_epoch=registration_epoch) if not test else result
 
 
-def deliver_attention(req, *, root=ROOT, state=STATE, api=telegram):
+def deliver_attention(req, *, root=ROOT, state=STATE, api=telegram, ctx=None):
+    allowed, reason = _action_status("attention_notifications_enabled", root=root, ctx=ctx)
+    if not allowed:
+        return {"ok": False, "feature_ready": False, "reason": reason}
     kind = req.get("kind")
     if kind == "ask":
         checked = inspect_ask(req, root=root)
@@ -535,51 +591,69 @@ def deliver_attention(req, *, root=ROOT, state=STATE, api=telegram):
     # Ask ids are unique per question; question claims are per final row.
     identity = [str(root.resolve()), profile, "attention-v1", req.get("session_key"), kind, anchor]
     key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
-    result = _send_verified(key, profile, req.get("session_key"), attention_text(checked), root, state, api)
+    result = _send_verified(key, profile, req.get("session_key"), attention_text(checked), root, state, api,
+                            gate="attention_notifications_enabled", ctx=ctx)
     return {**result, "kind": kind}
 
 
-def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget=None):
+def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget=None, ctx=None):
     """Dispatch one bounded native or direct-launch request through existing actions."""
     try:
         if not isinstance(req, dict):
             return {"ok": False, "reason": "invalid_request"}
         action = req.get("action")
+        if action in {"settings_status", "settings_set"}:
+            if action == "settings_status" and set(req) != {"action"}:
+                return {"ok": False, "reason": "invalid_settings_request"}
+            if not native or ctx is None:
+                return {"ok": False, "reason": "native_settings_context_required"}
+            settings_control = _sibling_module("settings_control")
+            if action == "settings_status":
+                return settings_control.settings_status(ctx, root=root, state=state)
+            return settings_control.settings_set(req, ctx, root=root, state=state)
         if action == "probe":
             result = probe(root=root)
         elif action == "test":
-            result = deliver(req, root=root, state=state, test=True)
+            result = deliver(req, root=root, state=state, test=True, ctx=ctx)
         elif action == "send":
-            result = deliver(req, root=root, state=state)
+            result = deliver(req, root=root, state=state, ctx=ctx)
         elif action == "attention":
-            result = deliver_attention(req, root=root, state=state)
-        elif action in ("reply_register", "reply_poll", "reply_settle", "reply_fragment"):
+            result = deliver_attention(req, root=root, state=state, ctx=ctx)
+        elif action in ("reply_register", "reply_poll", "reply_settle", "reply_fragment", "reply_claim_valid"):
             gateway = _sibling_module("telegram_integration")
-            allowed, reason = gateway.feature_status("replies_enabled", root=root)
-            if not allowed:
+            allowed, reason = gateway.feature_status("clarify_replies_enabled", root=root, ctx=ctx)
+            if not allowed and action not in {"reply_settle"}:
+                if action == "reply_claim_valid":
+                    return {"ok": True, "valid": False, "id": req.get("id"), "claim": req.get("claim"),
+                            "authority": req.get("authority"), "deadline": req.get("deadline"), "reason": reason}
                 return {"ok": False, "feature_ready": False, "reason": reason}
             reply_bridge = _sibling_module("reply_bridge")
-            result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
-                                         result_budget=result_budget if native else None)
+            if action == "reply_claim_valid":
+                result = reply_bridge.claim_valid(req.get("owner"), req.get("id"), req.get("claim"),
+                    req.get("descriptor"), req.get("authority"), req.get("deadline"), root=root, state=state, ctx=ctx)
+            else:
+                result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
+                                             result_budget=result_budget if native else None)
         elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice", "approval_claim_valid"}:
-            if action != "approval_notice":
-                gateway = _sibling_module("telegram_integration")
-                allowed, reason = gateway.feature_status("approvals_enabled", root=root)
-                if not allowed:
-                    if action == "approval_poll":
-                        return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
-                    if action == "approval_claim_valid":
-                        return {"ok": True, "valid": False, "id": req.get("id"), "claim": req.get("claim"),
-                                "authority": req.get("authority"), "deadline": req.get("deadline"),
-                                "reason": reason}
-                    return {"ok": False, "feature_ready": False, "reason": reason}
+            gateway = _sibling_module("telegram_integration")
+            gate = ("attention_notifications_enabled" if action == "approval_notice"
+                    else "approvals_enabled")
+            allowed, reason = gateway.feature_status(gate, root=root, ctx=ctx)
+            if not allowed and action not in {"approval_settle"}:
+                if action == "approval_poll":
+                    return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
+                if action == "approval_claim_valid":
+                    return {"ok": True, "valid": False, "id": req.get("id"), "claim": req.get("claim"),
+                            "authority": req.get("authority"), "deadline": req.get("deadline"),
+                            "reason": reason}
+                return {"ok": False, "feature_ready": False, "reason": reason}
             approval_bridge = _sibling_module("approval_bridge")
             result = approval_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                             result_budget=result_budget if native else None)
         elif isinstance(action, str) and action.startswith("followup_"):
             gateway = _sibling_module("telegram_integration")
-            allowed, reason = gateway.feature_status("replies_enabled", root=root)
-            if not allowed:
+            allowed, reason = gateway.feature_status("completion_followups_enabled", root=root, ctx=ctx)
+            if not allowed and action not in {"followup_settle", "followup_reject"}:
                 return {"ok": False, "feature_ready": False, "reason": reason}
             followup_bridge = _sibling_module("followup_bridge")
             owner = req.get("owner")
@@ -594,7 +668,8 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
                     req.get("binding_id"), req.get("descriptor"), state=state)
             elif action == "followup_begin_submit":
                 result = followup_bridge.begin_submit(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
-                    req.get("claim"), state=state)
+                    req.get("claim"), state=state,
+                    policy=lambda: action_enabled("completion_followups_enabled", root=root, ctx=ctx))
             elif action == "followup_reject":
                 result = followup_bridge.reject_pending(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
                     req.get("binding_id"), state=state)
@@ -606,7 +681,7 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             if action in ("followup_settle", "followup_reject") and result.get("ok"):
                 try:
                     followup_bridge.notify_receipt(owner, req.get("bot"), req.get("chat"), req.get("inbound_id"),
-                                                   sys.modules[__name__], state=state)
+                                                   sys.modules[__name__], state=state, root=root)
                 except Exception:
                     pass
         elif action == "inspect":
@@ -625,7 +700,7 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
                 # renderer caches this handshake; action authority is checked
                 # afresh by owner heartbeat/register/poll/claim-validity gates.
                 if (approval_bridge.VERSION == VERSION and
-                        approval_bridge.CAPABILITY == "desktop-command-approval-v3"):
+                        approval_bridge.CAPABILITY == "desktop-command-approval-v4"):
                     capabilities.append(approval_bridge.CAPABILITY)
             except Exception:
                 approval_enabled = False

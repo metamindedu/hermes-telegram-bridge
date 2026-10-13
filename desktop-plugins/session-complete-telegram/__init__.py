@@ -96,13 +96,14 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--request", required=True, help=argparse.SUPPRESS)
 
 
-def _run_cli(args: argparse.Namespace) -> None:
+def _run_cli(args: argparse.Namespace, *, ctx=None) -> None:
     try:
         home = resolve_package_home(__file__)
         request = _parse_request(getattr(args, "request", None))
         from . import notifier
 
-        result = notifier.dispatch_request(request, root=home, native=True, result_budget=MAX_RESULT_BYTES)
+        result = notifier.dispatch_request(request, root=home, native=True, result_budget=MAX_RESULT_BYTES,
+                                          ctx=ctx)
     except Exception as exc:
         # Exception text is never returned: it may include URLs or credentials.
         result = {"ok": False, "reason": type(exc).__name__}
@@ -119,10 +120,10 @@ def register(ctx) -> None:
     owner_id = getattr(ctx, "plugin_id", None)
 
     def run_bound(args):
-        if owner_id != PLUGIN_ID:
+        if owner_id != PLUGIN_ID or getattr(ctx, "plugin_id", None) != PLUGIN_ID:
             _write_frame({"ok": False, "reason": "native_plugin_owner_mismatch"})
             return
-        _run_cli(args)
+        _run_cli(args, ctx=ctx)
 
     ctx.register_cli_command(
         name="desktop-telegram-bridge",

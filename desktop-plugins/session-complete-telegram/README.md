@@ -1,5 +1,11 @@
 # Session Completion → Telegram
 
+## Modular settings (1.8.0 candidate)
+
+Open the dedicated **Telegram Bridge** settings page while the Desktop plugin is enabled. The common service switch preserves individual choices; completion notices, input-needed notices, question answers, completion-card followups and one-time approvals have separate settings. Existing `replies_enabled` and `approvals_enabled` consent remains default-off and is never enabled by installation. Parent-notification switches and exact live authorization still apply. Writes use the captured public native settings API, one known boolean at a time, with readback and no retry after an unknown result. See [`../../docs/modular-settings.md`](../../docs/modular-settings.md) for defaults, revocation, all-profile scope and distinct activation gates.
+
+The current source uses 1.8.0 / `desktop-command-approval-v4`; the immutable public 1.7.0 release remains historical. Receiver heartbeats and saved settings are not proof of a Telegram roundtrip or command completion.
+
 ## Optional replies (1.7.0 candidate; unreleased)
 
 After normal native Gateway loading and only when `replies_enabled: true`, newly verified completion cards accept direct plain-text replies from the configured private-home owner. They submit through the captured Desktop route to the same in-memory session with `prompt.submit` and `queued:true`. No session handoff, resume, creation, interruption, or core change. Older cards lack trustworthy routing metadata and are not actionable.

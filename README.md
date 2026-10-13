@@ -4,6 +4,10 @@ Community-authored plugins that connect Hermes Desktop notifications and selecte
 
 This is an independently authored NewMetaW project, not a fork of `telegram-notify`, not part of Hermes core, and not an official Nous Research product or endorsement. The unified candidate uses ONE installable package, `session-complete-telegram`, for the Desktop component, fixed native CLI command, and optional handlers on the existing Telegram Gateway application. It never starts another polling client. `desktop-clarify-telegram` remains only as a deprecated inert compatibility stub; it is not a required package.
 
+## Modular-settings development candidate
+
+The 1.8.0 working candidate adds a dedicated **Telegram Bridge** settings page, a common service switch and five separately selectable modules. It preserves the existing default-off replies/approvals consent and all local ownership/no-replay boundaries. See [modular settings and activation](docs/modular-settings.md). This section does not change the public 1.7.0 release pin below or claim the new candidate is already published or active.
+
 ## What it does
 
 - Sends one completion card after a persisted Desktop response has settled and the local session has been quiet for 60 seconds. The card includes a redacted final-response preview capped at 1,200 characters. Keep Desktop open and connected through that interval.

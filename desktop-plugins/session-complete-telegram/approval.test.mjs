@@ -6,7 +6,8 @@ import {registerHooks} from 'node:module'
 
 registerHooks({resolve(specifier, context, nextResolve) {
   if (specifier === '@hermes/plugin-sdk') return {url:'data:text/javascript,export const host = {}', shortCircuit:true}
-  return nextResolve(specifier)
+  if (specifier === 'react/jsx-runtime') return {url: 'data:text/javascript,export const jsx=(type,props,key)=>({type,props,key})', shortCircuit:true}
+  return nextResolve(specifier, context)
 }})
 const {CompletionMonitor, validateApprovalPair, validApprovalSnapshot, approvalFingerprint,
   APPROVAL_CAPABILITY, VERSION} = await import('./desktop/plugin.js')
@@ -227,9 +228,9 @@ test('approval_claim_valid is explicitly dispatched but remains a read-only non-
   await assert.rejects(monitor.helper(request),error=>error?.ambiguousWrite===false)
 })
 
-test('new pre-dispatch authorization contract requires 1.7.0 approval-v3 handshake', () => {
-  assert.equal(VERSION,'1.7.0')
-  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v3')
+test('new pre-dispatch authorization contract requires 1.8.0 approval-v4 handshake', () => {
+  assert.equal(VERSION,'1.8.0')
+  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v4')
 })
 
 test('claim validity is the last fresh gate before approval.respond and accepts only an exact typed receipt', async () => {

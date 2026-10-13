@@ -32,6 +32,12 @@ Historical public v1.6.1 at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` used two 
 
 The user explicitly chose to proceed without SDK development. Use the existing public API and preserve bridge authorization, consent, ownership, queue binding, replay protection and state. Whole-platform input blocking when the SDK cannot attach even the reject-only guard is excluded: the host can continue ordinary Telegram input. Keep that behavior as an executed characterization test, together with denied bridge receiver/owner readiness and unchanged approval state; do not skip it or hide previous RED/NO-GO evidence. Startup managed-policy errors still require scoped consumers to install when host installation succeeds, with every bridge action denied until policy is healthy. Disclose the limitation in README, package README, SECURITY and setup/operations docs. No core patch, private override, second poller or shared Gateway stop is authorized by this clarification. Final independent review applies to this explicit narrower contract, not the retired platform-wide guarantee.
 
+## Modular-settings follow-on (1.8.0 candidate)
+
+The current user task adds the dedicated settings page and common/all-profile modular controls, requires immutable independent Heavy review and complete tests/CI, and carries the accepted candidate through publication, common installation and live verification while preserving current active settings. Historical Light-only/source-only statements above describe the preceding 1.7.0 task, not a prohibition on this newly requested delivery. No historical consent is used to enable default-off features or change unrelated settings.
+
+See `docs/modular-settings.md` for the seven-leaf/five-module contract, public native settings writer, revocation/no-replay, v4 handshake and the separately verified shared-Gateway activation boundary. Existing ownership, secret/state preservation and SDK limitation remain binding. Do not label earlier failed test receipts successful; executed native React/SDK and installed-pane verification remain distinct from controller mocks.
+
 ## Release boundary
 
 The candidate SHA, commit-bound CI, Heavy GO, catalog disposition, public release, real installation, production config, Desktop/Gateway activation, restart, and Telegram round trip are not established by this task. Do not claim them. `docs/operations.md` and `docs/public-install.md` describe the one-package candidate and its separate activation/migration/rollback boundaries.

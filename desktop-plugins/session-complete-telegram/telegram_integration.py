@@ -16,7 +16,25 @@ else:
     from runtime import PLUGIN_ID, resolve_package_home
 
 LEGACY_PLUGIN_ID = "desktop-clarify-telegram"
-FEATURES = frozenset({"replies_enabled", "approvals_enabled"})
+VERSION = "1.8.0"
+SETTING_DEFAULTS = {
+    "service_enabled": True,
+    "completion_notifications_enabled": True,
+    "attention_notifications_enabled": True,
+    "clarify_replies_enabled": True,
+    "completion_followups_enabled": True,
+    "replies_enabled": False,
+    "approvals_enabled": False,
+}
+SETTING_KEYS = tuple(SETTING_DEFAULTS)
+FEATURES = frozenset(SETTING_DEFAULTS)
+MODULES = {
+    "completion_notifications": ("service_enabled", "completion_notifications_enabled"),
+    "attention_notifications": ("service_enabled", "attention_notifications_enabled"),
+    "clarify_replies": ("service_enabled", "replies_enabled", "clarify_replies_enabled", "attention_notifications_enabled"),
+    "completion_followups": ("service_enabled", "replies_enabled", "completion_followups_enabled", "completion_notifications_enabled"),
+    "approvals": ("service_enabled", "approvals_enabled", "attention_notifications_enabled"),
+}
 logger = logging.getLogger("hermes.plugin.session_complete_telegram")
 
 
@@ -76,14 +94,15 @@ def _read_config(root: str | Path) -> dict[str, Any]:
     active = set(enabled) - set(disabled)
     entry = entries.get(PLUGIN_ID, {})
     settings_valid = isinstance(entry, dict)
-    settings: dict[str, Any] = {}
+    raw_settings: dict[str, Any] = {}
     if settings_valid:
-        raw_settings = entry.get("settings", {})
-        settings_valid = isinstance(raw_settings, dict)
+        value = entry.get("settings", {})
+        settings_valid = isinstance(value, dict)
         if settings_valid:
-            settings = raw_settings
-            settings_valid = (set(settings).issubset(FEATURES) and
-                              all(type(settings.get(key, False)) is bool for key in FEATURES))
+            raw_settings = value
+            settings_valid = (set(raw_settings).issubset(FEATURES) and
+                              all(type(raw_settings.get(key, SETTING_DEFAULTS[key])) is bool
+                                  for key in FEATURES))
         # The public PluginContext API can fall back to the old `config` subtree.
         # These package switches are deliberately settings-only; legacy values
         # must never be treated as consent for the unified package.
@@ -92,12 +111,18 @@ def _read_config(root: str | Path) -> dict[str, Any]:
             settings_valid = False
         elif legacy_config is not None and not isinstance(legacy_config, dict):
             settings_valid = False
+    display_settings = dict(SETTING_DEFAULTS)
+    for key, value in raw_settings.items():
+        if key in SETTING_DEFAULTS and type(value) is bool:
+            display_settings[key] = value
+    validated_settings = dict(SETTING_DEFAULTS)
+    validated_settings.update(raw_settings if settings_valid else {})
     return {
         "structural_valid": True,
         "settings_valid": bool(settings_valid),
         "reason": "native_plugin_config_invalid" if not settings_valid else None,
         "active": active,
-        "settings": settings if settings_valid else {},
+        "settings": validated_settings if settings_valid else display_settings,
         "primary_enabled": PLUGIN_ID in active,
         "migration_required": LEGACY_PLUGIN_ID in active,
     }
@@ -165,15 +190,18 @@ def _native_effective_config(root: str | Path) -> tuple[dict[str, Any] | None, s
         legacy_config = entry.get("config") if settings_valid else None
         settings_valid = (settings_valid and isinstance(settings, dict) and
                           set(settings).issubset(FEATURES) and
-                          all(type(settings.get(name, False)) is bool for name in FEATURES) and
+                          all(type(settings.get(name, SETTING_DEFAULTS[name])) is bool for name in FEATURES) and
                           not (isinstance(legacy_config, dict) and bool(set(legacy_config) & FEATURES)) and
                           (legacy_config is None or isinstance(legacy_config, dict)))
         if not isinstance(settings, dict):
             settings = {}
+        effective_settings = dict(SETTING_DEFAULTS)
+        if settings_valid:
+            effective_settings.update(settings)
         return {
             "active": set(enabled) - set(disabled),
             "settings_valid": bool(settings_valid),
-            "settings": {name: settings.get(name, False) for name in FEATURES},
+            "settings": effective_settings,
         }, "ready"
     except Exception:
         return None, "native_plugin_config_invalid"
@@ -189,40 +217,90 @@ def _selection_reason(raw: dict[str, Any], effective: dict[str, Any] | None) -> 
     return "ready"
 
 
-def feature_status(name: str, *, root: str | Path, ctx=None) -> tuple[bool, str]:
-    """Return (enabled, bounded reason), requiring raw and native effective consent."""
-    if name not in FEATURES:
-        return False, "unknown_feature"
+def effective_modules(settings: dict[str, bool], *, selected: bool = True) -> dict[str, bool]:
+    """Compute bounded per-module eligibility without mutating the user's choices."""
+    return {name: bool(selected and all(settings.get(key) is True for key in gates))
+            for name, gates in MODULES.items()}
+
+
+def settings_state(*, root: str | Path, ctx=None) -> dict[str, Any]:
+    """Compare raw, native-effective, and captured PluginContext settings read-only."""
     raw = _read_config(root)
+    settings = dict(SETTING_DEFAULTS)
+    if isinstance(raw.get("settings"), dict):
+        for key, value in raw["settings"].items():
+            if key in SETTING_DEFAULTS and type(value) is bool:
+                settings[key] = value
     if not raw.get("structural_valid") or not raw.get("settings_valid"):
-        return False, "native_plugin_config_invalid"
+        return {"ok": False, "settings": settings, "effective_settings": {},
+                "selection_reason": "native_plugin_config_invalid"}
     if ctx is not None and getattr(ctx, "plugin_id", None) != PLUGIN_ID:
-        return False, "native_plugin_owner_mismatch"
+        return {"ok": False, "settings": settings, "effective_settings": {},
+                "selection_reason": "native_plugin_owner_mismatch"}
     effective, reason = _native_effective_config(root)
     if effective is None:
-        return False, reason
+        return {"ok": False, "settings": settings, "effective_settings": {},
+                "selection_reason": reason}
     selection = _selection_reason(raw, effective)
+    if not effective.get("settings_valid"):
+        return {"ok": False, "settings": settings, "effective_settings": {},
+                "selection_reason": "native_plugin_config_invalid"}
+    for key in SETTING_KEYS:
+        raw_value = raw["settings"].get(key, SETTING_DEFAULTS[key])
+        effective_value = effective["settings"].get(key, SETTING_DEFAULTS[key])
+        if type(raw_value) is not bool or type(effective_value) is not bool or raw_value is not effective_value:
+            return {"ok": False, "settings": settings, "effective_settings": {},
+                    "selection_reason": "native_plugin_config_invalid"}
+        if ctx is not None:
+            getter = getattr(ctx, "get_config", None)
+            if not callable(getter):
+                return {"ok": False, "settings": settings, "effective_settings": {},
+                        "selection_reason": "native_plugin_config_invalid"}
+            try:
+                api_value = getter(key, default=SETTING_DEFAULTS[key])
+            except Exception:
+                return {"ok": False, "settings": settings, "effective_settings": {},
+                        "selection_reason": "native_plugin_config_invalid"}
+            if type(api_value) is not bool or api_value is not raw_value:
+                return {"ok": False, "settings": settings, "effective_settings": {},
+                        "selection_reason": "native_plugin_config_invalid"}
+    if selection == "ready" and settings["service_enabled"] is not True:
+        selection = "service_disabled"
+    return {"ok": True, "settings": settings, "effective_settings": effective["settings"],
+            "selection_reason": selection}
+
+
+def feature_status(name: str, *, root: str | Path, ctx=None) -> tuple[bool, str]:
+    """Return (eligible, bounded reason), requiring exact raw/native/API agreement."""
+    if name not in FEATURES and name not in MODULES:
+        return False, "unknown_feature"
+    state = settings_state(root=root, ctx=ctx)
+    if not state["ok"]:
+        return False, state["selection_reason"]
+    settings = state["settings"]
+    effective = state["effective_settings"]
+    selection = state["selection_reason"]
     if selection != "ready":
         return False, selection
-    if not effective.get("settings_valid"):
-        return False, "native_plugin_config_invalid"
-    raw_value = raw["settings"].get(name, False)
-    effective_value = effective["settings"].get(name, False)
-    if (type(raw_value) is not bool or type(effective_value) is not bool or
-            raw_value is not effective_value):
-        return False, "native_plugin_config_invalid"
-    if ctx is not None:
-        getter = getattr(ctx, "get_config", None)
-        if not callable(getter):
+    if name == "replies_enabled":
+        gates = ("service_enabled", "replies_enabled")
+    elif name in {"clarify_replies_enabled", "clarify_replies"}:
+        gates = MODULES["clarify_replies"]
+    elif name in {"completion_followups_enabled", "completion_followups"}:
+        gates = MODULES["completion_followups"]
+    elif name in {"approvals_enabled", "approvals"}:
+        gates = MODULES["approvals"]
+    elif name in {"completion_notifications_enabled", "completion_notifications"}:
+        gates = MODULES["completion_notifications"]
+    elif name in {"attention_notifications_enabled", "attention_notifications"}:
+        gates = MODULES["attention_notifications"]
+    else:
+        gates = ("service_enabled", name)
+    for key in gates:
+        if settings.get(key) is not True:
+            return False, key.replace("_enabled", "_disabled")
+        if effective.get(key, settings.get(key)) is not True:
             return False, "native_plugin_config_invalid"
-        try:
-            api_value = getter(name, default=False)
-        except Exception:
-            return False, "native_plugin_config_invalid"
-        if type(api_value) is not bool or api_value is not raw_value or api_value is not effective_value:
-            return False, "native_plugin_config_invalid"
-    if raw_value is not True:
-        return False, name.replace("_enabled", "_disabled")
     return True, "ready"
 
 
@@ -273,7 +351,8 @@ def _factory(ctx, captured_owner: object):
             adapter,
             followup_bridge,
             approval_bridge,
-            replies_enabled=lambda: feature_enabled("replies_enabled", root=home, ctx=ctx),
+            replies_enabled=lambda: feature_enabled("clarify_replies_enabled", root=home, ctx=ctx),
+            followups_enabled=lambda: feature_enabled("completion_followups_enabled", root=home, ctx=ctx),
             approvals_enabled=lambda: feature_enabled("approvals_enabled", root=home, ctx=ctx),
         )
 
@@ -286,4 +365,5 @@ def register(ctx) -> None:
     ctx.register_telegram_handler(_factory(ctx, captured_owner))
 
 
-__all__ = ["FEATURES", "LEGACY_PLUGIN_ID", "feature_enabled", "feature_status", "migration_required", "register"]
+__all__ = ["FEATURES", "SETTING_DEFAULTS", "SETTING_KEYS", "MODULES", "VERSION", "LEGACY_PLUGIN_ID",
+           "effective_modules", "feature_enabled", "feature_status", "settings_state", "migration_required", "register"]

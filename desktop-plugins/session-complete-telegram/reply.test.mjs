@@ -1,7 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {registerHooks} from 'node:module'
-registerHooks({resolve(s,c,n){return s==='@hermes/plugin-sdk'?{url:'data:text/javascript,export const host={}',shortCircuit:true}:n(s,c)}})
+registerHooks({resolve(s,c,n){
+  if(s==='@hermes/plugin-sdk')return{url:'data:text/javascript,export const host={}',shortCircuit:true}
+  if(s==='react/jsx-runtime')return{url:'data:text/javascript,export const jsx=(type,props,key)=>({type,props,key})',shortCircuit:true}
+  return n(s,c)
+}})
 const {CompletionMonitor,stableJSON,validReplySnapshot}=await import('./desktop/plugin.js')
 function fixture() {
   const route={mode:'local',connectionId:'local',profile:'default',targetProfile:'default'}
@@ -31,6 +35,8 @@ function fixture() {
       const observed=r.observations?.some(x=>x.id==='form1')&&!r.unverified?.includes('form1')
       return {ok:true,items:queue&&observed?[{id:'form1',claim:'claim1',deadline:Date.now()/1000+40,descriptor:registered.descriptor,result:{answers:{q1:'B'}}}]:[]}
     }
+    if(r.action==='reply_claim_valid') return {ok:true,valid:true,id:r.id,claim:r.claim,
+      authority:r.authority,deadline:r.deadline,reason:'ready'}
     if(r.action==='reply_settle'){settles.push(r);queue=false;return {ok:true}}
     return {ok:true}
   }
@@ -40,6 +46,25 @@ function fixture() {
     queue:()=>{queue=true},setRegisterHandler:fn=>{registerHandler=fn},setActive:value=>{activeOverride=value},
     register:()=>mon.checkAsk(record,route,row)}
 }
+for(const mode of ['off','wrong claim','expired after gate','disposed after gate','malformed receipt','read failure']) test('last reply gate denies '+mode+' without response write',async()=>{
+  const f=fixture();await f.register();f.queue();const original=f.mon.helper, originalNow=Date.now
+  f.mon.helper=async r=>{
+    const result=await original(r)
+    if(r.action==='reply_claim_valid'){
+      if(mode==='off')return {...result,valid:false,reason:'service_disabled'}
+      if(mode==='wrong claim')return {...result,claim:'foreign'}
+      if(mode==='expired after gate')Date.now=()=>originalNow()+90_000
+      if(mode==='disposed after gate')f.mon.dispose()
+      if(mode==='malformed receipt')return {ok:true,valid:true}
+      if(mode==='read failure')throw Error('readonly timeout')
+    }
+    return result
+  }
+  try { await f.mon.pumpReplies() } finally { Date.now=originalNow }
+  assert.equal(f.writes.length,0)
+  assert.notEqual(f.settles[0]?.status,'applied')
+})
+
 test('registers clarify and applies exact all-question response on captured route',async()=>{
   const f=fixture();await f.register();f.queue();await f.mon.pumpReplies()
   assert.equal(f.writes.length,1);assert.deepEqual(f.writes[0].params,{id:f.ask.id,result:{answers:{q1:'B'}}});assert.equal(f.settles[0].status,'applied')
@@ -127,6 +152,8 @@ test('assembles a bounded UTF-8 fragment, checks digest and identity, then answe
       return {ok:true,id:'form1',claim,sha256,index:request.index,bytes:payload.byteLength,chunks,chunk_bytes:chunkBytes,
         data:payload.subarray(start,start+chunkBytes).toString('base64url')}
     }
+    if(request.action==='reply_claim_valid')return {ok:true,valid:true,id:request.id,claim:request.claim,
+      authority:request.authority,deadline:request.deadline,reason:'ready'}
     if(request.action==='reply_settle'){f.settles.push(request);return {ok:true}}
     return {ok:true}
   }

@@ -19,8 +19,8 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.7.0"
-CAPABILITY = "desktop-command-approval-v3"
+VERSION = "1.8.0"
+CAPABILITY = "desktop-command-approval-v4"
 PREFIX = "hda:"
 LEASE = 45
 MAX_TTL = 31_536_000
@@ -141,6 +141,29 @@ def _retire(c, row, status, now):
     c.execute("""UPDATE approvals SET status=?,choice=NULL,claim=NULL,deadline=NULL,
       dirty=CASE WHEN message_id IS NULL THEN dirty ELSE 1 END,
       review_text=NULL,request_json='{}',pending_json='{}' WHERE id=?""", (status, row["id"]))
+
+
+def retire_unexecuted(*, state=STATE, now=None):
+    """Terminalize unexecuted cards; applying/posting attempts become unknown, never replayable."""
+    path = Path(state) / "approval-inbox" / "approvals.sqlite3"
+    if not path.is_file():
+        return 0
+    now = time.time() if now is None else now
+    c = connect(state)
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        rows = c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying')").fetchall()
+        for row in rows:
+            status = "unknown" if row["status"] in ("posting", "applying") else (
+                "rejected" if row["status"] == "queued" else "expired")
+            _retire(c, row, status, now)
+        c.commit()
+        return len(rows)
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 def _expire_owner(c, owner, now):
@@ -600,7 +623,7 @@ def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=N
         return {"ok": False, "reason": "duplicate"}
     finally:
         c.close()
-    result = publish(approval_id, notifier, state=state)
+    result = publish(approval_id, notifier, state=state, root=root)
     return {**result, "id": approval_id, "status": result.get("status", "unknown"), "expires": expires}
 
 
@@ -611,7 +634,9 @@ def _keyboard(row):
     ]]}
 
 
-def publish(approval_id, notifier, *, state=STATE):
+def publish(approval_id, notifier, *, state=STATE, root=None):
+    if not notifier.action_enabled("approvals_enabled", root=root):
+        return {"ok": False, "feature_ready": False, "reason": "approvals_disabled"}
     c = connect(state)
     try:
         c.execute("BEGIN IMMEDIATE")
@@ -636,6 +661,9 @@ def publish(approval_id, notifier, *, state=STATE):
                    "link_preview_options": {"is_disabled": True}}
         if row["topic"] is not None:
             payload["message_thread_id"] = row["topic"]
+        if not notifier.action_enabled("approvals_enabled", root=root):
+            _finish_post(approval_id, "rejected", state)
+            return {"ok": False, "feature_ready": False, "reason": "approvals_disabled"}
         answer = notifier.telegram(notifier.credentials()[0], "sendMessage", payload)
         message = answer.get("result") if isinstance(answer, dict) else None
         if not isinstance(message, dict):
@@ -665,6 +693,9 @@ def publish(approval_id, notifier, *, state=STATE):
             c.commit()
         finally:
             c.close()
+        if not notifier.action_enabled("approvals_enabled", root=root):
+            _finish_post(approval_id, "unknown", state, message_id=mid)
+            return {"ok": False, "status": "unknown", "reason": "approvals_disabled_after_send"}
         # Same-text edit proves the addressed message still has the exact content
         # and the same keyboard; never drop buttons during verification.
         verify = notifier.telegram(notifier.credentials()[0], "editMessageText",
@@ -676,6 +707,9 @@ def publish(approval_id, notifier, *, state=STATE):
         if not verified:
             _finish_post(approval_id, "unknown", state, message_id=mid)
             return {"ok": False, "status": "unknown", "reason": "send_verification_unknown"}
+        if not notifier.action_enabled("approvals_enabled", root=root):
+            _finish_post(approval_id, "unknown", state, message_id=mid)
+            return {"ok": False, "status": "unknown", "reason": "approvals_disabled_after_send"}
         c = connect(state)
         try:
             c.execute("BEGIN IMMEDIATE")
@@ -923,6 +957,8 @@ def settle(approval_id, claim, status, *, state=STATE, now=None):
 
 
 def flush(notifier, *, state=STATE):
+    if not notifier.action_enabled("approvals_enabled"):
+        return
     c = connect(state)
     try:
         _prune(c, time.time())
@@ -933,6 +969,8 @@ def flush(notifier, *, state=STATE):
         return
     token, chat, topic = notifier.credentials()
     for row in rows:
+        if not notifier.action_enabled("approvals_enabled"):
+            break
         if (row["chat"], row["topic"]) != (chat, topic):
             continue
         if row["status"] == "open" and row["review_text"]:
@@ -969,6 +1007,8 @@ def flush(notifier, *, state=STATE):
 
 def approval_notice(req, notifier, *, root=ROOT, state=STATE, api=None):
     """Notification-only message for a supported but unsafe-to-render approval."""
+    if not notifier.action_enabled("attention_notifications_enabled", root=root):
+        return {"ok": False, "feature_ready": False, "reason": "attention_notifications_disabled"}
     request = req.get("request")
     pending = req.get("pending")
     descriptor = req.get("descriptor")
@@ -1003,17 +1043,25 @@ def approval_notice(req, notifier, *, root=ROOT, state=STATE, api=None):
                     "status": existing[0], "message_id": existing[1], "verified": bool(existing[2])}
         c.execute("INSERT INTO deliveries(dedupe_key,profile,session_key,status,created) VALUES(?,?,?,?,?)",
                   (key, profile, descriptor["session_key"], "sending", time.time()))
+    if not notifier.action_enabled("attention_notifications_enabled", root=root):
+        with notifier.state_db(state) as c:
+            c.execute("UPDATE deliveries SET status='failed' WHERE dedupe_key=? AND status='sending'", (key,))
+        return {"ok": False, "feature_ready": False, "reason": "attention_notifications_disabled"}
     payload = {"chat_id": target, "text": text, "disable_notification": False,
                "protect_content": False, "link_preview_options": {"is_disabled": True}}
     if topic is not None:
         payload["message_thread_id"] = topic
+    if not notifier.action_enabled("attention_notifications_enabled", root=root):
+        with notifier.state_db(state) as c:
+            c.execute("UPDATE deliveries SET status='failed' WHERE dedupe_key=? AND status='sending'", (key,))
+        return {"ok": False, "feature_ready": False, "reason": "attention_notifications_disabled"}
     response = (api or notifier.telegram)(token, "sendMessage", payload)
     message = response.get("result", {})
     sent = bool(response.get("ok") and message.get("message_id") and message.get("chat", {}).get("id") == target and
                 message.get("text") == text)
     mid = message.get("message_id") if sent else None
     verified = False
-    if sent:
+    if sent and notifier.action_enabled("attention_notifications_enabled", root=root):
         check = (api or notifier.telegram)(token, "editMessageText", {"chat_id": target, "message_id": mid,
                  "text": text, "link_preview_options": {"is_disabled": True}})
         verified = bool(check.get("ok") and check.get("result", {}).get("message_id") == mid) or (
@@ -1041,7 +1089,7 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     else:
         gateway = importlib.import_module('telegram_integration')
     allowed, reason = gateway.feature_status('approvals_enabled', root=root)
-    if not allowed:
+    if not allowed and action not in {"approval_settle"}:
         if action == "approval_poll":
             return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
         if action == "approval_claim_valid":
@@ -1160,7 +1208,12 @@ def wire(application, notifier, bot, chat, topic, boot, *, approvals_enabled=lam
     async def consume_text_reply(update, context):
         msg = getattr(update, "effective_message", None)
         try:
-            if msg is not None:
+            enabled = False
+            try:
+                enabled = approvals_enabled() is True
+            except Exception:
+                pass
+            if msg is not None and enabled:
                 # Free text is never converted to once/deny or forwarded to the
                 # agent. This handler only consumes the known card reply.
                 await msg.reply_text("명령 승인은 버튼으로만 처리됩니다. Desktop에서 현재 승인 상태를 확인해 주세요.")

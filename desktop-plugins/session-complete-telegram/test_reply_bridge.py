@@ -405,6 +405,35 @@ class BridgeTests(unittest.TestCase):
         self.create();self.take();item=self.claim()['items'][0]
         b.settle(self.fid,item['claim'],'unknown',state=self.state)
         self.assertFalse(self.claim()['items']);self.assertEqual(b.read_form(self.fid,self.state)['status'],'unknown')
+    def test_reply_claim_valid_is_read_only_and_checks_full_authority_and_policy(self):
+        self.create()
+        self.assertEqual(self.take()['status'], 'queued')
+        item = self.claim()['items'][0]
+        descriptor = item['descriptor']
+        authority = hashlib.sha256(b.canonical(descriptor).encode('utf-8')).hexdigest()
+        path = self.state / 'reply-inbox' / 'replies.sqlite3'
+        before = path.read_bytes()
+        with patch.object(b, '_feature_status', return_value=(True, 'ready')):
+            valid = b.claim_valid('desktop1', item['id'], item['claim'], descriptor, authority,
+                item['deadline'], state=self.state, now=self.now)
+            self.assertTrue(valid['valid'], valid)
+            self.assertFalse(b.claim_valid('other-owner', item['id'], item['claim'], descriptor, authority,
+                item['deadline'], state=self.state, now=self.now)['valid'])
+            self.assertFalse(b.claim_valid('desktop1', item['id'], 'wrong-claim', descriptor, authority,
+                item['deadline'], state=self.state, now=self.now)['valid'])
+            self.assertFalse(b.claim_valid('desktop1', item['id'], item['claim'], dict(descriptor, epoch='changed'), authority,
+                item['deadline'], state=self.state, now=self.now)['valid'])
+            self.assertFalse(b.claim_valid('desktop1', item['id'], item['claim'], descriptor, authority,
+                item['deadline'] + 1, state=self.state, now=self.now)['valid'])
+            self.assertFalse(b.claim_valid('desktop1', item['id'], item['claim'], descriptor, authority,
+                item['deadline'], state=self.state, now=item['deadline'])['valid'])
+        with patch.object(b, '_feature_status', return_value=(False, 'service_disabled')):
+            denied = b.claim_valid('desktop1', item['id'], item['claim'], descriptor, authority,
+                item['deadline'], state=self.state, now=self.now)
+            self.assertFalse(denied['valid'])
+            self.assertEqual(denied['reason'], 'service_disabled')
+        self.assertEqual(path.read_bytes(), before, 'claim-validity checks must be read-only')
+
     def test_tombstone_reply_stays_recognizable(self):
         self.create();self.claim([])
         self.assertEqual(b.lookup_reply(77,99,100,self.state),(self.fid,0))
@@ -432,7 +461,8 @@ class BridgeTests(unittest.TestCase):
         calls=[]
         def api(token,method,p):
             calls.append((method,p));return {'ok':True,'result':{'message_id':55,'chat':{'id':99},'text':p['text']}}
-        n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=api,final_preview=lambda x:x)
+        n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=api,final_preview=lambda x:x,
+                          action_enabled=lambda *a,**k:True)
         b.publish(fid,n,state=self.state)
         self.assertIs(calls[0][1]['protect_content'],False)
         self.assertEqual(calls[0][1]['reply_markup'],calls[1][1]['reply_markup'])
@@ -444,12 +474,14 @@ class BridgeTests(unittest.TestCase):
         calls=[]
         def api(token,method,p):
             calls.append(p);return {'ok':True,'result':{'message_id':55,'chat':{'id':99},'text':p['text']}}
-        n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=api,final_preview=lambda x:x)
+        n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=api,final_preview=lambda x:x,
+                          action_enabled=lambda *a,**k:True)
         b.publish(fid,n,state=self.state)
         self.assertIn('1시간 30분 후 만료됩니다',calls[0]['text'])
     def test_ambiguous_send_not_retried(self):
         fid=b.register({'descriptor':self.d,'ask':self.ask},state=self.state,now=self.now,ttl=300)['id']
-        n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=lambda *a:{'ok':False,'ambiguous':True},final_preview=lambda x:x)
+        n=SimpleNamespace(credentials=lambda:('test',99,None),telegram=lambda *a:{'ok':False,'ambiguous':True},
+                          final_preview=lambda x:x,action_enabled=lambda *a,**k:True)
         b.publish(fid,n,state=self.state)
         self.assertEqual(b.read_form(fid,self.state)['status'],'unknown')
         r=b.register({'descriptor':self.d,'ask':self.ask},state=self.state,now=self.now,ttl=300)

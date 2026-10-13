@@ -103,6 +103,17 @@ class CatalogRegistrationTests(unittest.TestCase):
         self.assertIs(manifest['config_schema']['replies_enabled']['default'], False)
         self.assertEqual(manifest['config_schema']['approvals_enabled']['type'], 'bool')
         self.assertIs(manifest['config_schema']['approvals_enabled']['default'], False)
+        expected = {
+            'service_enabled': True,
+            'completion_notifications_enabled': True,
+            'attention_notifications_enabled': True,
+            'clarify_replies_enabled': True,
+            'completion_followups_enabled': True,
+        }
+        for key, default in expected.items():
+            self.assertEqual(manifest['config_schema'][key]['type'], 'bool')
+            self.assertIs(manifest['config_schema'][key]['default'], default)
+        self.assertEqual(manifest['version'], '1.8.0')
 
     def test_recording_cli_owner_cannot_execute_even_at_valid_location(self):
         module = self.load(self.install(FRONTEND), 'frontend_recording')

@@ -4,6 +4,7 @@ import { registerHooks } from 'node:module'
 
 registerHooks({resolve(specifier, context, nextResolve) {
   if (specifier === '@hermes/plugin-sdk') return {url: 'data:text/javascript,export const host = {}', shortCircuit:true}
+  if (specifier === 'react/jsx-runtime') return {url: 'data:text/javascript,export const jsx=(type,props,key)=>({type,props,key})', shortCircuit:true}
   return nextResolve(specifier, context)
 }})
 const {CompletionMonitor, QUIET_MS, blockingProcess, unfinishedControl, stableJSON, encodeRequest, decodeResultFrame, NativeHelperError} = await import('./desktop/plugin.js')

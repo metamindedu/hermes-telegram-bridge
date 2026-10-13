@@ -16,6 +16,15 @@ class FollowupTests(unittest.TestCase):
  def claim(self):
   row=b.ready('owner',state=self.state,now=self.now)['items'][0]
   return b.claim('owner',77,99,200,self.bid,row['descriptor'],state=self.state,now=self.now)
+ def test_legacy_register_api_is_allowed_only_before_revocation(self):
+  self.assertEqual(b.lookup_outbound(77,99,100,state=self.state)["kind"],"completion")
+  b.retire_unexecuted(state=self.state,now=self.now+1)
+  result=b.register_completion(self.d,bot=77,chat=99,topic=None,message_id=101,state=self.state,now=self.now+1)
+  self.assertFalse(result["ok"],result)
+  self.assertEqual(b.lookup_outbound(77,99,101,state=self.state),{"kind":"legacy","binding":None})
+  with b.connect(self.state) as db:
+   self.assertEqual(db.execute("SELECT count(*) FROM bindings WHERE outbound_mid=101").fetchone()[0],0)
+
  def test_register_and_one_attempt_purge(self):
   self.assertTrue(self.ingest()['ok']);self.assertTrue(self.ingest()['duplicate']);c=self.claim();self.assertTrue(c['ok'])
   self.assertFalse(b.claim('owner',77,99,200,self.bid,c['descriptor'],state=self.state,now=self.now)['ok'])
@@ -37,6 +46,15 @@ class FollowupTests(unittest.TestCase):
   self.ingest();c=self.claim()
   self.assertFalse(b.begin_submit('owner',77,99,200,c['claim'],state=self.state,now=self.now+46)['ok'])
   with b.connect(self.state) as db:self.assertEqual(db.execute('SELECT status,text FROM receipts').fetchone()[:],('unknown',None))
+ def test_begin_submit_rechecks_policy_and_marks_revoked_claim_unknown(self):
+  self.ingest();claimed=self.claim();checks=iter((True,False))
+  result=b.begin_submit('owner',77,99,200,claimed['claim'],state=self.state,now=self.now,
+                        policy=lambda:next(checks))
+  self.assertFalse(result['ok']);self.assertEqual(result['reason'],'feature_disabled')
+  with b.connect(self.state) as db:
+   self.assertEqual(tuple(db.execute('SELECT status,text,claim FROM receipts').fetchone()),('unknown',None,None))
+  self.assertEqual(b.ready('owner',state=self.state,now=self.now)['items'],[])
+
  def test_no_owner_takeover_or_duplicate_card(self):
   self.assertFalse(b.register_completion(self.d,bot=77,chat=99,topic=None,message_id=100,state=self.state,now=self.now)['ok'])
   self.ingest();self.assertEqual(b.ready('another',state=self.state,now=self.now)['items'],[])
@@ -137,7 +155,7 @@ class FollowupTests(unittest.TestCase):
     await real_sleep(0)
    before=set(asyncio.all_tasks())
    with patch.object(rb,'_NOTIFIER',notifier),patch.object(rb,'bind_receiver',side_effect=lambda *a:ticks.append(1)),patch.object(rb,'time',SimpleNamespace(monotonic=lambda:clock[0])),patch.object(rb.asyncio,'to_thread',thread),patch.object(rb.asyncio,'sleep',sleep):
-    rb.wire(app,None,follow,replies_enabled=lambda:True)
+    rb.wire(app,None,follow,replies_enabled=lambda:True,followups_enabled=lambda:True)
     created=set(asyncio.all_tasks())-before
     await asyncio.gather(*created)
    self.assertEqual(len(ticks),12);self.assertEqual(len(probes),2);self.assertGreaterEqual(len(attempts),2);self.assertEqual(wired,[1])
@@ -172,7 +190,7 @@ class FollowupTests(unittest.TestCase):
    context.enter_context(patch.object(rb,'intake',side_effect=lambda *a:(clarify.append(a) or {'ok':True})))
    context.enter_context(patch.object(rb,'flush'))
    follow=SimpleNamespace(wire=lambda *a,**kw:b.wire(*a,state=self.state,**kw))
-   rb.wire(app,None,follow,replies_enabled=lambda:True)
+   rb.wire(app,None,follow,replies_enabled=lambda:True,followups_enabled=lambda:True)
    app.add_handler(MessageHandler(filters.ALL,ordinary),group=0);app.add_handler(MessageHandler(filters.ALL,ordinary),group=99);app.add_error_handler(error)
    base={'message_id':210,'date':1,'chat':{'id':99,'type':'private'},'from':{'id':99,'is_bot':False,'first_name':'owner'},'text':'followup','reply_to_message':{'message_id':100,'date':1,'chat':{'id':99,'type':'private'},'from':{'id':77,'is_bot':True,'first_name':'bot'}}}
    for i,kind in enumerate(['text','edited','media','command','unauth','legacy','outage','clarify_outage']):

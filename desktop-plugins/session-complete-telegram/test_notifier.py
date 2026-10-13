@@ -20,6 +20,15 @@ class NotificationTests(unittest.TestCase):
         self.home = self.root
         self.state = self.root / 'sender-state'
         self.sid = 'desktop-fixture'
+        self.home.mkdir(parents=True, exist_ok=True)
+        nl = chr(10)
+        (self.home / 'config.yaml').write_text(nl.join((
+            'plugins:', '  enabled: [session-complete-telegram]', '  entries:',
+            '    session-complete-telegram:', '      settings: {}', ''
+        )), encoding='utf-8')
+        self.home_patch = patch.dict(os.environ, {'HERMES_HOME': str(self.home)})
+        self.home_patch.start()
+        self.addCleanup(self.home_patch.stop)
         self.make_session(self.home)
 
     def tearDown(self):
@@ -418,6 +427,40 @@ class NotificationTests(unittest.TestCase):
         self.assertTrue(question['ok'] and question['kind']=='question')
         self.assertTrue(done['ok'] and 'kind' not in done)
         self.assertEqual(calls.count('sendMessage'),2)
+
+    def test_question_final_completion_gate_does_not_suppress_attention_and_dedupes(self):
+        self.execute("UPDATE messages SET content='계속 진행할까요?' WHERE role='assistant'")
+        calls=[]
+        def status(name, root=None, ctx=None):
+            ready=name == 'attention_notifications_enabled'
+            return ready, 'ready' if ready else 'completion_notifications_disabled'
+        with (
+            patch.object(notifier, '_action_status', side_effect=status),
+            patch.object(notifier, 'credentials', return_value=('test',12,None)),
+        ):
+            first=notifier.deliver(self.request(),root=self.root,state=self.state,
+                                   api=self.fake_api(calls))
+            second=notifier.deliver(self.request(),root=self.root,state=self.state,
+                                    api=self.fake_api(calls))
+        self.assertTrue(first['ok'] and first['verified'] and first['kind']=='question')
+        self.assertTrue(second['duplicate'])
+        self.assertEqual(calls.count('sendMessage'),1)
+
+    def test_completion_disabled_does_not_promote_an_ordinary_final_to_attention(self):
+        self.assertTrue(self.inspect()['ok'])
+        calls=[]
+        def status(name, root=None, ctx=None):
+            ready=name == 'attention_notifications_enabled'
+            return ready, 'ready' if ready else 'completion_notifications_disabled'
+        with (
+            patch.object(notifier, '_action_status', side_effect=status),
+            patch.object(notifier, 'credentials', return_value=('test',12,None)),
+        ):
+            result=notifier.deliver(self.request(),root=self.root,state=self.state,
+                                    api=self.fake_api(calls))
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['reason'],'completion_notifications_disabled')
+        self.assertEqual(calls,[])
 
     def test_attention_unknown_kind_rejected(self):
         self.assertEqual(notifier.deliver_attention({'kind':'mystery'},root=self.root,state=self.state,api=self.fake_api([]))['reason'],'unknown_attention_kind')

@@ -203,10 +203,11 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.assertEqual(b._approval_timeout('default',notifier,self.root),300)
 
     def test_actual_timeout_is_used_without_clarify_ttl_floor(self):
-        (self.root/'config.yaml').write_text('approvals:\n  timeout: 23\n',encoding='utf-8')
+        consent='plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\n'
+        (self.root/'config.yaml').write_text(consent+'approvals:\n  timeout: 23\n',encoding='utf-8')
         result=self.registered();self.assertLessEqual(result['expires']-self.now,23.01)
         self.assertLess(result['expires']-self.now,3600)
-        (self.root/'config.yaml').write_text('approvals:\n  timeout: 0\n',encoding='utf-8')
+        (self.root/'config.yaml').write_text(consent+'approvals:\n  timeout: 0\n',encoding='utf-8')
         fresh=self.register();self.assertEqual(fresh['reason'],'approval_expired')
 
     def test_once_and_deny_queue_exact_id_one_shot_and_all_false_not_inherited(self):
@@ -294,6 +295,24 @@ class ApprovalBridgeTests(unittest.TestCase):
         with patch.object(notifier,'telegram',side_effect=lambda t,m,p:(calls.append(m) or {'ok':False,'ambiguous':True,'error_code':0})):
             result=self.register();duplicate=self.register()
         self.assertEqual(result['status'],'unknown');self.assertTrue(duplicate['duplicate']);self.assertEqual(calls,['sendMessage'])
+
+    def test_notice_uses_fresh_attention_gate_for_claim_send_and_verification(self):
+        req={'action':'approval_notice','capability':b.CAPABILITY,'owner':self.owner,
+            'descriptor':self.descriptor,'request':self.request,'pending':self.pending,
+            'reason':'review_unavailable'}
+        gates=[]
+        def attention_only(name,**_kwargs):
+            gates.append(name)
+            return name=='attention_notifications_enabled'
+        with patch.object(notifier,'action_enabled',side_effect=attention_only):
+            result=b.helper(req,notifier,root=self.root,state=self.state)
+        self.assertTrue(result['ok'] and result['verified'] and result['notification_only'],result)
+        self.assertEqual(gates,['attention_notifications_enabled']*4)
+        sends=[payload for method,payload in self.calls if method=='sendMessage']
+        self.assertEqual(len(sends),1)
+        self.assertNotIn(self.request['params']['command'],sends[0]['text'])
+        self.assertNotIn('reply_markup',sends[0])
+        self.assertEqual([method for method,_ in self.calls],['sendMessage','editMessageText'])
 
     def test_native_dispatcher_has_explicit_approval_actions_and_bounded_claim(self):
         heartbeat=notifier.dispatch_request({'action':'approval_owner_heartbeat','capability':b.CAPABILITY,'owner':self.owner},
