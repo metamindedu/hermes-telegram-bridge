@@ -825,10 +825,10 @@ class RecoveryReviewTests(CompletionRecoveryTests):
         item = self.record()
         claimed = self.claim(item)
         self.assertTrue(claimed["ok"], claimed)
-        # After claiming, the actual renderer can spend four 35s native helper
-        # budgets and two 60s two-read snapshot budgets before dispatch admission.
+        # Four post-claim helpers plus the claim response (75s each), and two
+        # two-read snapshots (60s each), fit without extending the original TTL.
         clock = [time.time()]
-        spent = sum((35, 60, 35, 35, 60, 35))
+        spent = sum((75, 60, 75, 75, 60, 75, 75))
         request = self.send_request(item, claimed)
         calls = []
         def transport(_token, method, payload):

@@ -25,10 +25,11 @@ QUIET_SECONDS = 60
 MAX_ACTIVE = 256
 MAX_TOTAL = 1024
 # A claim is a pre-dispatch exclusion lease, not delivery authority. The real
-# renderer still runs four bounded native CLI calls (35s each) and two two-read
-# snapshots (60s each); leave room for the claim response as well. Every final
-# native gate and token CAS remains mandatory, and the original expiry caps it.
-CLAIM_SECONDS = 5 * 60
+# renderer runs bounded native CLI calls (75s outer budget) and two two-read
+# snapshots (60s each). Five RPC budgets including the claim response plus both
+# snapshots fit inside this exclusion lease. Every final native gate and token
+# CAS remains mandatory, and the original expiry still caps the claim.
+CLAIM_SECONDS = 10 * 60
 MAX_PAGE_ITEMS = 16
 MAX_RESULT_BYTES = 24 * 1024
 

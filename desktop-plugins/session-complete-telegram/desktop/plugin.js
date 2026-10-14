@@ -608,7 +608,9 @@ export class CompletionMonitor {
     let result
     try {
       // cli.exec's child budget is seconds; SDK's outer deadline is milliseconds.
-      result = await requestCLI('cli.exec', {argv, timeout: 25}, 35_000)
+      const recoveryBudget = recoveryAction || action === 'loaded'
+      result = await requestCLI('cli.exec', {argv, timeout: recoveryBudget ? 60 : 25},
+        recoveryBudget ? 75_000 : 35_000)
     } catch {
       throw new NativeHelperError('Notification helper did not complete', ambiguousWrite)
     }

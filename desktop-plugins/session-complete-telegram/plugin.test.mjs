@@ -34,9 +34,10 @@ function fixture(profile='default') {
   const api = {state:{profile:{get:()=>profile}},profileRoutes:async()=>routes,notify:v=>notices.push(v),requestProfile:async(route,method,args,outerTimeout)=>{
     if (method==='cli.exec') {
       assert.equal(route.profile,'default')
-      assert.equal(args.timeout,25)
-      assert.equal(outerTimeout,35_000)
       const request=decodeArgvRequest(args)
+      const recoveryBudget=request.action==='loaded'||request.action.startsWith('completion_recovery_')
+      assert.equal(args.timeout,recoveryBudget?60:25)
+      assert.equal(outerTimeout,recoveryBudget?75_000:35_000)
       if (request.action === 'followup_owner_heartbeat') return {blocked:false,code:0,output:frame({ok:true,feature_ready:false})}
       sent.push(request)
       return {blocked:false,code:0,output:frame({ok:true,status:'sent',verified:true})}
