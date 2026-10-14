@@ -15,7 +15,7 @@ const frame=value=>`${BEGIN}\n${Buffer.from(JSON.stringify(value),'utf8').toStri
 const DEFAULT_ROUTE={mode:'local',connectionId:'local',profile:'default',targetProfile:'default'}
 const GEN='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 
-function fixture({profile='claire', policy={ok:true,enabled:true,generation:GEN}}={}) {
+function fixture({profile='claire', policy={ok:true,enabled:true,generation:GEN}, beforeHelper=null}={}) {
   let now=1_800_000_000_000
   let socket='open'
   let activeProfile=profile
@@ -57,6 +57,8 @@ function fixture({profile='claire', policy={ok:true,enabled:true,generation:GEN}
     assert.deepEqual(args.argv.slice(0,4),['--profile','default','desktop-telegram-bridge','--request'])
     const request=JSON.parse(Buffer.from(args.argv[4],'base64url').toString('utf8'))
     requests.push({transport,request:structuredClone(request)})
+    const override=beforeHelper?await beforeHelper(request):undefined
+    if(override!==undefined)return {blocked:false,code:0,output:frame(override)}
     let value
     if(request.action==='loaded') {
       value={ok:true,version:APPROVAL_COMPAT_VERSION,package_version:VERSION,
@@ -473,3 +475,42 @@ test('same live captured socket can establish definitive recovery runtime absenc
   assert.equal(f.currentRecord(),undefined)
   assert.equal(f.candidates.values().next().value.state,'cancelled')
 })
+
+// The registered native CLI produces these receipts in test_recovery_review.py;
+// Python asserts complete wire equality so this is not a hand-authored success.
+const nativeExpiryFrames=JSON.parse(await (await import('node:fs/promises')).readFile(
+  new URL('./fixtures/recovery-expiry-results.json',import.meta.url),'utf8'))
+for(const kind of ['claim','claim_retry']){
+  test(`native ${kind} rollback receipt keeps recovery and reacquires once`,async()=>{
+    let blocked=false,sends=0
+    const f=fixture({beforeHelper:(request)=>{
+      if(request.action==='completion_recovery_send'){
+        if(!blocked){blocked=true;return structuredClone(nativeExpiryFrames[kind])}
+        sends++
+      }
+    }})
+    await ready(f);await register(f)
+    const expiry=f.currentRecord().candidate.expiresAt
+    await f.check()
+    assert.ok(f.currentRecord().candidate)
+    assert.equal(f.currentRecord().candidate.unknownOutcome??false,false)
+    assert.equal(sends,0)
+    assert.equal(f.currentRecord().candidate.expiresAt,expiry)
+    await f.check()
+    assert.equal(sends,1)
+    assert.equal(f.currentRecord().candidate,null)
+    assert.equal(f.notices.length,0)
+  })
+}
+for(const kind of ['ttl','ttl_retry']){
+  test(`native ${kind} rollback receipt ends as expiry without unknown warning`,async()=>{
+    const f=fixture({beforeHelper:request=>request.action==='completion_recovery_send'
+      ?structuredClone(nativeExpiryFrames[kind]):undefined})
+    await ready(f);await register(f);await f.check()
+    assert.equal(f.requests.filter(x=>x.request.action==='completion_recovery_send').length,1)
+    assert.notEqual(f.candidates.values().next().value.state,'sent')
+    assert.equal(f.currentRecord().candidate,null)
+    assert.equal(f.currentRecord().settledFinals.has(42),true)
+    assert.equal(f.notices.length,0)
+  })
+}

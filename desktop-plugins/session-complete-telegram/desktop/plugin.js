@@ -1599,6 +1599,10 @@ export class CompletionMonitor {
         await this.reconcileRecoveryState(record, candidate, route, {delay:5000})
         return
       }
+      if (reply?.phase === 'pre_dispatch' && reply.retryable === false && reply.reason === 'candidate_expired') {
+        this.dropLocalCandidate(record, candidate, true)
+        return
+      }
       if (reply?.phase === 'pre_dispatch' && reply.retryable === false && reply.reason === 'attention_required') {
         await this.handoffRecoveryAttention(record, candidate, route, current)
         return

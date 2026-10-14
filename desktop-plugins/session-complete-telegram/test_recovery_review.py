@@ -821,6 +821,174 @@ class RecoveryReviewTests(CompletionRecoveryTests):
         self.assertEqual(recovered.get("status"), "sent", recovered)
         self.assertEqual(calls.count("sendMessage"), 1)
 
+    def test_claim_survives_bounded_real_helper_and_snapshot_latency(self):
+        item = self.record()
+        claimed = self.claim(item)
+        self.assertTrue(claimed["ok"], claimed)
+        # After claiming, the actual renderer can spend four 35s native helper
+        # budgets and two 60s two-read snapshot budgets before dispatch admission.
+        clock = [time.time()]
+        spent = sum((35, 60, 35, 35, 60, 35))
+        request = self.send_request(item, claimed)
+        calls = []
+        def transport(_token, method, payload):
+            calls.append(method)
+            if method == "sendMessage":
+                return {"kind":"response", "response":{"ok":True, "result":{
+                    "message_id":891, "chat":{"id":-100123456, "type":"supergroup"}, "text":payload["text"]}}}
+            return {"kind":"unknown"}
+        clock[0] += spent
+        with patch.object(self.recovery, "time", SimpleNamespace(time=lambda: clock[0])), \
+             patch.object(self.notifier, "completion_telegram", side_effect=transport):
+            sent = self.invoke(request)
+        self.assertEqual(sent.get("status"), "sent", (spent, sent))
+        self.assertEqual(calls.count("sendMessage"), 1)
+        with self.db() as db:
+            self.assertEqual(db.execute("SELECT state FROM completion_candidates WHERE candidate_id=?", (item["candidate_id"],)).fetchone()[0], "sent")
+
+    def _assert_dispatch_clock(self, ttl):
+        for stage in (1, 2, 3):
+            with self.subTest(stage=stage, ttl=ttl):
+                item = self.record(self.identity(runtime_id=f'clock-{ttl}-{stage}'))
+                self.assertTrue(item['ok'], item)
+                with self.notifier.state_db(self.state):
+                    pass
+                claim_time = item['expires_at'] - 2 if ttl else time.time()
+                with patch.object(self.recovery, 'time', SimpleNamespace(time=lambda: claim_time)):
+                    claimed = self.claim(item)
+                self.assertTrue(claimed['ok'], claimed)
+                deadline = claimed['claim_until']
+                clock = [deadline - 1]
+                calls = [0]
+                real = self.recovery._resolve_source
+
+                def source(*args):
+                    value = real(*args)
+                    calls[0] += 1
+                    if calls[0] == stage:
+                        clock[0] = deadline + 1
+                    return value
+                key = self.notifier.completion_dedupe_key(self.home, 'default', item['session_key'], item['session_key'], item['final_row_id'])
+                real_connection = self.recovery._connection
+                ledger_barrier = []
+                @contextlib.contextmanager
+                def connection(*args, **kwargs):
+                    with real_connection(*args, **kwargs) as db:
+                        def trace(sql):
+                            if stage == 3 and sql.upper().startswith('INSERT INTO DELIVERIES'):
+                                ledger_barrier.append(True)
+                                clock[0] = deadline + 1
+                        db.set_trace_callback(trace)
+                        try:
+                            yield db
+                        finally:
+                            db.set_trace_callback(None)
+                with patch.object(self.recovery, 'time', SimpleNamespace(time=lambda: clock[0])), patch.object(self.recovery, '_resolve_source', side_effect=source), patch.object(self.recovery, '_connection', side_effect=connection):
+                    try:
+                        result = self.recovery.begin_dispatch(self.state, self.home, {'candidate_id': claimed['candidate_id'], 'revision': claimed['revision'], 'claim_token': claimed['claim_token'], 'generation': claimed['generation']}, ROUTE, dedupe_key=key, profile='default', session_key=item['session_key'], runtime_id=item['runtime_id'], started_at=item['started_at'], epoch=item['epoch'], final_row_id=item['final_row_id'])
+                    except self.recovery.RecoveryError:
+                        self.fail('proven rollback must return a typed pre-dispatch result')
+                if stage == 3:
+                    self.assertEqual(ledger_barrier, [True])
+                    self.assertEqual(result.get('phase'), 'pre_dispatch')
+                    self.assertIs(result.get('retryable'), not ttl)
+                    self.assertEqual(result.get('reason'), 'candidate_expired' if ttl else 'claim_expired')
+                self.assertFalse(result['ok'], result)
+                with self.db() as db:
+                    self.assertEqual(db.execute('SELECT count(*) FROM deliveries').fetchone()[0], 0)
+                    remaining = db.execute('SELECT state,expires FROM completion_candidates WHERE candidate_id=?', (item['candidate_id'],)).fetchone()
+                    if remaining:
+                        self.assertNotEqual(remaining[0], 'dispatching')
+                        self.assertEqual(remaining[1], item['expires_at'])
+
+    def test_claim_expiry_during_io(self):
+        self._assert_dispatch_clock(False)
+
+    def test_original_ttl_expiry_during_io(self):
+        self._assert_dispatch_clock(True)
+
+    def _assert_framed_expiry(self, ttl, retry):
+        item = self.record()
+        self.assertTrue(item['ok'], item)
+        claimed = self.claim(item)
+        with self.notifier.state_db(self.state):
+            pass
+        if retry:
+            with patch.object(self.notifier, 'completion_telegram', return_value={'kind': 'proven_unsent'}):
+                first = self.invoke(self.send_request(item, claimed))
+            self.assertEqual(first['status'], 'unsent_retryable')
+            item = self.listing()['items'][0]
+        clock = [item['expires_at'] - 2 if ttl else time.time()]
+        if ttl or retry:
+            if not retry:
+                clock[0] = item['expires_at'] - 2
+            with patch.object(self.recovery, 'time', SimpleNamespace(time=lambda: clock[0])):
+                claimed = self.claim({**item, 'revision': claimed['revision']} if not retry else item)
+            self.assertTrue(claimed['ok'], claimed)
+        clock[0] = claimed['claim_until'] - 1
+        with self.db() as db:
+            old_ledger = db.execute('SELECT * FROM deliveries').fetchall()
+            old_candidate = db.execute('SELECT * FROM completion_candidates').fetchall()
+        real_connection = self.recovery._connection
+        hit = []
+
+        @contextlib.contextmanager
+        def connection(*args, **kwargs):
+            with real_connection(*args, **kwargs) as db:
+                if db is None:
+                    yield db
+                    return
+
+                def trace(sql):
+                    if sql.upper().startswith(('INSERT INTO DELIVERIES', "UPDATE DELIVERIES SET STATUS='SENDING'")):
+                        hit.append(True)
+                        clock[0] = claimed['claim_until'] + 1
+                db.set_trace_callback(trace)
+                try:
+                    yield db
+                finally:
+                    db.set_trace_callback(None)
+        with patch.object(self.recovery, 'time', SimpleNamespace(time=lambda: clock[0])), patch.object(self.recovery, '_connection', side_effect=connection), patch.object(self.notifier, 'completion_telegram') as api:
+            result = self.invoke(self.send_request(item, claimed))
+        self.assertEqual(hit, [True])
+        api.assert_not_called()
+        with self.db() as db:
+            self.assertEqual(db.execute('SELECT * FROM deliveries').fetchall(), old_ledger)
+            self.assertEqual(db.execute('SELECT * FROM completion_candidates').fetchall(), old_candidate)
+        self.assertEqual(result.get('phase'), 'pre_dispatch', result)
+        self.assertIs(result.get('retryable'), not ttl, result)
+        self.assertEqual(result.get('reason'), 'candidate_expired' if ttl else 'claim_expired', result)
+        self.assertNotEqual(result.get('status'), 'unknown', result)
+        frames = json.loads((Path(__file__).parent / 'fixtures' / 'recovery-expiry-results.json').read_text())
+        self.assertEqual(result, frames[('ttl' if ttl else 'claim') + ('_retry' if retry else '')])
+        if not ttl:
+            calls = []
+
+            def transport(_token, method, payload):
+                calls.append(method)
+                if method == 'sendMessage':
+                    return {'kind': 'response', 'response': {'ok': True, 'result': {'message_id': 892, 'chat': {'id': -100123456, 'type': 'supergroup'}, 'text': payload['text']}}}
+                return {'kind': 'unknown'}
+            with patch.object(self.recovery, 'time', SimpleNamespace(time=lambda: clock[0])):
+                fresh = self.claim({**item, 'revision': claimed['revision']})
+                self.assertTrue(fresh['ok'], fresh)
+                with patch.object(self.notifier, 'completion_telegram', side_effect=transport):
+                    sent = self.invoke(self.send_request(item, fresh))
+            self.assertEqual(sent.get('status'), 'sent', sent)
+            self.assertEqual(calls.count('sendMessage'), 1)
+
+    def test_claim_insert(self):
+        self._assert_framed_expiry(False, False)
+
+    def test_claim_retry_update(self):
+        self._assert_framed_expiry(False, True)
+
+    def test_ttl_insert(self):
+        self._assert_framed_expiry(True, False)
+
+    def test_ttl_retry_update(self):
+        self._assert_framed_expiry(True, True)
+
     def test_policy_loaded_projection_has_generation_and_does_not_enable(self):
         loaded = self.invoke({"action": "loaded", "version": "1.8.0"})
         self.assertTrue(loaded["ok"], loaded)

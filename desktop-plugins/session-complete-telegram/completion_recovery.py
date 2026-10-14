@@ -24,7 +24,11 @@ TTL_SECONDS = 30 * 60
 QUIET_SECONDS = 60
 MAX_ACTIVE = 256
 MAX_TOTAL = 1024
-CLAIM_SECONDS = 20
+# A claim is a pre-dispatch exclusion lease, not delivery authority. The real
+# renderer still runs four bounded native CLI calls (35s each) and two two-read
+# snapshots (60s each); leave room for the claim response as well. Every final
+# native gate and token CAS remains mandatory, and the original expiry caps it.
+CLAIM_SECONDS = 5 * 60
 MAX_PAGE_ITEMS = 16
 MAX_RESULT_BYTES = 24 * 1024
 
@@ -950,7 +954,8 @@ def begin_dispatch(state: str | Path, root: str | Path, candidate: object, route
                    epoch: str | None = None, final_row_id: int | None = None,
                    destination_binding: str | None = None, now: float | None = None) -> dict[str, Any]:
     """Atomically validate generation, quiet, source, claim and existing delivery ledger."""
-    now = time.time() if now is None else _number(now, name="now")
+    live_clock = now is None
+    now = time.time() if live_clock else _number(now, name="now")
     if (not isinstance(candidate, dict) or set(candidate) not in
             ({"candidate_id", "revision", "claim_token"},
              {"candidate_id", "revision", "claim_token", "generation"})):
@@ -1038,7 +1043,19 @@ def begin_dispatch(state: str | Path, root: str | Path, candidate: object, route
                               "generation": row["generation"], "bookkeeping_seq": row["bookkeeping_seq"]}
                 else:
                     delivery = c.execute("SELECT status FROM deliveries WHERE dedupe_key=?", (dedupe_key,)).fetchone()
-                    if delivery is None and row["proof_attempt"]:
+                    # Source reads and BEGIN IMMEDIATE can block. An entry-time
+                    # timestamp cannot authorize the dispatch boundary afterward.
+                    now = time.time() if live_clock else now
+                    if row["expires"] <= now:
+                        _terminalize(c, row, "expired", "ttl_expired", now)
+                        result = {"ok": False, "reason": "candidate_expired", "state": "expired",
+                                  "revision": revision + 1, "generation": row["generation"],
+                                  "bookkeeping_seq": row["bookkeeping_seq"]}
+                    elif row["claim_until"] is None or row["claim_until"] <= now:
+                        result = {"ok": False, "reason": "claim_expired", "state": row["state"],
+                                  "revision": revision, "generation": row["generation"],
+                                  "bookkeeping_seq": row["bookkeeping_seq"]}
+                    elif delivery is None and row["proof_attempt"]:
                         c.execute("UPDATE completion_candidates SET state='rejected',revision=revision+1,reason='delivery_interference',updated=? WHERE candidate_id=? AND revision=?",
                                   (now, ident, revision))
                         result = {"ok": False, "reason": "delivery_interference", "state": "rejected"}
@@ -1062,10 +1079,22 @@ def begin_dispatch(state: str | Path, root: str | Path, candidate: object, route
                         result = {"ok": True, "duplicate": True, "status": current, "candidate_state": terminal,
                                   "generation": row["generation"], "bookkeeping_seq": row["bookkeeping_seq"]}
                     if result is None:
+                        # Ledger I/O is still inside the transaction. If it
+                        # crossed a deadline, roll it back before granting CAS.
+                        now = time.time() if live_clock else now
+                        expired = row["expires"] <= now
+                        if expired or row["claim_until"] is None or row["claim_until"] <= now:
+                            # Rollback must succeed before claiming a proven
+                            # pre-dispatch result. A rollback exception remains
+                            # uncertain through the existing caller boundary.
+                            c.rollback()
+                            return {"ok": False, "phase": "pre_dispatch", "retryable": not expired,
+                                    "reason": "candidate_expired" if expired else "claim_expired"}
                         c.execute("""UPDATE completion_candidates SET state='dispatching',revision=revision+1,
                             reason='',claim_token=NULL,claim_until=NULL,dispatch_token=?,updated=?
-                            WHERE candidate_id=? AND revision=? AND state='claimed' AND claim_token=?""",
-                            (attempt, now, ident, revision, token))
+                            WHERE candidate_id=? AND revision=? AND state='claimed' AND claim_token=?
+                              AND expires>? AND claim_until>?""",
+                            (attempt, now, ident, revision, token, now, now))
                         if c.execute("SELECT changes()").fetchone()[0] != 1:
                             raise RecoveryError("recovery_dispatch_cas_failed")
                         latest = c.execute("SELECT revision,generation,bookkeeping_seq,quiet_at FROM completion_candidates WHERE candidate_id=?", (ident,)).fetchone()
