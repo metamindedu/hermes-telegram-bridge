@@ -1,10 +1,18 @@
 # Session Completion → Telegram
 
-## Modular settings (1.8.0 candidate)
+## Modular settings (public v1.8.0; 1.8.1 source candidate)
 
 Open the dedicated **Telegram Bridge** settings page while the Desktop plugin is enabled. The common service switch preserves individual choices; completion notices, input-needed notices, question answers, completion-card followups and one-time approvals have separate settings. Existing `replies_enabled` and `approvals_enabled` consent remains default-off and is never enabled by installation. Parent-notification switches and exact live authorization still apply. Writes use the captured public native settings API, one known boolean at a time, with readback and no retry after an unknown result. See [`../../docs/modular-settings.md`](../../docs/modular-settings.md) for defaults, revocation, all-profile scope and distinct activation gates.
 
-The current source uses 1.8.0 / `desktop-command-approval-v4`; the immutable public 1.7.0 release remains historical. Receiver heartbeats and saved settings are not proof of a Telegram roundtrip or command completion.
+The current source candidate uses package/helper/renderer 1.8.1 with `desktop-completion-recovery-v1`; the existing approval receiver remains compatible at 1.8.0 / `desktop-command-approval-v4`. The public 1.8.0 release pin is unchanged; this source candidate is not yet published. Receiver heartbeats and saved settings are not proof of a Telegram roundtrip or command completion.
+
+## Completion notification recovery (1.8.1 source candidate only)
+
+A candidate is recorded only from a fresh successful persisted Desktop completion—not from historical replay or a session-history scan. If Desktop reconnects within 30 minutes, the candidate can be rechecked only against the same already-live local connection/session and complete event replay. It does not start, resume, or create a profile/session. Unreadable or incomplete snapshots stay unverified; changed identity or new work cancels the candidate. The candidate table stores bounded metadata only, never the card text, title, preview, token, or destination.
+
+Durable recovery currently applies to the active local profile's live runtime. Fresh completions from other profiles retain the ordinary notification path rather than losing alerts; they do not gain durable recovery. A temporary disconnect or profile-view switch does not itself prove the recorded runtime changed. Ordinary question/attention cards keep their original classification and no-replay policy.
+
+The existing completion dedupe identity is shared with older send paths and multiple windows. Only a durable proof that the exact attempt failed before the Telegram request began allows another attempt; timeouts, helper/result loss, read/write/protocol failures, explicit rejections and any unknown result are not automatically replayed. A send accepted by Telegram remains sent even if the follow-up verification edit fails. Turning service/completion notifications off retires unexecuted candidates; it cannot cancel a write already dispatched. The settings page shows sender counters separately from receiver heartbeat. These behaviors are source-candidate documentation, not release or activation status.
 
 ## Optional replies (1.7.0 candidate; unreleased)
 
@@ -69,14 +77,13 @@ The bridge's live authorization checks remain mandatory, but it does not control
   Markdown-to-plain previews, literal code, redaction and reply authorization stay unchanged.
 - Explicitly detached services and satisfied non-completion readiness watches
   do not block. Unclassified running background commands conservatively block.
-- Desktop must remain open/connected through the quiet window. Closing the app,
-  losing the connection or a missing state contract fails closed (no notification).
-  Remote SSH/cloud profiles are outside this local installation's scope.
+- Desktop must be open for the fresh event and initial identity capture. The 1.8.1 source candidate can recheck a durably recorded completion after a temporary interruption only when the same local route/runtime remains live and unchanged before the original 30-minute TTL. Desktop/backend restarts, changed runtime/connection/epoch, missing metadata or incomplete replay are not recovered; no backend is started to inspect a candidate. Remote SSH/cloud profiles remain outside this local route boundary.
 - Delivery claims persist in
   `plugin-data/session-complete-telegram/notifications.sqlite3`.
-  A network timeout is recorded as `unknown` and is not automatically resent;
-  Telegram's send API has no idempotency key. Explicit rejected sends are also
-  retained for inspection rather than retried noisily.
+  A read/write/protocol timeout or otherwise uncertain send is recorded as unknown
+  and is never automatically resent; Telegram's send API has no idempotency key.
+  The source candidate retries only a durable exact-attempt proof of a pre-request
+  connection failure. Explicit API rejection is terminal.
 
 ## Disable / remove
 
@@ -88,20 +95,19 @@ for audit/deduplication. For migration from the historical two-package release, 
 
 - `desktop/plugin.js`: app lifecycle, scoped profile routing, quiet-state gate and native `cli.exec` helper.
 - `__init__.py` / `runtime.py`: fixed CLI registration and package-home validation.
-- `notifier.py`: read-only durable-state checks, SQLite at-most-once claims,
-  existing Telegram credentials, fixed-destination sender and shared action dispatcher.
+- `notifier.py` / `completion_recovery.py`: read-only durable-state checks, shared completion-v2 dedupe, bounded metadata-only recovery, revision/claim/send CAS and recovery-only proven-connect-failure classification.
 - `followup_bridge.py`: completion-card reply lifecycle and isolated followup inbox.
 - `approval_bridge.py`: separate command-approval inbox, full literal review, receiver lease, and one-shot tap claim; Telegram never answers the core queue directly.
-- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`, `approval.test.mjs`: Node behavior/race tests (Node built-in runner).
-- `test_notifier.py`, `test_reply_bridge.py`, `test_followup_bridge.py`, `test_approval_bridge.py`: Python bridge tests using the actual pinned Hermes redactor/approval contract and real PTB `Application.process_update`; Telegram transport is mocked only where a unit scenario requires it.
-- `test_native_install.py`, `test_registration.py`, `test_feature_gates.py`: real Hermes install/Doctor/PluginContext fake-home contracts, one-package registration, strict default-off settings, migration refusal and runtime home guards.
+- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`, `approval.test.mjs`, `settings.test.mjs`, `completion_recovery.test.mjs`: Node behavior/race tests (Node built-in runner).
+- `test_notifier.py`, `test_reply_bridge.py`, `test_followup_bridge.py`, `test_approval_bridge.py`, `test_completion_recovery.py`: Python bridge/recovery tests using the actual pinned Hermes schemas and native CLI/result frame; Telegram transport is mocked only where a unit scenario requires it.
+- `test_native_install.py`, `test_registration.py`, `test_feature_gates.py`, `test_settings_control.py`: real Hermes install/Doctor/PluginContext fake-home contracts, one-package registration, strict default-off settings, migration refusal, recovery cleanup and runtime home guards.
 
 From this folder, in the pinned-core environment described by `docs/operations.md`:
 
 ```
 node --check desktop/plugin.js
-node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs
-python -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install test_registration test_feature_gates -v
+node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs
+python -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review -v
 ```
 
 The test dependencies are declared in `requirements-test.txt`. Do not run the native installer against a production home as part of source tests.

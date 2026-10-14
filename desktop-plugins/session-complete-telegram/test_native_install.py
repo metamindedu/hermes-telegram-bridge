@@ -53,31 +53,29 @@ def _load_package(directory: Path, name: str):
 
 
 def _copy_candidate(destination: Path, version: str, *, include_legacy: bool = False) -> Path:
-    """Copy a package candidate into a disposable local Git-transport fixture."""
+    """Use immutable 1.8.0 bytes for skew tests and current source bytes for 1.8.1."""
     destination.mkdir(parents=True)
-    packages = [(REPO / "desktop-plugins" / FRONTEND_ID,
-                 Path("desktop-plugins") / FRONTEND_ID)]
+    if version == "1.8.0":
+        revision = "4874276f519f68fdbacb9767f70c5ed760b5c6fb"
+        paths = subprocess.check_output([
+            "git", "-C", str(REPO), "ls-tree", "-r", "--name-only", revision, "--",
+            "desktop-plugins/session-complete-telegram",
+        ]).decode("utf-8").splitlines()
+        if not paths:
+            raise AssertionError("immutable v1.8.0 fixture tree unavailable; fetch repository history")
+        for relative in paths:
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(subprocess.check_output(["git", "-C", str(REPO), "show", revision + ":" + relative]))
+        return destination
+    if version != "1.8.1":
+        raise ValueError("only the exact approval-v4 compatibility pin and current source are accepted")
+    source = REPO / "desktop-plugins" / FRONTEND_ID
+    target = destination / "desktop-plugins" / FRONTEND_ID
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     if include_legacy:
-        packages.append((REPO / "plugins" / INGRESS_ID, Path("plugins") / INGRESS_ID))
-    for source, relative in packages:
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        manifest = target / "plugin.yaml"
-        text = manifest.read_text(encoding="utf-8")
-        manifest.write_text(text.replace("version: '1.8.0'", f"version: '{version}'"), encoding="utf-8")
-        if version != "1.8.0":
-            for runtime_relative in (Path("desktop") / "plugin.js", Path("notifier.py"),
-                                     Path("approval_bridge.py")):
-                candidate = target / runtime_relative
-                if candidate.is_file():
-                    source_text = candidate.read_text(encoding="utf-8")
-                    source_text = source_text.replace("1.8.0", version)
-                    if version == "1.6.1":
-                        source_text = source_text.replace("desktop-command-approval-v4", "desktop-command-approval-v2")
-                    elif version == "1.6.0":
-                        source_text = source_text.replace("desktop-command-approval-v4", "desktop-command-approval-v1")
-                    candidate.write_text(source_text, encoding="utf-8")
+        raise ValueError("legacy fixture bytes must use _copy_synthetic_legacy_candidate")
     return destination
 
 
@@ -128,7 +126,7 @@ class NativeInstallTests(unittest.TestCase):
         self.ledger_files = {}
         self.candidates = {
             "old": _copy_synthetic_legacy_candidate(self.root / "candidate old two-package"),
-            "current": _copy_candidate(self.root / "candidate unified 1.8.0", "1.8.0"),
+            "current": _copy_candidate(self.root / "candidate unified 1.8.1", "1.8.1"),
         }
         self.revisions = {"old": "1" * 40, "current": "8" * 40}
 
@@ -305,7 +303,7 @@ class NativeInstallTests(unittest.TestCase):
         # A single native install updates only the primary package. The legacy
         # package, config selection, and all durable state remain untouched.
         self._install_package("current", frontend_path, force=True)
-        self.assertIn("version: '1.8.0'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertIn("version: '1.8.1'", (self.home / "plugins" / FRONTEND_ID / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertTrue((self.home / "plugins" / INGRESS_ID / "__init__.py").is_file())
         self._assert_preserved()
         self._assert_package_ids()
@@ -1051,12 +1049,15 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             status, _ = self._call_native(handler, parser, {"action": "settings_status"})
             self.assertTrue(status["ok"], status)
             self.assertTrue(status["read_only"])
-            self.assertEqual(status["version"], "1.8.0")
+            self.assertEqual(status["version"], "1.8.1")
             self.assertEqual(status["settings"]["service_enabled"], True)
             self.assertEqual(status["effective"], {
                 "completion_notifications": True, "attention_notifications": True,
                 "clarify_replies": False, "completion_followups": False, "approvals": False,
             })
+            self.assertEqual(inventory, sorted(str(path.relative_to(self.state)) for path in self.state.rglob("*")),
+                             "read-only settings status must not create state")
+            self.assertEqual(self.config.read_bytes(), config)
             changed, _ = self._call_native(handler, parser, {"action": "settings_set", "key": "service_enabled",
                 "value": False, "expected": True})
             self.assertTrue(changed["ok"], changed)
@@ -1070,8 +1071,17 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
         self.assertIn(b"service_enabled: false", self.config.read_bytes())
         self.assertIn(b"replies_enabled: false", self.config.read_bytes())
         self.expected_config_bytes = self.config.read_bytes()
-        self.assertEqual(inventory, sorted(str(path.relative_to(self.state)) for path in self.state.rglob("*")),
-                         "settings status/write must not create bridge ledgers or auxiliary state")
+        self.assertEqual(sorted([*inventory, "notifications.sqlite3"]),
+                         sorted(str(path.relative_to(self.state)) for path in self.state.rglob("*")),
+                         "public OFF creates only the bounded recovery-generation store")
+        import sqlite3
+        with contextlib.closing(sqlite3.connect(self.state / "notifications.sqlite3")) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(tables, {"completion_candidates", "completion_recovery_meta"})
+            self.assertEqual(db.execute("SELECT count(*) FROM completion_candidates").fetchone()[0], 0)
+            generation, enabled = db.execute("SELECT generation,enabled FROM completion_recovery_meta WHERE singleton=1").fetchone()
+            self.assertRegex(generation, r"^[0-9a-f]{32}$")
+            self.assertEqual(enabled, 0)
         self._assert_preserved()
 
     def test_native_loaded_handshake_hides_capability_on_helper_version_skew(self):
@@ -1086,7 +1096,8 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
             result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.1","profiles":[]})
         self.assertEqual(result["version"], "1.8.0")
-        self.assertEqual(result["capabilities"], [])
+        self.assertEqual(result["package_version"], "1.8.1")
+        self.assertEqual(result["capabilities"], ["desktop-completion-recovery-v1"])
 
     def test_new_helper_loaded_handshake_rejects_old_renderer_contract(self):
         _plugin, handler, parser = self._native_frontend_handler("phase2_new_handshake_fixture", candidate="current")
@@ -1097,9 +1108,55 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
             result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.1","profiles":[]})
         self.assertEqual(result["version"], "1.8.0")
-        self.assertEqual(result["capabilities"], ["desktop-command-approval-v4"])
+        self.assertEqual(result["package_version"], "1.8.1")
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v4", "desktop-completion-recovery-v1"])
         self.assertNotEqual((result["version"], "desktop-command-approval-v4"),
                             ("1.6.1", "desktop-command-approval-v2"))
+
+    def test_immutable_180_helper_and_renderer_keep_approval_v4_while_181_adds_recovery(self):
+        from hermes_cli.plugins import PluginContext, PluginManager
+        from hermes_cli.plugins_manifest import PluginManifest
+        pinned = _copy_candidate(self.root / "exact-public-180", "1.8.0")
+        old_source = pinned / "desktop-plugins" / FRONTEND_ID
+        old_home = self.root / "old-helper-home"
+        old_target = old_home / "plugins" / FRONTEND_ID
+        old_target.parent.mkdir(parents=True)
+        shutil.copytree(old_source, old_target)
+        old_home.mkdir(exist_ok=True)
+        (old_home / "config.yaml").write_text(
+            "plugins:\n  enabled: [session-complete-telegram]\n  entries:\n"
+            "    session-complete-telegram:\n      settings: {}\n", encoding="utf-8")
+        old_manager = PluginManager(scope_key=str(old_home))
+        old_manifest = PluginManifest(name=FRONTEND_ID, key=FRONTEND_ID, source="user", path=str(old_target))
+        old_context = PluginContext(old_manifest, old_manager)
+        with patch.dict(os.environ, {"HERMES_HOME": str(old_home), "LOCALAPPDATA": str(self.local_app_data)}):
+            old_package = _load_package(old_target, "immutable_180_approval_compat_fixture")
+            old_package.register(old_context)
+        old_registration = old_manager._cli_commands[COMMAND_ID]
+        old_parser = argparse.ArgumentParser()
+        old_registration["setup_fn"](old_parser)
+        raw = json.dumps({"action":"loaded", "version":"1.8.1", "profiles":[]}, separators=(",", ":")).encode()
+        token = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"), \
+             patch.dict(os.environ, {"HERMES_HOME": str(old_home), "LOCALAPPDATA": str(self.local_app_data)}), \
+             contextlib.redirect_stdout(io.StringIO()) as old_output:
+            old_registration["handler_fn"](old_parser.parse_args(["--request", token]))
+        old_reply = _frame_value(old_output.getvalue())
+        self.assertEqual(old_reply["version"], "1.8.0")
+        self.assertNotIn("package_version", old_reply)
+        self.assertEqual(old_reply["capabilities"], ["desktop-command-approval-v4"])
+        old_renderer = (old_source / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("VERSION = '1.8.0'", old_renderer)
+        self.assertIn("reply.version === VERSION", old_renderer)
+
+        _plugin, new_handler, new_parser = self._native_frontend_handler("current_181_compat_fixture", candidate="current")
+        with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
+            new_reply, _ = self._call_native(new_handler, new_parser, {"action":"loaded","version":"1.8.0","profiles":[]})
+        self.assertEqual(new_reply["version"], "1.8.0")
+        self.assertEqual(new_reply["package_version"], "1.8.1")
+        self.assertEqual(new_reply["capabilities"], ["desktop-command-approval-v4", "desktop-completion-recovery-v1"])
+        self.assertEqual((old_reply["version"], old_reply["capabilities"][0]),
+                         (new_reply["version"], new_reply["capabilities"][0]))
 
     def test_primary_runtime_location_and_home_guards_refuse_foreign_and_named_homes(self):
         self._install_package("current", "desktop-plugins/session-complete-telegram", force=False)
@@ -1183,7 +1240,8 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 "action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v2", "owner": "old-owner"
             }, root=self.home, state=self.state, native=True)
         self.assertEqual(result["version"], "1.8.0")
-        self.assertEqual(result["capabilities"], ["desktop-command-approval-v4"])
+        self.assertEqual(result["package_version"], "1.8.1")
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v4", "desktop-completion-recovery-v1"])
         self.assertNotEqual(result["version"], "1.6.1")
         self.assertEqual(old_helper, {"ok": False, "reason": "capability_mismatch"})
         self.assertEqual(bridge.VERSION, "1.8.0")
@@ -1225,9 +1283,9 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 approval_module = importlib.import_module(f"{module_name}.approval_bridge")
                 gateway_module = importlib.import_module(f"{module_name}.telegram_integration")
             package_modules.append((notifier_module, reply_module, followup_module, approval_module, gateway_module))
-            self.assertEqual(notifier_module.VERSION, "1.8.0")
+            self.assertEqual(notifier_module.VERSION, "1.8.1")
             self.assertEqual(approval_module.CAPABILITY, "desktop-command-approval-v4")
-            self.assertEqual(approval_module.VERSION, notifier_module.VERSION)
+            self.assertEqual(approval_module.VERSION, notifier_module.APPROVAL_COMPAT_VERSION)
             self.assertEqual(notifier_module.ROOT, home.resolve())
             self.assertTrue(all(module.__name__.startswith(module_name + ".") for module in package_modules[-1]))
             self.assertFalse((home / "plugin-data").exists(), "declaration/import must not access bridge state")

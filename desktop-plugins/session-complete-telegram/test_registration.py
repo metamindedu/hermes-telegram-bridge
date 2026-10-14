@@ -113,7 +113,7 @@ class CatalogRegistrationTests(unittest.TestCase):
         for key, default in expected.items():
             self.assertEqual(manifest['config_schema'][key]['type'], 'bool')
             self.assertIs(manifest['config_schema'][key]['default'], default)
-        self.assertEqual(manifest['version'], '1.8.0')
+        self.assertEqual(manifest['version'], '1.8.1')
 
     def test_recording_cli_owner_cannot_execute_even_at_valid_location(self):
         module = self.load(self.install(FRONTEND), 'frontend_recording')

@@ -10,7 +10,7 @@ registerHooks({resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context)
 }})
 const {CompletionMonitor, validateApprovalPair, validApprovalSnapshot, approvalFingerprint,
-  APPROVAL_CAPABILITY, VERSION} = await import('./desktop/plugin.js')
+  APPROVAL_CAPABILITY, APPROVAL_COMPAT_VERSION, VERSION} = await import('./desktop/plugin.js')
 
 function fixture() {
   const request={id:'srq-aabbcc112233',method:'approval',params:{session_id:'runtime-1',request_id:'a'.repeat(32),
@@ -100,7 +100,7 @@ test('approval registration freezes full fingerprints and binds queue not just s
   monitor.replyOwner=f.owner;monitor.approvalCapable=true
   const actions=[]
   monitor.helper=async request=>{actions.push(request);if(request.action==='approval_owner_heartbeat')
-    return {ok:true,feature_ready:true,version:VERSION,capability:APPROVAL_CAPABILITY}
+    return {ok:true,feature_ready:true,version:APPROVAL_COMPAT_VERSION,capability:APPROVAL_CAPABILITY}
     return {ok:true,new:true,id:'stored-card',status:'open'}}
   const record={sid:f.row.id,approval:null,askChecking:false}
   assert.equal(validateApprovalPair(f.request,f.pending,f.row.id),true)
@@ -145,7 +145,7 @@ async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimVali
   }
   monitor.helper=async request=>{
     helperCalls.push(request)
-    if(request.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:VERSION,capability:APPROVAL_CAPABILITY}
+    if(request.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:APPROVAL_COMPAT_VERSION,capability:APPROVAL_CAPABILITY}
     if(request.action==='approval_poll')return {ok:true,items:[item],terminal:[]}
     if(request.action==='approval_claim_valid'){
       if(runStoppedOnGate)monitor.stopped=true
@@ -228,8 +228,9 @@ test('approval_claim_valid is explicitly dispatched but remains a read-only non-
   await assert.rejects(monitor.helper(request),error=>error?.ambiguousWrite===false)
 })
 
-test('new pre-dispatch authorization contract requires 1.8.0 approval-v4 handshake', () => {
-  assert.equal(VERSION,'1.8.0')
+test('package version 1.8.1 keeps the 1.8.0 approval-v4 compatibility handshake', () => {
+  assert.equal(VERSION,'1.8.1')
+  assert.equal(APPROVAL_COMPAT_VERSION,'1.8.0')
   assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v4')
 })
 
@@ -301,7 +302,7 @@ test('unsafe approval registration reasons from checkAsk only reach notification
     monitor.approvalCapable=true;monitor.replyOwner='owner'
     monitor.helper=async payload=>{
       calls.push(payload)
-      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:VERSION,capability:APPROVAL_CAPABILITY}
+      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:APPROVAL_COMPAT_VERSION,capability:APPROVAL_CAPABILITY}
       if(payload.action==='approval_register')return {ok:false,reason}
       if(payload.action==='approval_notice')return {ok:true,status:'sent',notification_only:true}
       if(payload.action==='attention')return {ok:true,status:'sent'}
@@ -327,7 +328,7 @@ test('supported approval failures never fall into attention even without a typed
     const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}});monitor.approvalCapable=true;monitor.replyOwner=f.owner
     monitor.helper=async payload=>{
       calls.push(payload.action)
-      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:variant!=='receiver-unready',version:VERSION,capability:APPROVAL_CAPABILITY}
+      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:variant!=='receiver-unready',version:APPROVAL_COMPAT_VERSION,capability:APPROVAL_CAPABILITY}
       if(payload.action==='approval_register')return variant==='null' ? null : variant==='empty' ? {} : {ok:false,reason:123}
       if(payload.action==='approval_notice')return {ok:true,status:'sent',notification_only:true}
       if(payload.action==='attention')return {ok:true,status:'sent'}

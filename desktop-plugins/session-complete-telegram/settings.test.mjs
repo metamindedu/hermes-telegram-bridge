@@ -11,7 +11,8 @@ const {SETTINGS_ROWS,VERSION,validateSettingsStatus,readBridgeSettings,writeBrid
 function status(){return {ok:true,version:VERSION,read_only:true,selection_reason:'ready',
  settings:Object.fromEntries(SETTINGS_ROWS.map(r=>[r.key,true])),
  effective:Object.fromEntries(SETTINGS_ROWS.filter(r=>r.module).map(r=>[r.module,true])),
- receiver:{version:VERSION,heartbeat_ready:true}}}
+ receiver:{version:VERSION,heartbeat_ready:true},
+ sender:{version:VERSION,available:true,awaiting_recovery:0,uncertain_delivery:0,sent:0,expired:0}}}
 function fixture(){
  const state=status(),calls=[]
  const monitor={stopped:false,refreshRoutes:async force=>{assert.equal(force,true)},helper:async request=>{

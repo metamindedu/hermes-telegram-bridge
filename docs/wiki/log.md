@@ -62,3 +62,10 @@
 - Public v1.8.0 stays pinned to 4874276f519f68fdbacb9767f70c5ed760b5c6fb; later default-branch docs do not move that source/tag.
 - Synchronize the existing unmerged single-package catalog submission, all public install pins and five-module/default-off consent guidance. Upstream admission/search and live interaction remain separate gates.
 - Preserve historical 1.7.0 evidence and the SDK limitation; this publication metadata update does not modify package code, live settings, credentials, data or Gateway processes.
+
+## 2026-10-14 update | Bounded completion recovery source candidate
+
+- Recorded the separate unpublished 1.8.1 helper/renderer recovery capability while preserving the receiver's 1.8.0 approval-v4 compatibility value and exact pinned 1.8.0 fixture bytes.
+- The SDK route list is not connection evidence and routed RPC may cold-start a backend; recovery is restricted to the exact already-open SDK route, with complete replay and strict unknown-versus-absence handling.
+- Candidate metadata is content-free and bounded by active and total-row caps. Existing delivery states remain untouched; only a durable exact-attempt pre-request connection failure may retry. Sender status remains distinct from receiver heartbeat.
+- Source tests are isolated to fake homes and mocked Telegram transport. No production install, enablement, profile/config/auth/ledger write, live send, Gateway restart, commit, push, or publication occurred; independent Heavy review and release/activation gates remain pending.

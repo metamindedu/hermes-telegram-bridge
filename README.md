@@ -10,7 +10,8 @@ The public 1.8.0 release adds a dedicated **Telegram Bridge** settings page, a c
 
 ## What it does
 
-- Sends one completion card after a persisted Desktop response has settled and the local session has been quiet for 60 seconds. The card includes a redacted final-response preview capped at 1,200 characters. Keep Desktop open and connected through that interval.
+- Sends one completion card after a persisted Desktop response has settled and the local session has been quiet for 60 seconds. The card includes a redacted final-response preview capped at 1,200 characters. Keep Desktop open through that interval.
+- An unpublished source candidate adds bounded recovery only for a freshly recorded completion and the exact same still-live local runtime/connection, for up to 30 minutes. It never starts or resumes a profile session. Incomplete state checks remain pending; changed identity/new work cancels. An uncertain Telegram send is never replayed.
 - Sends input-needed notices for supported pending requests. Optional clarify answers and completion-card followups are controlled by `replies_enabled` (default `false`). A reply is accepted only for the matching live request and configured private-home owner.
 - Uses local routes only. Remote/foreign homes, unrelated chats, and replies not attached to a verified card are outside the supported path.
 
@@ -22,7 +23,7 @@ The plugin uses the existing Hermes SDK; it neither patches core nor adds a poll
 
 ## Data and trust
 
-The Desktop component reads persisted session titles, final replies, and clarify requests from local profiles under the same default Hermes home. Completion previews are redacted and bounded, but redaction is not an absolute guarantee. Sending a card transmits its contents to Telegram at `api.telegram.org`. Cards are copyable and forwardable (`protect_content: false`). Local SQLite ledgers retain delivery/deduplication records and some message-ID tombstones; temporary clarify content expires and is purged after its retention window. The plugin uses the user's own existing default-home Telegram setup; it does not copy, write, or rotate the bot token. No telemetry is sent to NewMetaW. Read [SECURITY.md](SECURITY.md) before installing.
+The Desktop component reads persisted session titles, final replies, and clarify requests from local profiles under the same default Hermes home. Completion previews are redacted and bounded, but redaction is not an absolute guarantee. Sending a card transmits its contents to Telegram at `api.telegram.org`. Cards are copyable and forwardable (`protect_content: false`). Local SQLite ledgers retain delivery/deduplication records and some message-ID tombstones; temporary clarify content expires and is purged after its retention window. The plugin uses the user's own existing default-home Telegram setup; it does not copy, write, or rotate the bot token. No telemetry is sent to NewMetaW. The source candidate's sender counters are separate from the receiver heartbeat and are not proof of Telegram delivery. Read [SECURITY.md](SECURITY.md) before installing.
 
 The current messages and question cards are primarily Korean; this release does not claim complete localization across languages.
 

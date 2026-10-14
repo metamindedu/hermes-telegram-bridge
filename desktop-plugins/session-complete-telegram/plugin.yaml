@@ -1,5 +1,5 @@
 name: session-complete-telegram
-version: '1.8.0'
+version: '1.8.1'
 requires_hermes: '>=0.21.5'
 description: Sends settled Desktop completion notices and optionally handles replies or one-time command approvals through your existing default-home Telegram setup.
 config_schema:

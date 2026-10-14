@@ -113,7 +113,12 @@ class NativeFeatureGateTests(unittest.TestCase):
             state = self.root / "plugin-data" / PLUGIN_ID
             loaded = notifier.dispatch_request({"action": "loaded", "version": "1.8.0"}, root=self.root, state=state)
             self.assertTrue(loaded["ok"])
-            self.assertEqual(loaded["capabilities"], ["desktop-command-approval-v4"])
+            self.assertEqual(loaded["capabilities"], [
+                "desktop-command-approval-v4", "desktop-completion-recovery-v1"])
+            self.assertEqual(set(loaded["completion_policy"]), {"ok", "enabled", "generation"})
+            self.assertTrue(loaded["completion_policy"]["ok"])
+            self.assertIs(loaded["completion_policy"]["enabled"], True)
+            self.assertRegex(loaded["completion_policy"]["generation"], r"^[0-9a-f]{32}$")
             denied = notifier.dispatch_request({"action": "approval_owner_heartbeat", "owner": "fixture"}, root=self.root, state=state)
             self.assertFalse(denied["ok"])
             self.assertEqual(denied["reason"], "approvals_disabled")
