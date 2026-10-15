@@ -20,7 +20,7 @@ import unicodedata
 from pathlib import Path
 
 VERSION = "1.8.0"
-CAPABILITY = "desktop-command-approval-v4"
+CAPABILITY = "desktop-command-approval-v5"
 PREFIX = "hda:"
 LEASE = 45
 MAX_TTL = 31_536_000
@@ -290,67 +290,163 @@ def _owner_live(c, owner, now):
 
 
 def _valid_queue_id(value):
-    return isinstance(value, str) and len(value) == 32 and all(ch in "0123456789abcdef" for ch in value)
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
 
 
-def supported_pair(request, pending, runtime_sid):
-    """Match only the pinned core command-gate queue shape; never generic approvals."""
+def _valid_request_id(value):
+    return isinstance(value, str) and re.fullmatch(r"srq-[0-9a-f]{12}", value) is not None
+
+
+def _native_json(value, depth=0):
+    if depth > 32:
+        return False
+    if value is None or type(value) in (str, bool, int):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_native_json(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _native_json(item, depth + 1)
+                   for key, item in value.items())
+    return False
+
+
+def _choice_shape(params):
+    choices = params.get("choices")
+    allowed = {"once", "session", "always", "deny"}
+    if (not isinstance(choices, list) or len(choices) < 2 or len(choices) > 4 or
+            any(not isinstance(choice, str) or choice not in allowed for choice in choices) or
+            len(set(choices)) != len(choices) or "once" not in choices or "deny" not in choices):
+        return False
+    for key in ("allow_permanent", "allow_session", "smart_denied"):
+        if key in params and type(params[key]) is not bool:
+            return False
+    if params.get("allow_session") is False and ({"session", "always"} & set(choices)):
+        return False
+    if params.get("allow_permanent") is False and "always" in choices:
+        return False
+    if params.get("allow_permanent") is True and params.get("allow_session") is False:
+        return False
+    if params.get("smart_denied") is True and (
+            params.get("allow_session") is not False or params.get("allow_permanent") is not False or
+            set(choices) != {"once", "deny"}):
+        return False
+    return True
+
+
+def _valid_native_approval(request, runtime_sid):
     if (not isinstance(request, dict) or request.get("method") != "approval" or
-            not isinstance(pending, dict) or not isinstance(runtime_sid, str) or not runtime_sid):
+            not _valid_request_id(request.get("id")) or not isinstance(runtime_sid, str) or not runtime_sid or
+            not _native_json(request)):
         return False
     params = request.get("params")
-    if not isinstance(params, dict):
+    if not isinstance(params, dict) or params.get("session_id") != runtime_sid:
+        return False
+    queue_id = params.get("request_id")
+    command, description = params.get("command"), params.get("description")
+    pattern_key, pattern_keys = params.get("pattern_key"), params.get("pattern_keys")
+    if (not _valid_queue_id(queue_id) or not isinstance(command, str) or not command or
+            not isinstance(description, str) or not description or
+            not isinstance(pattern_key, str) or not pattern_key or
+            not isinstance(pattern_keys, list) or not pattern_keys or
+            any(not isinstance(key, str) or not key for key in pattern_keys) or
+            len(set(pattern_keys)) != len(pattern_keys) or pattern_key not in pattern_keys or
+            (pattern_key.startswith("editor-") and not re.fullmatch(r"editor-[0-9a-f]{32}", pattern_key)) or
+            not _choice_shape(params)):
+        return False
+    if "session_key" in params and (not isinstance(params["session_key"], str) or not params["session_key"]):
         return False
     try:
-        if (not isinstance(request.get("id"), str) or
-                not __import__("re").fullmatch(r"srq-[0-9a-f]{4,32}", request["id"]) or
-                params.get("session_id") != runtime_sid or
-                params.get("request_id") != pending.get("request_id") or
-                not _valid_queue_id(pending.get("request_id"))):
-            return False
-        queue_keys = {"request_id", "command", "description", "pattern_key", "pattern_keys",
-                      "allow_permanent", "allow_session"}
-        if "smart_denied" in pending:
-            queue_keys.add("smart_denied")
-        if set(pending) != queue_keys:
-            return False
-        expected_params = queue_keys | {"session_id", "choices"}
-        if set(params) != expected_params:
-            return False
-        if "smart_denied" in params and params["smart_denied"] is not False:
-            return False
-        if pending.get("smart_denied") is True or params.get("allow_session") is not True:
-            return False
-        key = pending.get("pattern_key")
-        keys = pending.get("pattern_keys")
-        if (not isinstance(key, str) or not key or key.startswith(("plugin_rule:", "tirith:", "execute_code")) or
-                not isinstance(keys, list) or keys != [key] or
-                params.get("pattern_key") != key or params.get("pattern_keys") != keys):
-            return False
-        if type(pending.get("allow_permanent")) is not bool or params.get("allow_permanent") is not pending["allow_permanent"]:
-            return False
-        if params.get("allow_session") is not pending["allow_session"]:
-            return False
-        choices = params.get("choices")
-        expected_choices = ["once", "session", "always", "deny"] if pending["allow_permanent"] else ["once", "session", "deny"]
-        if choices != expected_choices:
-            return False
-        command, description = pending.get("command"), pending.get("description")
-        if (not isinstance(command, str) or not command or not isinstance(description, str) or not description or
-                params.get("command") != command or params.get("description") != description):
-            return False
-        # Use the real pinned producer, not a copied classifier or a stub. This
-        # excludes execute_code, plugin_rule, Tirith-only, and unknown queue entries.
-        from tools.approval_detection import DANGEROUS_PATTERNS, detect_dangerous_command
-        known = {description for _, description in DANGEROUS_PATTERNS}
-        if key not in known:
-            return False
-        detected = detect_dangerous_command(command)
-        if detected != (True, key, key):
-            return False
-        return True
-    except Exception:
+        return len(canonical(request).encode("utf-8", errors="strict")) <= 22_500
+    except (TypeError, ValueError, UnicodeError, RecursionError):
         return False
+
+
+def _valid_queue_row(pending):
+    if not isinstance(pending, dict) or not _native_json(pending):
+        return False
+    if not _valid_queue_id(pending.get("request_id")):
+        return False
+    key, keys = pending.get("pattern_key"), pending.get("pattern_keys")
+    if (not isinstance(pending.get("command"), str) or not pending["command"] or
+            not isinstance(pending.get("description"), str) or not pending["description"] or
+            not isinstance(key, str) or not key or not isinstance(keys, list) or not keys or
+            any(not isinstance(value, str) or not value for value in keys) or
+            len(set(keys)) != len(keys) or key not in keys or
+            (key.startswith("editor-") and not re.fullmatch(r"editor-[0-9a-f]{32}", key))):
+        return False
+    for flag in ("allow_permanent", "allow_session", "smart_denied"):
+        if flag in pending and type(pending[flag]) is not bool:
+            return False
+    if "choices" in pending and not _choice_shape(pending):
+        return False
+    return True
+
+
+def _queue_pair_matches(request, pending, runtime_sid):
+    if not _valid_native_approval(request, runtime_sid) or not _valid_queue_row(pending):
+        return False
+    params = request["params"]
+    if pending["request_id"] != params["request_id"]:
+        return False
+    if "choices" in pending and pending["choices"] != params["choices"]:
+        return False
+    request_fields = {key: value for key, value in params.items() if key not in {"session_id", "choices"}}
+    queue_fields = {key: value for key, value in pending.items() if key != "choices"}
+    try:
+        return canonical(request_fields) == canonical(queue_fields)
+    except (TypeError, ValueError, RecursionError):
+        return False
+
+
+def _request_queue_conflict(request, pending):
+    params = request.get("params") if isinstance(request, dict) else None
+    if not isinstance(params, dict) or pending.get("request_id") == params.get("request_id"):
+        return False
+    shared = ("command", "description", "pattern_key", "pattern_keys", "edit")
+    common = [key for key in shared if key in params and key in pending]
+    try:
+        return len(common) >= 2 and all(canonical(params[key]) == canonical(pending[key]) for key in common)
+    except (TypeError, ValueError, RecursionError):
+        return True
+
+
+def supported_pair(request, pending, runtime_sid, dispatch_mode="queue"):
+    """Validate the frozen native approval envelope for exactly one dispatch mode."""
+    if not _valid_native_approval(request, runtime_sid):
+        return False
+    if dispatch_mode == "queue":
+        return _queue_pair_matches(request, pending, runtime_sid)
+    if dispatch_mode == "server_request":
+        return pending == {"request_id": request["params"]["request_id"], "missing": True}
+    return False
+
+
+def classify_approval_authority(request, queue_snapshot, runtime_sid):
+    """Choose queue or server-request authority only from a healthy native queue snapshot."""
+    if (not _valid_native_approval(request, runtime_sid) or not isinstance(queue_snapshot, dict) or
+            set(queue_snapshot) != {"approvals"} or not isinstance(queue_snapshot["approvals"], list) or
+            len(queue_snapshot["approvals"]) > 100):
+        return None
+    rows = queue_snapshot["approvals"]
+    ids = []
+    for row in rows:
+        if not _valid_queue_row(row):
+            return None
+        ids.append(row["request_id"])
+    if len(set(ids)) != len(ids):
+        return None
+    request_id = request["params"]["request_id"]
+    matches = [row for row in rows if row["request_id"] == request_id]
+    if matches:
+        if len(matches) != 1 or not _queue_pair_matches(request, matches[0], runtime_sid):
+            return None
+        return {"dispatch_mode": "queue", "pending": matches[0]}
+    if any(_request_queue_conflict(request, row) for row in rows):
+        return None
+    return {"dispatch_mode": "server_request",
+            "pending": {"request_id": request_id, "missing": True}}
 
 
 def _redact_literal(value):
@@ -376,21 +472,73 @@ def _redact_literal(value):
     return cleaned
 
 
+def _review_native_value(value, *, sensitive=False, depth=0):
+    """Redact JSON values before serialization, while raw string context still exists."""
+    if depth > 32:
+        raise ValueError("review_native_payload_invalid")
+    if type(value) is str:
+        cleaned = _redact_literal(value)
+        # A standalone leaf has no surrounding key for the text redactor to inspect.
+        # Keep the field/key and its structure, but conservatively mask its scalar value.
+        return "***" if sensitive and value else cleaned
+    if value is None:
+        return None
+    if type(value) in (bool, int):
+        return "***" if sensitive else value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("review_native_payload_invalid")
+        return "***" if sensitive else value
+    if isinstance(value, list):
+        return [_review_native_value(item, sensitive=sensitive, depth=depth + 1)
+                for item in value]
+    if isinstance(value, dict):
+        from agent.redact import is_secret_field_name
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("review_native_payload_invalid")
+            # Keys are never silently rewritten: a key that itself looks secret or
+            # unsafe rejects the actionable review instead of risking a collision/drop.
+            if _redact_literal(key) != key or key in result:
+                raise ValueError("review_native_payload_invalid")
+            result[key] = _review_native_value(
+                item, sensitive=(sensitive or is_secret_field_name(key)), depth=depth + 1)
+        return result
+    raise ValueError("review_native_payload_invalid")
+
+
 def review_card(request, timeout_seconds):
+    if not isinstance(request, dict) or not isinstance(request.get("params"), dict):
+        raise ValueError("review_text_missing")
     params = request["params"]
-    command = _redact_literal(params["command"])
-    description = _redact_literal(params["description"])
+    command = _redact_literal(params.get("command"))
+    description = _redact_literal(params.get("description"))
     if not command.strip() or not description.strip():
         raise ValueError("review_text_missing")
     raw_command, raw_description = params["command"], params["description"]
     if raw_command != raw_description and command == description:
         raise ValueError("redaction_collision")
-    # No Markdown parsing, truncation, preview, or hidden command tail. Telegram
-    # receives the entire literal redacted command or no actionable card.
+    # The command stays literal and readable (including Python's full multiline body).
+    # Redact each raw leaf before JSON escapes its newlines. Credential-named mapping
+    # values are masked even when a standalone scalar has no key context for the text
+    # redactor; object keys and non-sensitive fields remain present and untruncated.
+    rendered_request = dict(request)
+    rendered_request["params"] = {
+        key: value for key, value in params.items() if key not in {"command", "description"}}
+    rendered_request = _review_native_value(rendered_request)
+    try:
+        supplied = json.dumps(rendered_request, ensure_ascii=False, sort_keys=True,
+                              indent=2, allow_nan=False)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError("review_native_payload_invalid") from exc
     text = ("⚠️ Hermes Desktop 명령 승인\n\n"
             f"설명\n{description}\n\n명령 (전체)\n$ {command}\n\n"
-            f"이 명령만 한 번 허용하거나 거부합니다. {int(timeout_seconds)}초 후 만료됩니다.\n"
-            "다른 명령·세션에 대한 권한은 저장되지 않습니다.")
+            "Desktop에서 제공한 나머지 native 요청 필드 (전체, JSON)\n"
+            f"{supplied}\n\n"
+            "이 카드는 요청에 포함된 검토 자료만 보여 줍니다. 요청에 없는 도구 인수나 파일 diff를 포함한다고 보장하지 않습니다.\n"
+            f"이 작업만 한 번 허용하거나 거부합니다. {int(timeout_seconds)}초 후 만료됩니다.\n"
+            "다른 작업·세션에 대한 권한은 저장되지 않습니다.")
     if len(text.encode("utf-16-le", errors="strict")) // 2 > MAX_REVIEW_UNITS:
         raise ValueError("review_card_too_large")
     return text
@@ -437,13 +585,19 @@ def _identity_base(descriptor):
 def validate_snapshot(descriptor, request, pending, route, row, epoch, owner):
     """Full client-side snapshot/route/session authority matrix, fail-closed."""
     required = ("owner", "connectionId", "profile", "targetProfile", "sid", "session_key",
-                "epoch", "request_id", "queue_id", "request_fingerprint", "pending_fingerprint")
+                "epoch", "request_id", "queue_id", "dispatch_mode",
+                "request_fingerprint", "pending_fingerprint")
     if not isinstance(descriptor, dict) or set(descriptor) != set(required):
         return False
     try:
-        if descriptor["owner"] != owner or not supported_pair(request, pending, descriptor["sid"]):
+        if descriptor["owner"] != owner or not supported_pair(
+                request, pending, descriptor["sid"], descriptor["dispatch_mode"]):
             return False
-        if request["id"] != descriptor["request_id"] or pending["request_id"] != descriptor["queue_id"]:
+        if (request["id"] != descriptor["request_id"] or
+                request["params"]["request_id"] != descriptor["queue_id"] or
+                ("session_key" in request["params"] and request["params"]["session_key"] != descriptor["session_key"])):
+            return False
+        if pending.get("request_id") != descriptor["queue_id"]:
             return False
         if _digest(request) != descriptor["request_fingerprint"] or _digest(pending) != descriptor["pending_fingerprint"]:
             return False
@@ -462,14 +616,17 @@ def validate_snapshot(descriptor, request, pending, route, row, epoch, owner):
 
 def _validate_descriptor(descriptor):
     required = {"owner", "connectionId", "profile", "targetProfile", "sid", "session_key",
-                "epoch", "request_id", "queue_id", "request_fingerprint", "pending_fingerprint"}
+                "epoch", "request_id", "queue_id", "dispatch_mode",
+                "request_fingerprint", "pending_fingerprint"}
     if not isinstance(descriptor, dict) or set(descriptor) != required:
         return False
     if any(not isinstance(descriptor.get(key), str) or not descriptor[key] for key in required):
         return False
+    if descriptor["dispatch_mode"] not in {"queue", "server_request"}:
+        return False
     if len(canonical(descriptor).encode("utf-8")) > 12000:
         return False
-    return (descriptor["request_id"].startswith("srq-") and _valid_queue_id(descriptor["queue_id"]) and
+    return (_valid_request_id(descriptor["request_id"]) and _valid_queue_id(descriptor["queue_id"]) and
             all(len(descriptor[key]) == 64 and all(c in "0123456789abcdef" for c in descriptor[key])
                 for key in ("request_fingerprint", "pending_fingerprint")))
 
@@ -1012,17 +1169,18 @@ def approval_notice(req, notifier, *, root=ROOT, state=STATE, api=None):
     request = req.get("request")
     pending = req.get("pending")
     descriptor = req.get("descriptor")
-    if not supported_pair(request, pending, (request or {}).get("params", {}).get("session_id")):
+    if not supported_pair(request, pending, (request or {}).get("params", {}).get("session_id"),
+                          (descriptor or {}).get("dispatch_mode")):
         return {"ok": False, "reason": "not_supported"}
     if (not _validate_descriptor(descriptor) or descriptor.get("request_id") != request.get("id") or
-            descriptor.get("queue_id") != pending.get("request_id") or
+            descriptor.get("queue_id") != request.get("params", {}).get("request_id") or
             descriptor.get("request_fingerprint") != _digest(request) or
             descriptor.get("pending_fingerprint") != _digest(pending)):
         return {"ok": False, "reason": "invalid_descriptor"}
     kind = req.get("reason")
     safe_reasons = {"review_text_missing", "invalid_review_text", "redaction_not_stable", "redaction_omission", "redaction_collision",
                     "review_unicode_ambiguous", "review_control_character", "review_card_too_large",
-                    "review_unavailable", "approval_result_too_large", "timeout_unavailable", "receiver_unavailable", "owner_unavailable"}
+                    "review_unavailable", "review_native_payload_invalid", "approval_result_too_large", "timeout_unavailable", "receiver_unavailable", "owner_unavailable"}
     if kind not in safe_reasons:
         kind = "review_unavailable"
     profile = descriptor["targetProfile"]
@@ -1228,6 +1386,6 @@ def wire(application, notifier, bot, chat, topic, boot, *, approvals_enabled=lam
     return True
 
 
-__all__ = ["VERSION", "CAPABILITY", "ALLOWED_CHOICES", "supported_pair", "validate_snapshot",
+__all__ = ["VERSION", "CAPABILITY", "ALLOWED_CHOICES", "supported_pair", "classify_approval_authority", "validate_snapshot",
            "bind_receiver", "receiver_info", "owner_heartbeat", "register", "publish", "lookup_message",
            "choose", "poll", "settle", "flush", "helper", "wire"]

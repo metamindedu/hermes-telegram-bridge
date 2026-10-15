@@ -828,8 +828,8 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                     session={'id':'runtime-native','session_key':'durable-native','status':'waiting'}
                     descriptor={'owner':owner,'connectionId':route['connectionId'],'profile':'default','targetProfile':'default',
                         'sid':session['id'],'session_key':session['session_key'],'epoch':'native-epoch',
-                        'request_id':request['id'],'queue_id':queue_id,'request_fingerprint':bridge._digest(request),
-                        'pending_fingerprint':bridge._digest(pending)}
+                        'request_id':request['id'],'queue_id':queue_id,'dispatch_mode':'queue',
+                        'request_fingerprint':bridge._digest(request),'pending_fingerprint':bridge._digest(pending)}
                     heartbeat,_=self._call_native(handler,parser,{'action':'approval_owner_heartbeat','capability':bridge.CAPABILITY,'owner':owner})
                     registration,_=self._call_native(handler,parser,{'action':'approval_register','capability':bridge.CAPABILITY,
                         'owner':owner,'descriptor':descriptor,'request':request,'pending':pending,'route':route,'session':session,'epoch':'native-epoch'})
@@ -890,7 +890,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
         session = {"id":"runtime-native", "session_key":"durable-native", "status":"waiting"}
         descriptor = {"owner":owner, "connectionId":route["connectionId"], "profile":route["profile"],
             "targetProfile":route["targetProfile"], "sid":session["id"], "session_key":session["session_key"],
-            "epoch":"native-epoch", "request_id":request["id"], "queue_id":queue_id,
+            "epoch":"native-epoch", "request_id":request["id"], "queue_id":queue_id, "dispatch_mode":"queue",
             "request_fingerprint":bridge._digest(request), "pending_fingerprint":bridge._digest(pending)}
         calls=[]
         def telegram_stub(token, method, payload):
@@ -1109,8 +1109,8 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.1","profiles":[]})
         self.assertEqual(result["version"], "1.8.0")
         self.assertEqual(result["package_version"], "1.8.1")
-        self.assertEqual(result["capabilities"], ["desktop-command-approval-v4", "desktop-completion-recovery-v1"])
-        self.assertNotEqual((result["version"], "desktop-command-approval-v4"),
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v5", "desktop-completion-recovery-v1"])
+        self.assertNotEqual((result["version"], "desktop-command-approval-v5"),
                             ("1.6.1", "desktop-command-approval-v2"))
 
     def test_immutable_180_helper_and_renderer_keep_approval_v4_while_181_adds_recovery(self):
@@ -1154,9 +1154,10 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             new_reply, _ = self._call_native(new_handler, new_parser, {"action":"loaded","version":"1.8.0","profiles":[]})
         self.assertEqual(new_reply["version"], "1.8.0")
         self.assertEqual(new_reply["package_version"], "1.8.1")
-        self.assertEqual(new_reply["capabilities"], ["desktop-command-approval-v4", "desktop-completion-recovery-v1"])
-        self.assertEqual((old_reply["version"], old_reply["capabilities"][0]),
-                         (new_reply["version"], new_reply["capabilities"][0]))
+        self.assertEqual(new_reply["capabilities"], ["desktop-command-approval-v5", "desktop-completion-recovery-v1"])
+        self.assertEqual(old_reply["version"], new_reply["version"])
+        self.assertEqual(old_reply["capabilities"], ["desktop-command-approval-v4"])
+        self.assertNotEqual(old_reply["capabilities"][0], new_reply["capabilities"][0])
 
     def test_primary_runtime_location_and_home_guards_refuse_foreign_and_named_homes(self):
         self._install_package("current", "desktop-plugins/session-complete-telegram", force=False)
@@ -1220,7 +1221,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 {"action": "reply_poll", "owner": "fixture", "observations": [], "unverified": []})[0],
                 {"ok": False, "feature_ready": False, "reason": "legacy_package_migration_required"})
             self.assertEqual(self._call_native(registration["handler_fn"], parser,
-                {"action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v4",
+                {"action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v5",
                  "owner": "fixture"})[0],
                 {"ok": False, "feature_ready": False, "reason": "legacy_package_migration_required"})
         self.assertEqual(manager.get_platform_handler_factories("telegram"), [(factory, FRONTEND_ID)])
@@ -1241,11 +1242,11 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             }, root=self.home, state=self.state, native=True)
         self.assertEqual(result["version"], "1.8.0")
         self.assertEqual(result["package_version"], "1.8.1")
-        self.assertEqual(result["capabilities"], ["desktop-command-approval-v4", "desktop-completion-recovery-v1"])
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v5", "desktop-completion-recovery-v1"])
         self.assertNotEqual(result["version"], "1.6.1")
         self.assertEqual(old_helper, {"ok": False, "reason": "capability_mismatch"})
         self.assertEqual(bridge.VERSION, "1.8.0")
-        self.assertEqual(bridge.CAPABILITY, "desktop-command-approval-v4")
+        self.assertEqual(bridge.CAPABILITY, "desktop-command-approval-v5")
     def test_legacy_compatibility_package_is_deprecated_and_registers_no_factory(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
@@ -1284,7 +1285,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 gateway_module = importlib.import_module(f"{module_name}.telegram_integration")
             package_modules.append((notifier_module, reply_module, followup_module, approval_module, gateway_module))
             self.assertEqual(notifier_module.VERSION, "1.8.1")
-            self.assertEqual(approval_module.CAPABILITY, "desktop-command-approval-v4")
+            self.assertEqual(approval_module.CAPABILITY, "desktop-command-approval-v5")
             self.assertEqual(approval_module.VERSION, notifier_module.APPROVAL_COMPAT_VERSION)
             self.assertEqual(notifier_module.ROOT, home.resolve())
             self.assertTrue(all(module.__name__.startswith(module_name + ".") for module in package_modules[-1]))

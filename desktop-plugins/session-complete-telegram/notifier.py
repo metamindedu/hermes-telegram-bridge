@@ -24,7 +24,7 @@ from pathlib import Path
 
 VERSION = "1.8.1"
 APPROVAL_COMPAT_VERSION = "1.8.0"
-APPROVAL_CAPABILITY = "desktop-command-approval-v4"
+APPROVAL_CAPABILITY = "desktop-command-approval-v5"
 RECOVERY_CAPABILITY = "desktop-completion-recovery-v1"
 
 

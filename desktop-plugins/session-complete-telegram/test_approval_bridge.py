@@ -1,11 +1,16 @@
 """Security contract tests for the separate native-command approval inbox."""
 from __future__ import annotations
-import asyncio, copy, json, time, unittest
+import asyncio, copy, importlib, importlib.util, json, os, subprocess, time, unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import approval_bridge as b
 import notifier
 import test_support
+
+CORE_GENERATION_REFS={
+    'legacy':'74306c1d1b080837744faca3e371267dd09dda4b',
+    'current':'297552a9d646119871391d202509822cd86330df',
+}
 
 class ApprovalBridgeTests(unittest.TestCase):
     def setUp(self):
@@ -26,14 +31,59 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.net=patch.object(notifier,'telegram',side_effect=self.telegram);self.net.start()
         self.addCleanup(self.net.stop);self.addCleanup(self.cred.stop)
 
+    def _assert_core_generation(self):
+        import agent.redact as redact
+
+        configured_root=os.environ.get('HERMES_CORE_ROOT')
+        root=Path(configured_root).resolve() if configured_root else Path(redact.__file__).resolve().parents[1]
+        self.assertTrue(root.is_dir(),f'bound Hermes core root is unavailable: {root}')
+        modules=[redact]
+        for name in ('tools.approval','tui_gateway.server','tui_gateway.server_requests'):
+            modules.append(importlib.import_module(name))
+        for module in modules:
+            origin=Path(module.__file__).resolve()
+            self.assertTrue(origin.is_relative_to(root),
+                f'{module.__name__} escaped the declared Hermes core: {origin} not under {root}')
+
+        editor_path=root/'gateway'/'session_local_editor.py'
+        inferred='current' if editor_path.is_file() else 'legacy'
+        generation=os.environ.get('HERMES_CORE_GENERATION',inferred)
+        self.assertIn(generation,CORE_GENERATION_REFS)
+        self.assertEqual(generation,inferred,
+            f'declared generation {generation} contradicts actual editor producer availability at {editor_path}')
+        expected_ref=CORE_GENERATION_REFS[generation]
+        declared_ref=os.environ.get('HERMES_CORE_REF')
+        if declared_ref is not None:
+            self.assertEqual(declared_ref,expected_ref)
+        if (root/'.git').exists():
+            revision=subprocess.run(['git','-C',str(root),'rev-parse','HEAD'],check=True,
+                capture_output=True,text=True).stdout.strip()
+            if declared_ref is not None:
+                self.assertEqual(revision,declared_ref,'checked-out core revision differs from its declared generation')
+        elif os.environ.get('CI','').lower()=='true':
+            self.fail('CI core checkout must expose Git metadata for immutable-ref verification')
+
+        if generation=='current':
+            self.assertTrue(editor_path.is_file())
+            editor=importlib.import_module('gateway.session_local_editor')
+            self.assertEqual(Path(editor.__file__).resolve(),editor_path.resolve())
+        else:
+            self.assertFalse(editor_path.exists(),'legacy core unexpectedly contains the editor producer')
+            self.assertIsNone(importlib.util.find_spec('gateway.session_local_editor'),
+                'a newer namespace module leaked into the exact legacy-core test')
+        return generation,root
+
     @staticmethod
     def pair(command='rm -rf approval-fixture',description='recursive delete',key='recursive delete',
              queue_id='a'*32,srq='srq-aabbcc112233',method='approval',sid='runtime-fixture',allow=True,smart=None):
         pending={'request_id':queue_id,'command':command,'description':description,'pattern_key':key,
-                 'pattern_keys':[key],'allow_permanent':allow,'allow_session':True}
+                 'pattern_keys':[key],'allow_permanent':False if smart is True else allow,
+                 'allow_session':False if smart is True else True}
         params={'session_id':sid,'request_id':queue_id,'command':command,'description':description,
-                'pattern_key':key,'pattern_keys':[key],'allow_permanent':allow,'allow_session':True,
-                'choices':['once','session','always','deny'] if allow else ['once','session','deny']}
+                'pattern_key':key,'pattern_keys':[key],'allow_permanent':False if smart is True else allow,
+                'allow_session':False if smart is True else True,
+                'choices':['once','deny'] if smart is True else
+                    (['once','session','always','deny'] if allow else ['once','session','deny'])}
         if smart is not None: pending['smart_denied']=params['smart_denied']=smart
         return {'id':srq,'method':method,'params':params},pending
 
@@ -42,7 +92,7 @@ class ApprovalBridgeTests(unittest.TestCase):
         return {'owner':owner or self.owner,'connectionId':route['connectionId'],'profile':route['profile'],
             'targetProfile':route['targetProfile'],'sid':session['id'],'session_key':session['session_key'],
             'epoch':str(epoch),'request_id':request['id'],'queue_id':pending['request_id'],
-            'request_fingerprint':b._digest(request),'pending_fingerprint':b._digest(pending)}
+            'dispatch_mode':'queue','request_fingerprint':b._digest(request),'pending_fingerprint':b._digest(pending)}
 
     def telegram(self,token,method,payload):
         self.calls.append((method,copy.deepcopy(payload)))
@@ -89,14 +139,48 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.now=time.time()+.01
         return result
 
-    def test_only_real_pinned_command_gate_pair_is_supported(self):
+    def test_native_approval_pair_uses_live_request_and_queue_not_detector_membership(self):
         from tools.approval_detection import detect_dangerous_command
         self.assertEqual(detect_dangerous_command('rm -rf approval-fixture'),(True,'recursive delete','recursive delete'))
         self.assertTrue(b.supported_pair(self.request,self.pending,self.session['id']))
-        for key in ('plugin_rule:rule','execute_code','tirith:secret'):
-            ask,pending=self.pair(key=key);self.assertFalse(b.supported_pair(ask,pending,self.session['id']))
+        for key in ('plugin_rule:rule','execute_code','tirith:secret','future_native_key'):
+            ask,pending=self.pair(key=key)
+            self.assertTrue(b.supported_pair(ask,pending,self.session['id']),key)
         ask,pending=self.pair(method='sudo');self.assertFalse(b.supported_pair(ask,pending,self.session['id']))
         ask=copy.deepcopy(self.request);ask['params']['extra']='x';self.assertFalse(b.supported_pair(ask,self.pending,self.session['id']))
+
+    def test_server_request_authority_requires_valid_approval_and_exact_empty_queue_marker(self):
+        marker={'request_id':self.request['params']['request_id'],'missing':True}
+        self.assertTrue(b.supported_pair(self.request,marker,self.session['id'],'server_request'))
+        for request in [
+            {**self.request,'id':'srq-short'},
+            {**self.request,'method':'sudo'},
+            {**self.request,'params':{**self.request['params'],'choices':['once','deny','deny']}},
+            {**self.request,'params':{**self.request['params'],'allow_session':False}},
+        ]:
+            self.assertFalse(b.supported_pair(request,marker,self.session['id'],'server_request'))
+        self.assertFalse(b.supported_pair(self.request,{},self.session['id'],'server_request'))
+
+    def test_native_queue_snapshot_classifier_distinguishes_absence_from_malformed_and_conflict(self):
+        queue=b.classify_approval_authority(self.request,{'approvals':[self.pending]},self.session['id'])
+        self.assertEqual(queue,{'dispatch_mode':'queue','pending':self.pending})
+        absent=b.classify_approval_authority(self.request,{'approvals':[]},self.session['id'])
+        self.assertEqual(absent,{'dispatch_mode':'server_request',
+            'pending':{'request_id':self.request['params']['request_id'],'missing':True}})
+        for snapshot in (None,{},False,{'approvals':'bad'}, {'approvals':[{}]},
+                         {'approvals':[self.pending,self.pending]},
+                         {'approvals':[dict(self.pending,command='changed')]},
+                         {'approvals':[dict(self.pending,request_id='b'*32)]}):
+            self.assertIsNone(b.classify_approval_authority(self.request,snapshot,self.session['id']),repr(snapshot))
+
+    def test_type_scope_choice_contradictions_and_uuid_shape_fail_closed(self):
+        mutations=[]
+        ask,pending=self.pair(allow=False);self.assertTrue(b.supported_pair(ask,pending,self.session['id']))
+        ask['params']['choices']=['once','always','deny'];pending['choices']=ask['params']['choices'];mutations.append((ask,pending))
+        ask,pending=self.pair(smart=True);self.assertTrue(b.supported_pair(ask,pending,self.session['id']))
+        ask['params']['choices']=['once','session','deny'];pending['choices']=ask['params']['choices'];mutations.append((ask,pending))
+        ask,pending=self.pair();pending['request_id']='not-a-native-uuid';ask['params']['request_id']=pending['request_id'];mutations.append((ask,pending))
+        for ask,pending in mutations:self.assertFalse(b.supported_pair(ask,pending,self.session['id']))
 
     def test_queue_and_open_request_frozen_mismatches_fail_closed(self):
         mutations=[]
@@ -114,7 +198,7 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.assertTrue(b.validate_snapshot(self.descriptor,self.request,self.pending,self.route,self.session,'epoch-fixture',self.owner))
         fields={'owner':'other','connectionId':'other','profile':'other','targetProfile':'other','sid':'other',
                 'session_key':'other','epoch':'other','request_id':'srq-ffeeddccbbaa','queue_id':'f'*32,
-                'request_fingerprint':'0'*64,'pending_fingerprint':'1'*64}
+                'dispatch_mode':'changed','request_fingerprint':'0'*64,'pending_fingerprint':'1'*64}
         for key,value in fields.items():
             d=dict(self.descriptor);d[key]=value
             self.assertFalse(b.validate_snapshot(d,self.request,self.pending,self.route,self.session,'epoch-fixture',self.owner),key)
@@ -150,6 +234,112 @@ class ApprovalBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'review_unicode_ambiguous'):b.review_card(ask,300)
         ask,_=self.pair(command='rm -rf x\x01')
         with self.assertRaisesRegex(ValueError,'review_control_character'):b.review_card(ask,300)
+
+    def test_native_review_renders_full_supplied_params_and_does_not_invent_missing_arguments(self):
+        request,pending=self.pair(key='protected_instruction_file',command='<write to AGENTS.md>',
+            description='Protected instruction file write')
+        request['params'].update({'allow_permanent':False,'allow_session':False,'choices':['once','deny'],
+            'future_native_field':{'nested':['complete','payload']}})
+        pending.update({'allow_permanent':False,'allow_session':False})
+        text=b.review_card(request,300)
+        self.assertIn('future_native_field',text)
+        self.assertIn('complete',text)
+        self.assertIn('Protected instruction file write',text)
+        self.assertIn('AGENTS.md',text)
+        self.assertIn('요청에 없는',text)
+        self.assertNotIn('patch contents',text.lower())
+
+        editor,_=self.pair(key='editor-'+'e'*32,command='Edit src/file.py',description='Approve proposed file change')
+        editor['params'].update({'allow_permanent':False,'allow_session':False,'choices':['once','deny'],
+            'edit':{'path':'src/file.py','old_text':'before\\n','new_text':'after\\n',
+                    'diff':'-before\\n+after'}})
+        rendered=b.review_card(editor,300)
+        self.assertIn('src/file.py',rendered)
+        self.assertIn('-before',rendered)
+        self.assertIn('+after',rendered)
+
+        python,_=self.pair(key='execute_code',command="execute_code <<'PY'\\n"+'x'*5000+'\\nPY',
+            description='Full Python script')
+        with self.assertRaisesRegex(ValueError,'review_card_too_large'):
+            b.review_card(python,300)
+
+    def test_structured_native_review_redacts_raw_leaves_before_json_serialization(self):
+        self._assert_core_generation()
+        secrets_to_hide=[
+            'synthetic-editor-old-password-739102',
+            'synthetic-editor-old-api-key-739102',
+            'synthetic-editor-new-password-739102',
+            'synthetic-editor-new-access-token-739102',
+            'synthetic-editor-standalone-password-739102',
+            'synthetic-editor-nested-api-key-739102',
+            'synthetic-editor-array-secret-739102',
+        ]
+        request,_=self.pair(command='Edit synthetic config',description='Synthetic editor review',
+                            key='editor-'+'b'*32,allow=False)
+        request['params'].update({'allow_session':False,'choices':['once','deny']})
+        request['params']['edit']={
+            'old_text':'old config line\nsecond old line',
+            'new_text':'new config line\nsecond new line',
+            'arguments':{
+                'password':secrets_to_hide[4],
+                'nested':[{'api_key':secrets_to_hide[5],
+                           'metadata':{'event':'synthetic-event-metadata-visible-739102'}},
+                          [{'secret':secrets_to_hide[6]}]],
+                'metadata':{'note':'preserve this native metadata','attempt':3},
+            },
+        }
+        review=b.review_card(request,300)
+        for value in secrets_to_hide:
+            self.assertNotIn(value,review)
+        for field in ('old_text','new_text','arguments','nested','password','api_key','secret'):
+            self.assertIn(field,review)
+        self.assertIn('"password": "***"',review)
+        self.assertIn('"api_key": "***"',review)
+        self.assertIn('"secret": "***"',review)
+        self.assertIn('synthetic-event-metadata-visible-739102',review)
+        self.assertIn('preserve this native metadata',review)
+
+        assignment,_=self.pair(command='Edit synthetic config',description='Synthetic editor assignment review',
+                               key='editor-'+'c'*32,allow=False)
+        assignment['params'].update({'allow_session':False,'choices':['once','deny'],
+            'edit':{'old_text':f'password: {secrets_to_hide[0]}\nAPI_KEY={secrets_to_hide[1]}',
+                    'new_text':f'password: {secrets_to_hide[2]}\nACCESS_TOKEN={secrets_to_hide[3]}'}})
+        with self.assertRaisesRegex(ValueError,'redaction_(?:not_stable|omission)'):
+            b.review_card(assignment,300)
+
+    def test_structured_native_review_rejects_unsafe_or_redacted_object_keys(self):
+        self._assert_core_generation()
+        unsafe_keys=('unsafe\u202e-key','e\u0301', 'sk-'+('A1b2C3d4'*3))
+        for index,key in enumerate(unsafe_keys):
+            with self.subTest(key_index=index):
+                request,_=self.pair(command='Edit synthetic config',description='Synthetic key validation',
+                                    key='editor-'+format(index+1,'032x'),allow=False)
+                request['params'].update({'allow_session':False,'choices':['once','deny'],
+                    'edit':{'arguments':{key:'preserve-or-reject-without-rewriting'}}})
+                with self.assertRaises(ValueError):
+                    b.review_card(request,300)
+
+    def test_server_request_card_registration_freezes_mode_and_terminal_unknown_never_replays(self):
+        marker={'request_id':self.request['params']['request_id'],'missing':True}
+        self.descriptor=self.descriptor_for(self.request,marker)
+        self.descriptor['dispatch_mode']='server_request'
+        self.descriptor['pending_fingerprint']=b._digest(marker)
+        result=self.register(pending=marker,descriptor=self.descriptor)
+        self.assertTrue(result.get('ok'),result)
+        row=self.row(result['id'])
+        self.assertEqual(json.loads(row['descriptor'])['dispatch_mode'],'server_request')
+        tap_now=max(self.now+.1,time.time()+.1)
+        tapped=b.choose(row['token'],'deny',self.identity(result['id'],event='server-request-deny'),
+            state=self.state,now=tap_now)
+        self.assertTrue(tapped.get('ok'),tapped)
+        observation=self.observe(result['id'])
+        polled=b.poll(self.owner,[observation],state=self.state,now=tap_now+.1)
+        self.assertEqual(polled['items'][0]['descriptor']['dispatch_mode'],'server_request')
+        item=polled['items'][0]
+        self.assertTrue(b.settle(result['id'],item['claim'],'unknown',state=self.state,now=tap_now+.2)['ok'])
+        self.assertEqual(self.row(result['id'])['status'],'unknown')
+        self.assertIsNone(self.row(result['id'])['review_text'])
+        self.assertEqual(b.poll(self.owner,[observation],state=self.state,now=self.now+.4)['items'],[])
 
     def test_registration_sends_once_protect_content_false_and_opaque_buttons(self):
         result=self.registered();row=self.row(result['id'])
@@ -362,6 +552,262 @@ class ApprovalBridgeTests(unittest.TestCase):
         finally:
             with approval._lock:approval._gateway_queues.pop(session,None)
 
+    def _run_real_native_approval_producer(self, label, producer, *, approval_mode='on', smart_denied=False,
+                                           mcp=False, answer_method='approval.respond', isolate_tirith=False,
+                                           expect_registration=True):
+        import uuid, threading
+        from contextlib import ExitStack
+        from tools import approval as native_approval, approval_context
+        from tui_gateway import server, server_requests
+
+        sid='native-approval-'+uuid.uuid4().hex[:12]
+        session_key='native-session-key-'+uuid.uuid4().hex[:12]
+        server._sessions[sid]={'session_key':session_key}
+        notified=threading.Event();captured=[];outcome=[];thread_error=[]
+        def notify(data):
+            server._emit_approval_request(sid,data)
+            captured.extend(server_requests.open_requests(sid))
+            notified.set()
+        native_approval._gateway_notify_cbs[session_key]=notify
+        def invoke():
+            try:outcome.append(producer())
+            except BaseException as exc:thread_error.append(exc)
+
+        thread=None
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict('os.environ',{'USERPROFILE':str(self.root),'HOME':str(self.root)}))
+                stack.enter_context(patch.object(server_requests,'_write',lambda _frame:None))
+                stack.enter_context(patch.object(server_requests,'_emit',lambda *_args,**_kwargs:None))
+                stack.enter_context(patch.object(native_approval,'_presence',return_value=(None,False,True,False)))
+                stack.enter_context(patch.object(native_approval,'get_current_session_key',return_value=session_key))
+                stack.enter_context(patch.object(approval_context,'get_current_session_key',return_value=session_key))
+                stack.enter_context(patch.object(native_approval,'_unattended_contexts',return_value=[]))
+                stack.enter_context(patch.object(approval_context,'_get_approval_mode',return_value=approval_mode))
+                if isolate_tirith and hasattr(native_approval,'_tirith_scan'):
+                    stack.enter_context(patch.object(native_approval,'_tirith_scan',return_value={
+                        'action':'allow','findings':[],'summary':''}))
+                if smart_denied:
+                    stack.enter_context(patch.object(native_approval,'_smart_gate',return_value=(None,True)))
+                if mcp:
+                    prompt=__import__('tools.approval_prompt',fromlist=['request_elicitation_consent'])
+                    stack.enter_context(patch.object(prompt._ctx,'_is_gateway_approval_context',return_value=True))
+                    stack.enter_context(patch.object(prompt._ctx,'_is_single_query_approval_context',return_value=False))
+                    stack.enter_context(patch.object(prompt._ctx,'_is_cron_approval_context',return_value=False))
+                thread=threading.Thread(target=invoke,name='native-approval-producer-'+label,daemon=True)
+                thread.start()
+                self.assertTrue(notified.wait(5),f'{label} did not emit a native approval request: {thread_error!r}')
+                self.assertFalse(thread_error,repr(thread_error))
+                self.assertTrue(captured, label)
+                request=json.loads(json.dumps(captured[-1],ensure_ascii=False))
+                queue=native_approval.list_gateway_approvals(session_key)
+                self.assertEqual(len(queue),1,label)
+                pending=json.loads(json.dumps(queue[0],ensure_ascii=False))
+                self.assertEqual(request['method'],'approval',label)
+                self.assertRegex(request['id'],r'^srq-[0-9a-f]{12}$',label)
+                self.assertRegex(pending['request_id'],r'^[0-9a-f]{32}$',label)
+                self.assertTrue(b.supported_pair(request,pending,sid),f'{label}: request={request!r}; pending={pending!r}')
+                native_session={'id':sid,'session_key':session_key,'status':'waiting'}
+                descriptor=self.descriptor_for(request,pending,route=self.route,session=native_session,epoch='native-epoch')
+                self.assertTrue(b.validate_snapshot(descriptor,request,pending,self.route,native_session,
+                    'native-epoch',self.owner),f'{label}: native producer snapshot was not frozen')
+                registered=b.register({'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,
+                    'descriptor':descriptor,'request':request,'pending':pending,'route':self.route,
+                    'session':native_session,'epoch':'native-epoch'},notifier,root=self.root,state=self.state,now=self.now)
+                if expect_registration:
+                    self.assertTrue(registered.get('ok'),f'{label}: {registered}')
+                    row=self.row(registered['id'])
+                    self.assertEqual(row['status'],'open',label)
+                    review=row['review_text']
+                    self.assertIsInstance(review,str,label)
+                else:
+                    self.assertFalse(registered.get('ok'),f'{label}: unsafe review must fail closed: {registered}')
+                    row=None
+                    review=None
+                entry=native_approval._gateway_queues[session_key][0]
+                if answer_method=='request.answer':
+                    receipt=server._methods['request.answer']('native-request-answer',
+                        {'id':request['id'],'result':{'choice':'deny','all':False}})
+                    self.assertEqual(receipt['result'],{'status':'ok'},label)
+                    self.assertEqual(entry.result,'deny',label)
+                    late=server._methods['approval.respond']('native-late-approval-respond',
+                        {'session_id':sid,'request_id':pending['request_id'],'choice':'once','all':False})
+                    self.assertEqual(late['result']['resolved'],0,label)
+                else:
+                    receipt=server._methods['approval.respond']('native-approval-respond',
+                        {'session_id':sid,'request_id':pending['request_id'],'choice':'deny','all':False})
+                    self.assertEqual(receipt['result']['resolved'],1,label)
+                    self.assertEqual(entry.result,'deny',label)
+                    late=server._methods['approval.respond']('native-late-approval-respond',
+                        {'session_id':sid,'request_id':pending['request_id'],'choice':'once','all':False})
+                    self.assertEqual(late['result']['resolved'],0,label)
+                thread.join(5)
+                self.assertFalse(thread.is_alive(),label)
+                self.assertFalse(thread_error,repr(thread_error))
+                self.assertTrue(entry.event.is_set(),label)
+                return request,pending,receipt,outcome,review,descriptor,native_session,registered
+        finally:
+            with patch.object(server_requests,'_emit',lambda *_args,**_kwargs:None):
+                # The synthetic sid is owned entirely by this fixture. Use the public
+                # two-argument API shared by both immutable core generations.
+                server_requests.cancel(sid,'interrupted')
+            if thread is not None:thread.join(5)
+            with native_approval._lock:
+                native_approval._gateway_queues.pop(session_key,None)
+                native_approval._gateway_notify_cbs.pop(session_key,None)
+            server._sessions.pop(sid,None)
+
+    def test_real_native_producers_and_both_native_dispatchers_cover_all_approval_families(self):
+        generation,core_root=self._assert_core_generation()
+        from tools import approval as native_approval
+        from tools.file_tools_write_guards import _request_protected_instruction_approval, _check_approval_required_write
+        from tools.computer_use import tool as computer_use
+        from tools.approval_prompt import request_elicitation_consent
+
+        def ssh_config_producer():
+            return _check_approval_required_write([str(self.root/'.ssh'/'config')],task_id='default')
+        producers=[
+            ('shell-danger',lambda:native_approval.check_dangerous_command('rm -rf /tmp/approval-fixture','local')),
+            ('python-cli-shell',lambda:native_approval.check_dangerous_command(
+                'python -c "print(1)"','local')),
+            ('execute-code',lambda:native_approval.check_execute_code_guard('print("complete Python body")','local')),
+            ('protected-instruction',lambda:_request_protected_instruction_approval(['AGENTS.md'])),
+            ('ssh-config',ssh_config_producer),
+            ('plugin-rule',lambda:native_approval.request_tool_approval('fixture_tool','Synthetic plugin approval',rule_key='fixture-rule')),
+            ('computer-use',lambda:computer_use._request_approval('click',{'delivery_mode':'foreground','x':41,'y':23})),
+            ('smart-denied',lambda:native_approval.check_all_command_guards('rm -rf /tmp/approval-fixture','local')),
+            ('mcp-elicitation',lambda:request_elicitation_consent('Synthetic MCP action','Synthetic consent summary')),
+        ]
+        if generation=='current':
+            editor_module=importlib.import_module('gateway.session_local_editor')
+            from acp_adapter.edit_approval import EditProposal
+            producers.append(('editor-edit',lambda:editor_module.request_editor_edit(
+                EditProposal('edit_file','src/example.py','old line\n','new line\n',
+                             {'diff':'-old line\n+new line'}))))
+        else:
+            editor_path=core_root/'gateway'/'session_local_editor.py'
+            self.assertFalse(editor_path.exists())
+            self.assertIsNone(importlib.util.find_spec('gateway.session_local_editor'))
+        for label,producer in producers:
+            with self.subTest(producer=label):
+                request,pending,receipt,outcome,review,descriptor,native_session,registered=self._run_real_native_approval_producer(
+                    label,producer,approval_mode='smart' if label=='smart-denied' else 'on',
+                    smart_denied=label=='smart-denied',mcp=label=='mcp-elicitation',
+                    answer_method='request.answer' if label=='execute-code' else 'approval.respond',
+                    isolate_tirith=label=='smart-denied')
+                self.assertIn('once',request['params']['choices'],label)
+                self.assertIn('deny',request['params']['choices'],label)
+                self.assertIn('요청에 없는',review,label)
+                if label=='execute-code':
+                    self.assertIn('complete Python body',request['params']['command'])
+                    self.assertIn('complete Python body',review)
+                if label=='shell-danger':
+                    self.assertEqual(request['params']['command'],'rm -rf /tmp/approval-fixture')
+                if label=='python-cli-shell':
+                    self.assertEqual(request['params']['command'],'python -c "print(1)"')
+                    self.assertIn('script execution via -e/-c flag',request['params']['pattern_key'])
+                if label=='protected-instruction':
+                    self.assertIs(request['params']['allow_session'],False)
+                    self.assertIs(request['params']['allow_permanent'],False)
+                    self.assertIn('AGENTS.md',review)
+                if label=='plugin-rule':
+                    self.assertNotIn('"arguments"',review)
+                if label=='smart-denied':
+                    self.assertIs(request['params']['smart_denied'],True)
+                    self.assertIs(request['params']['allow_session'],False)
+                    self.assertEqual(request['params']['choices'],['once','deny'])
+                if label=='mcp-elicitation':
+                    self.assertNotIn('allow_session',request['params'])
+                    self.assertNotIn('allow_permanent',request['params'])
+                if label=='editor-edit':
+                    self.assertRegex(request['params']['pattern_key'],r'^editor-[0-9a-f]{32}$')
+                    self.assertIn('diff',request['params']['edit']['arguments'])
+                self.assertEqual(len(outcome),1,label)
+        self.assertEqual(len(producers),10 if generation=='current' else 9)
+        editor_coverage='actual producer executed' if generation=='current' else 'unavailable; exact legacy absence asserted'
+        print(f"native approval producer coverage: {generation} ({len(producers)} families); "
+              f"editor={editor_coverage}; root={core_root}")
+
+    def test_real_editor_producer_redacts_structured_fields_before_telegram_egress(self):
+        generation,core_root=self._assert_core_generation()
+        if generation=='legacy':
+            editor_path=core_root/'gateway'/'session_local_editor.py'
+            self.assertFalse(editor_path.exists())
+            self.assertIsNone(importlib.util.find_spec('gateway.session_local_editor'))
+            print('editor redaction egress integration unavailable on exact legacy core; absence verified')
+            return
+
+        editor_module=importlib.import_module('gateway.session_local_editor')
+        from acp_adapter.edit_approval import EditProposal
+        markers=[
+            'synthetic-editor-old-password-egress-739102',
+            'synthetic-editor-old-api-key-egress-739102',
+            'synthetic-editor-new-password-egress-739102',
+            'synthetic-editor-new-token-egress-739102',
+            'synthetic-editor-standalone-password-egress-739102',
+            'synthetic-editor-nested-api-key-egress-739102',
+            'synthetic-editor-array-secret-egress-739102',
+        ]
+        metadata='synthetic-editor-event-metadata-visible-739102'
+        old_text=f'password: {markers[0]}\nAPI_KEY={markers[1]}'
+        new_text=f'password: {markers[2]}\nACCESS_TOKEN={markers[3]}'
+        arguments={
+            'path':'src/synthetic-settings.yaml',
+            'password':markers[4],
+            'nested':[{'api_key':markers[5],
+                       'metadata':{'event':metadata,'attempt':2}},
+                      [{'secret':markers[6]}]],
+            'metadata':{'note':'preserve editor argument metadata','attempt':3},
+        }
+        proposal=EditProposal('edit_file','src/synthetic-settings.yaml',old_text,new_text,arguments)
+        request,pending,receipt,outcome,review,descriptor,native_session,registered=self._run_real_native_approval_producer(
+            'editor-redaction',lambda:editor_module.request_editor_edit(proposal),expect_registration=False)
+        self.assertFalse(outcome[0],'the fixture explicitly denies the native edit; no file is changed')
+        self.assertFalse(registered.get('ok'),registered)
+        self.assertIn(registered.get('reason'),{'redaction_not_stable','redaction_omission'},registered)
+        self.assertIsNone(review,'unstable structured redaction must not create an actionable card')
+        self.assertEqual(self.calls,[],'the unsafe review is rejected before any Telegram send/edit')
+        self.assertEqual(request['params']['edit']['old_text'],old_text)
+        self.assertEqual(request['params']['edit']['new_text'],new_text)
+        self.assertEqual(request['params']['edit']['arguments'],arguments)
+
+        notice=b.approval_notice({'request':request,'pending':pending,'descriptor':descriptor,
+            'reason':'review_unavailable'},notifier,root=self.root,state=self.state)
+        self.assertTrue(notice.get('ok'),notice)
+        self.assertTrue(notice.get('notification_only'),notice)
+        outbound=json.dumps([payload for _method,payload in self.calls],ensure_ascii=False)
+        receipts=json.dumps({'registered':registered,'native_receipt':receipt,'producer_outcome':outcome,
+                             'notice_receipt':notice},ensure_ascii=False)
+        for marker in markers:
+            self.assertNotIn(marker,outbound)
+            self.assertNotIn(marker,receipts)
+        notices=[payload for method,payload in self.calls if method=='sendMessage' and 'reply_markup' not in payload]
+        self.assertEqual(len(notices),1)
+        for marker in markers:
+            self.assertNotIn(marker,notices[0]['text'])
+        self.assertIn('Desktop에서',notices[0]['text'])
+
+    def test_real_compute_host_request_answer_ok_is_only_a_weak_gateway_ack(self):
+        import uuid, threading
+        from contextlib import ExitStack
+        from tui_gateway import server
+        sid='compute-host-approval-'+uuid.uuid4().hex[:12]
+        request_id='srq-'+uuid.uuid4().hex[:12]
+        mirror={'id':request_id,'method':'approval','params':{'session_id':sid,'request_id':'a'*32}}
+        server._sessions[sid]={'_compute_host_open_request':mirror,'history_lock':threading.RLock()}
+        class FailingChildRelay:
+            def respond(self,*_args,**_kwargs):raise RuntimeError('synthetic child relay loss')
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(server,'_session_uses_compute_host',return_value=True))
+                stack.enter_context(patch.object(server,'_get_compute_host_supervisor',return_value=FailingChildRelay()))
+                receipt=server._methods['request.answer']('compute-host-request-answer',
+                    {'id':request_id,'result':{'choice':'deny','all':False}})
+            self.assertEqual(receipt['result'],{'status':'ok'})
+            self.assertNotIn('_compute_host_open_request',server._sessions[sid])
+        finally:
+            server._sessions.pop(sid,None)
+
     def test_real_ptb_application_process_update_handles_callback_and_text_no_fallthrough(self):
         from telegram import Update
         from telegram.ext import Application, TypeHandler
@@ -555,7 +1001,7 @@ class ApprovalBridgeTests(unittest.TestCase):
             self.assertEqual(replay.get('items'),[],cause)
 
     def test_exact_poll_projection_defers_unicode_claim_with_terminal_ids_without_consuming(self):
-        large_command='rm -rf approval-fixture # '+'가'*3000+'🙂'*300
+        large_command='rm -rf approval-fixture # '+'가'*2800+'🙂'*300
         self.request,self.pending=self.pair(command=large_command)
         self.request_fp=b._digest(self.request);self.pending_fp=b._digest(self.pending);self.descriptor=self.descriptor_for()
         register_req={'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,

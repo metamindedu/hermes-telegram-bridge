@@ -114,7 +114,7 @@ class NativeFeatureGateTests(unittest.TestCase):
             loaded = notifier.dispatch_request({"action": "loaded", "version": "1.8.0"}, root=self.root, state=state)
             self.assertTrue(loaded["ok"])
             self.assertEqual(loaded["capabilities"], [
-                "desktop-command-approval-v4", "desktop-completion-recovery-v1"])
+                "desktop-command-approval-v5", "desktop-completion-recovery-v1"])
             self.assertEqual(set(loaded["completion_policy"]), {"ok", "enabled", "generation"})
             self.assertTrue(loaded["completion_policy"]["ok"])
             self.assertIs(loaded["completion_policy"]["enabled"], True)
@@ -176,7 +176,7 @@ class NativeFeatureGateTests(unittest.TestCase):
                 "claim": "fixture-claim", "descriptor": {}, "authority": "0" * 64, "deadline": 1},
                 root=self.root, state=state)
             approval = notifier.dispatch_request({"action": "approval_owner_heartbeat",
-                "capability": "desktop-command-approval-v4", "owner": "fixture"}, root=self.root, state=state)
+                "capability": "desktop-command-approval-v5", "owner": "fixture"}, root=self.root, state=state)
             with patch.object(notifier, "deliver", return_value={"ok": True, "status": "sent"}) as deliver:
                 outbound = notifier.dispatch_request({"action": "send"}, root=self.root, state=state)
             self.assertEqual(reply["reason"], "replies_disabled")
@@ -197,7 +197,7 @@ class NativeFeatureGateTests(unittest.TestCase):
                 self.write_config(raw=raw)
                 denied_reply = notifier.dispatch_request({"action": "reply_register"}, root=self.root, state=state)
                 denied_approval = notifier.dispatch_request({"action": "approval_owner_heartbeat",
-                    "capability": "desktop-command-approval-v4"}, root=self.root, state=state)
+                    "capability": "desktop-command-approval-v5"}, root=self.root, state=state)
                 self.assertEqual(denied_reply["reason"], "native_plugin_config_invalid")
                 self.assertEqual(denied_approval["reason"], "native_plugin_config_invalid")
             self.assertFalse((self.root / "plugin-data").exists(), "failed readiness checks must not create inbox state")

@@ -69,3 +69,17 @@
 - The SDK route list is not connection evidence and routed RPC may cold-start a backend; recovery is restricted to the exact already-open SDK route, with complete replay and strict unknown-versus-absence handling.
 - Candidate metadata is content-free and bounded by active and total-row caps. Existing delivery states remain untouched; only a durable exact-attempt pre-request connection failure may retry. Sender status remains distinct from receiver heartbeat.
 - Source tests are isolated to fake homes and mocked Telegram transport. No production install, enablement, profile/config/auth/ledger write, live send, Gateway restart, commit, push, or publication occurred; independent Heavy review and release/activation gates remain pending.
+
+## 2026-10-15 update | Bounded approval-coverage source candidate
+
+- Kept the public 1.8.0 pin and immutable v4 fixture bytes; renderer/helper/receiver approval capability is v5 while package and recovery stay 1.8.1 and the compatibility field stays 1.8.0.
+- Frozen two native dispatch paths only: exact matching parent queue row → `approval.respond`; healthy well-formed absence → `request.answer`. Snapshot failures, malformed rows, duplicate/conflicting IDs and later mode changes cannot downgrade/switch authority.
+- `request.answer status:"ok"` remains terminal uncertainty because the compute-host parent relay can swallow child errors; it does not assert child decision or command completion and cannot be replayed.
+- Full provided native request fields are redacted and shown with a 4,096 UTF-16-unit safe fallback; omitted tool arguments/diffs are not invented. No multipart or DB schema migration.
+- `approvals_enabled` and other saved choices remain default-off/unchanged. Candidate source/tests/docs do not install, activate, restart, commit, push, publish or call live Telegram. Verification and independent review are separately reported in the task result.
+
+## 2026-10-15 correction | Structured approval review and core-generation coverage
+
+- Fixed the reviewed JSON-before-redaction leak by applying the real core redactor to raw string leaves before serialization; recursively mask credential-named values, preserve validated keys and ordinary metadata, and reject unstable/unsafe reviews to command-free guidance.
+- The producer fixture now uses native `check_dangerous_command` for shell/Python detection, keeps smart-mode coverage without Tirith bootstrap, and uses only the portable `server_requests.cancel(sid, reason)` signature. It asserts the exact core import root and generation; legacy 743 has no editor module, while current 297 executes the real editor producer.
+- Local focused evidence: Python approval suite 36/36 on each declared generation; Node approval suite 23/23. These used the existing local Python 3.14.7 environment, not fresh per-pin `uv sync`; GitHub Windows/Ubuntu CI and a new independent Heavy review remain pending. No live Telegram, install, config/credential write, restart, commit, push, or publication.

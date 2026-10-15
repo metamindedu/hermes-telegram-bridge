@@ -1,7 +1,7 @@
 ---
 title: Completion notification recovery boundary
 created: 2026-10-14
-updated: 2026-10-14
+updated: 2026-10-15
 type: decision
 tags: [operations, testing, privacy, ownership]
 ---
@@ -16,7 +16,7 @@ An important SDK trap is that `host.profileRoutes()` is an inventory, not a conn
 
 Keep the active target route separate from the default credential owner: the public captured active gateway can run the fixed `--profile default` CLI on the same local source. Do not require two profiles to be foreground simultaneously. Fresh nonforeground completions retain ordinary notifications without durable recovery. Socket unavailability is unverified, not confirmed identity change. Consume a bookkeeping sequence once while preserving the original event watermark; generation rotation fences late registration across observed OFF/ON. Capacity pressure must never remove still-protective cancellation fences; use bounded refusal instead.
 
-The receiver and approval-v4 protocol remain at v1.8.0 while package/helper/renderer recovery is independently versioned at 1.8.1. Keep `loaded.version` as the approval compatibility value and require an explicit new recovery capability; the package version alone must never grant the new path. This preserves old 1.8.0 approval-v4 behavior without changing receiver modules. See [[runtime-boundaries]] for the existing SDK and consent boundary.
+The recovery-only 2026-10-14 source step kept the receiver and approval-v4 protocol at v1.8.0 while package/helper/renderer recovery was independently versioned at 1.8.1. Keep `loaded.version` as the approval compatibility value and require an explicit new recovery capability; the package version alone must never grant the new path. That historical step preserved old 1.8.0 approval-v4 behavior without changing receiver modules. The separate 2026-10-15 approval-coverage candidate retains the recovery capability/state logic and public v1.8.0 fixture, while moving only the new approval handshake to v5; see [[runtime-boundaries]] for its two native dispatch receipts and consent boundary.
 
 Only an exact attempt's durable pre-request connection failure is retryable. Dispatching, unknown, malformed/lost helper receipts, read/write/protocol errors, and explicit Bot API rejection are not. Existing `sending`, `unknown`, `failed` and `sent` delivery rows are never reset; the same completion-v2 dedupe key arbitrates old and new helper paths. Sender counters are separate from receiver heartbeat and are not delivery proof.
 

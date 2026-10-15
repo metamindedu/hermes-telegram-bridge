@@ -9,7 +9,7 @@ registerHooks({resolve(specifier, context, nextResolve) {
   if (specifier === 'react/jsx-runtime') return {url: 'data:text/javascript,export const jsx=(type,props,key)=>({type,props,key})', shortCircuit:true}
   return nextResolve(specifier, context)
 }})
-const {CompletionMonitor, validateApprovalPair, validApprovalSnapshot, approvalFingerprint,
+const {CompletionMonitor, validateApprovalPair, validApprovalSnapshot, approvalFingerprint, classifyApprovalAuthority,
   APPROVAL_CAPABILITY, APPROVAL_COMPAT_VERSION, VERSION} = await import('./desktop/plugin.js')
 
 function fixture() {
@@ -30,7 +30,7 @@ async function bridgeFixture() {
   const f=fixture()
   const descriptor={owner:f.owner,connectionId:f.route.connectionId,profile:f.route.profile,
     targetProfile:f.route.targetProfile,sid:f.row.id,session_key:f.row.session_key,epoch:'epoch-1',
-    request_id:f.request.id,queue_id:f.pending.request_id,
+    request_id:f.request.id,queue_id:f.pending.request_id,dispatch_mode:'queue',
     request_fingerprint:await approvalFingerprint(f.request),pending_fingerprint:await approvalFingerprint(f.pending)}
   return {...f,descriptor,bridge:{id:'approval-row-1',descriptor,request:f.request,pending:f.pending,
     requestFingerprint:descriptor.request_fingerprint,pendingFingerprint:descriptor.pending_fingerprint,
@@ -48,25 +48,69 @@ test('approval pump without an owned card leaves ordinary notification sweeps un
   assert.deepEqual(calls,[])
 })
 
-test('only the exact request/queue pair for a dangerous command is accepted', () => {
+test('native approval authority is the exact request/queue envelope, not detector membership', () => {
   const f=fixture()
   assert.equal(validateApprovalPair(f.request,f.pending,f.row.id),true)
   for (const mutate of [
     p=>{p.method='sudo'}, p=>{p.id='srq-evil'}, p=>{p.params.session_id='other'},
-    p=>{p.params.request_id='b'.repeat(32)}, p=>{p.params.pattern_keys=['plugin_rule:x']},
-    p=>{p.params.pattern_key='execute_code'}, p=>{p.params.allow_session=false},
-    p=>{p.params.smart_denied=true}, p=>{p.params.command+=' changed'},
-    p=>{p.params.extra='not-native'}
+    p=>{p.params.request_id='b'.repeat(32)}, p=>{p.params.command+=' changed'},
+    p=>{p.params.extra='not-in-queue'}
   ]) {
     const request=structuredClone(f.request); mutate(request)
     assert.equal(validateApprovalPair(request,f.pending,f.row.id),false)
   }
-  const plugin=structuredClone(f.pending);plugin.pattern_key='plugin_rule:abc';plugin.pattern_keys=[plugin.pattern_key]
-  const pluginRequest=structuredClone(f.request);pluginRequest.params.pattern_key=plugin.pattern_key;pluginRequest.params.pattern_keys=[plugin.pattern_key]
-  assert.equal(validateApprovalPair(pluginRequest,plugin,f.row.id),false)
-  const code=structuredClone(f.pending);code.pattern_key='execute_code';code.pattern_keys=[code.pattern_key]
-  const codeRequest=structuredClone(f.request);codeRequest.params.pattern_key=code.pattern_key;codeRequest.params.pattern_keys=[code.pattern_key]
-  assert.equal(validateApprovalPair(codeRequest,code,f.row.id),false)
+  for (const key of ['plugin_rule:fixture','execute_code','tirith:secret','future_native_rule']) {
+    const pending={...f.pending,pattern_key:key,pattern_keys:[key]}
+    const request=structuredClone(f.request)
+    request.params.pattern_key=key;request.params.pattern_keys=[key]
+    assert.equal(validateApprovalPair(request,pending,f.row.id),true,key)
+  }
+  const scope=structuredClone(f.request);scope.params.allow_session=false
+  assert.equal(validateApprovalPair(scope,f.pending,f.row.id),false)
+})
+
+test('all native producer families preserve full payloads and reject malformed scope choices', () => {
+  const f=fixture()
+  const cases=[
+    ['execute_code',"execute_code <<'PY'\\nprint(\"full body\")\\nPY",{allow_permanent:true,allow_session:true}],
+    ['protected_instruction_file','<write to AGENTS.md>',{allow_permanent:false,allow_session:false}],
+    ['ssh_config_write','<write to ~/.ssh/config>',{allow_permanent:true,allow_session:true}],
+    ['plugin_rule:fixture','<fixture_tool> (plugin approval rule)',{allow_permanent:true,allow_session:true}],
+    ['cua:click:foreground','computer_use: click at 40,20',{allow_permanent:true,allow_session:true}],
+    ['recursive delete','rm -rf /tmp/example',{allow_permanent:false,allow_session:false,smart_denied:true}],
+    ['mcp_elicitation','Request to publish the package',{choices:['once','session','always','deny']}],
+    ['editor-'+'e'.repeat(32),'Edit src/example.ts',{allow_permanent:false,allow_session:false,
+      edit:{path:'src/example.ts',old_text:'old line\\n',new_text:'new line\\n',arguments:{diff:'-old line\\n+new line'}}}]
+  ]
+  for(const [key,command,extra] of cases){
+    const pending={request_id:f.pending.request_id,command,description:`native ${key} summary`,pattern_key:key,pattern_keys:[key],...extra}
+    const choices=extra.choices || (extra.smart_denied || extra.allow_session===false ? ['once','deny'] : ['once','session','always','deny'])
+    const request={id:f.request.id,method:'approval',params:{session_id:f.row.id,request_id:f.pending.request_id,
+      command,description:pending.description,pattern_key:key,pattern_keys:[key],choices,...extra}}
+    assert.equal(validateApprovalPair(request,pending,f.row.id),true,key)
+  }
+  for(const choices of [['once','deny','deny'],['once','session','always','maybe','deny'],['deny'],null]){
+    const request=structuredClone(f.request);request.params.choices=choices
+    const pending={...f.pending,choices}
+    assert.equal(validateApprovalPair(request,pending,f.row.id),false,JSON.stringify(choices))
+  }
+  const contradiction=structuredClone(f.request);contradiction.params.allow_session=false
+  contradiction.params.choices=['once','session','deny']
+  const queue={...f.pending,allow_session:false,choices:contradiction.params.choices}
+  assert.equal(validateApprovalPair(contradiction,queue,f.row.id),false)
+})
+
+test('healthy empty queue freezes server-request authority; failures and conflicts never downgrade', () => {
+  const f=fixture()
+  const empty=classifyApprovalAuthority(f.request,{approvals:[]},f.row.id)
+  assert.equal(empty?.mode,'server_request')
+  assert.deepEqual(empty?.pending,{request_id:f.request.params.request_id,missing:true})
+  for(const queue of [null,{}, {approvals:'bad'}, {approvals:[{}]},
+    {approvals:[f.pending,f.pending]},
+    {approvals:[{...f.pending,command:'conflicting native command'}]},
+    {approvals:[{...f.pending,request_id:'b'.repeat(32)}]}]){
+    assert.equal(classifyApprovalAuthority(f.request,queue,f.row.id),null,JSON.stringify(queue))
+  }
 })
 
 test('route/runtime/durable/epoch/request/queue/fingerprint authority dimensions fail independently', async () => {
@@ -114,10 +158,14 @@ test('approval registration freezes full fingerprints and binds queue not just s
 })
 
 async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimValidity=true,
-  gateVariant=null, pausePostClaim=false, runStoppedOnGate=false, expireOnGate=false}={}) {
+  gateVariant=null, pausePostClaim=false, runStoppedOnGate=false, expireOnGate=false,
+  dispatchMode='queue', modeChangeOnFinal=false}={}) {
   const f=await bridgeFixture();const owner=f.owner
-  const item={id:'stored-card',claim:'b'.repeat(32),deadline:Date.now()/1000+30,descriptor:f.descriptor,
-    request:f.request,pending:f.pending,choice:'once'}
+  const pending=dispatchMode==='queue' ? f.pending : {request_id:f.request.params.request_id,missing:true}
+  const descriptor={...f.descriptor,dispatch_mode:dispatchMode,
+    pending_fingerprint:await approvalFingerprint(pending)}
+  const item={id:'stored-card',claim:'b'.repeat(32),deadline:Date.now()/1000+30,descriptor,
+    request:f.request,pending,choice:'once'}
   const calls=[];const helperCalls=[];let snapshots=0
   let resumeSnapshot
   let reachSnapshot
@@ -128,20 +176,22 @@ async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimVali
       calls.push({route,method,args})
       if(method==='session.active_list')return {sessions:[f.row]}
       if(method==='session.events.since')return f.snapshot
-      if(method==='approval.pending')return {approvals:[f.pending]}
-      if(method==='approval.respond') {if(throwRpc)throw new Error('synthetic timeout');return resolved}
+      if(method==='approval.pending')return {approvals:dispatchMode==='queue'?[f.pending]:[]}
+      if(method==='approval.respond'||method==='request.answer') {if(throwRpc)throw new Error('synthetic timeout');return resolved}
       throw new Error('unexpected RPC '+method)
     }}
   const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}})
   monitor.replyOwner=owner
-  const bridge={id:item.id,descriptor:f.descriptor,request:f.request,pending:f.pending,
-    requestFingerprint:f.descriptor.request_fingerprint,pendingFingerprint:f.descriptor.pending_fingerprint,route:f.route}
+  const bridge={id:item.id,descriptor,request:f.request,pending,
+    requestFingerprint:descriptor.request_fingerprint,pendingFingerprint:descriptor.pending_fingerprint,route:f.route}
   monitor.records.set('record',{approval:bridge})
   monitor.approvalSnapshot=async()=>{
     snapshots++
     if(pausePostClaim&&snapshots===2){reachSnapshot();await resumePostClaimSnapshot}
     if(changeOnFinal && snapshots===2)return null
-    return {route:f.route,row:f.row,snapshot:f.snapshot,request:f.request,pending:f.pending}
+    const currentMode=modeChangeOnFinal&&snapshots===2?'queue':dispatchMode
+    const currentPending=currentMode==='queue'?f.pending:{request_id:f.request.params.request_id,missing:true}
+    return {route:f.route,row:f.row,snapshot:f.snapshot,request:f.request,pending:currentPending,dispatchMode:currentMode}
   }
   monitor.helper=async request=>{
     helperCalls.push(request)
@@ -187,6 +237,35 @@ test('malformed numeric/bool response receipts are unknown and never retried', a
   }
 })
 
+test('server-request authority sends once to the frozen srq and never treats gateway acceptance as delivery', async () => {
+  const accepted=await runPump({status:'ok'},{dispatchMode:'server_request'})
+  const writes=accepted.calls.filter(call=>call.method==='request.answer')
+  assert.equal(writes.length,1)
+  assert.deepEqual(writes[0].args,{id:'srq-aabbcc112233',result:{choice:'once',all:false}})
+  assert.equal(accepted.calls.some(call=>call.method==='approval.respond'),false)
+  assert.equal(accepted.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
+  const expired=await runPump({status:'expired'},{dispatchMode:'server_request'})
+  assert.equal(expired.helperCalls.find(call=>call.action==='approval_settle').status,'expired')
+  for(const receipt of [{status:'ok',extra:true},{status:'resolved'},{},null]){
+    const out=await runPump(receipt,{dispatchMode:'server_request'})
+    assert.equal(out.calls.filter(call=>call.method==='request.answer').length,1)
+    assert.equal(out.calls.some(call=>call.method==='approval.respond'),false)
+    assert.equal(out.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
+    assert.equal(out.helperCalls.filter(call=>call.action==='approval_poll').length,1)
+  }
+  const ambiguous=await runPump({}, {dispatchMode:'server_request',throwRpc:true})
+  assert.equal(ambiguous.calls.filter(call=>call.method==='request.answer').length,1)
+  assert.equal(ambiguous.calls.some(call=>call.method==='approval.respond'),false)
+  assert.equal(ambiguous.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
+})
+
+test('a frozen server-request card cannot switch to queue dispatch when mode changes after its tap', async () => {
+  const changed=await runPump({resolved:1},{dispatchMode:'server_request',modeChangeOnFinal:true})
+  assert.equal(changed.calls.some(call=>call.method==='request.answer'||call.method==='approval.respond'),false)
+  assert.equal(changed.helperCalls.find(call=>call.action==='approval_settle').status,'rejected')
+  assert.equal(changed.helperCalls.filter(call=>call.action==='approval_poll').length,1)
+})
+
 test('final fresh snapshot race rejects without native write; transport ambiguity is terminal unknown', async () => {
   const raced=await runPump({resolved:1},{changeOnFinal:true})
   assert.equal(raced.calls.filter(call=>call.method==='approval.respond').length,0)
@@ -209,6 +288,15 @@ test('old sender/renderer capability cannot enable approval registration', async
   assert.equal(actions.length,1)
   assert.equal(actions[0].action,'loaded')
 })
+test('cached approval-v4 receiver helper cannot enable v5 authority modes', async () => {
+  const f=fixture();const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:()=>{}}
+  const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}})
+  const actions=[];monitor.helper=async request=>{actions.push(request);return {ok:true,version:'1.8.0',capabilities:['desktop-command-approval-v4']}}
+  await monitor.mounted()
+  assert.equal(monitor.approvalCapable,false)
+  assert.deepEqual(actions.map(request=>request.action),['loaded'])
+})
+
 test('approval_claim_valid is explicitly dispatched but remains a read-only non-ambiguous helper action', async () => {
   const f=fixture();const transported=[]
   const api={profileRoutes:async()=>[f.route],requestProfile:async(_route,method,args)=>{
@@ -228,10 +316,10 @@ test('approval_claim_valid is explicitly dispatched but remains a read-only non-
   await assert.rejects(monitor.helper(request),error=>error?.ambiguousWrite===false)
 })
 
-test('package version 1.8.1 keeps the 1.8.0 approval-v4 compatibility handshake', () => {
+test('package version 1.8.1 keeps the 1.8.0 approval compatibility value and fences with v5', () => {
   assert.equal(VERSION,'1.8.1')
   assert.equal(APPROVAL_COMPAT_VERSION,'1.8.0')
-  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v4')
+  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v5')
 })
 
 test('claim validity is the last fresh gate before approval.respond and accepts only an exact typed receipt', async () => {
@@ -343,21 +431,40 @@ test('supported approval failures never fall into attention even without a typed
   }
 })
 
-test('unsupported generic/plugin-rule/compute-host approvals retain ordinary notification-only behavior', async () => {
-  for(const key of ['plugin_rule:fixture','execute_code','tirith:secret']){
+test('generic native approval producers can register only from a healthy empty parent queue', async () => {
+  for(const key of ['plugin_rule:fixture','execute_code','tirith:secret','future_native_rule']){
     const f=fixture();f.request.params.pattern_key=key;f.request.params.pattern_keys=[key]
-    f.pending.pattern_key=key;f.pending.pattern_keys=[key]
-    assert.equal(validateApprovalPair(f.request,f.pending,f.row.id),false)
-    const calls=[];const payloads=[]
+    const calls=[]
     const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:()=>{},
-      requestProfile:async(_route,method)=>method==='approval.pending' ? {approvals:[f.pending]} : f.snapshot}
+      requestProfile:async(_route,method)=>method==='approval.pending' ? {approvals:[]} : f.snapshot}
     const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}});monitor.approvalCapable=true;monitor.replyOwner=f.owner
-    monitor.helper=async payload=>{calls.push(payload.action);payloads.push(payload);return {ok:true,status:'sent'}}
+    monitor.helper=async payload=>{
+      calls.push(payload)
+      if(payload.action==='approval_owner_heartbeat')return {ok:true,feature_ready:true,version:APPROVAL_COMPAT_VERSION,capability:APPROVAL_CAPABILITY}
+      if(payload.action==='approval_register')return {ok:true,new:true,id:'stored-'+key,status:'open'}
+      throw Error(payload.action)
+    }
     const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
     await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
-    assert.deepEqual(calls,['attention'],key);assert.equal(record.approval,null)
-    assert.deepEqual(payloads[0].ask_params,{},key)
-    assert.equal(payloads[0].ask_method,'approval');assert.equal(payloads[0].ask_id,f.request.id)
+    assert.deepEqual(calls.map(call=>call.action),['approval_owner_heartbeat','approval_register'],key)
+    assert.equal(record.approval?.descriptor.dispatch_mode,'server_request',key)
+    assert.equal(record.approval?.request.params.pattern_key,key)
+  }
+})
+
+test('unhealthy approval.pending reads never become server-request authority', async () => {
+  const f=fixture()
+  for(const response of [null,{}, {approvals:'bad'}, {approvals:[{}]},
+    {approvals:[f.pending,f.pending]}, {approvals:[{...f.pending,command:'conflict'}]}]){
+    const calls=[]
+    const api={state:{profile:{get:()=> 'default'}},profileRoutes:async()=>[f.route],notify:()=>{},
+      requestProfile:async(_route,method)=>method==='approval.pending'?response:f.snapshot}
+    const monitor=new CompletionMonitor(api,{setTimeout:()=>()=>{}});monitor.approvalCapable=true;monitor.replyOwner=f.owner
+    monitor.helper=async payload=>{calls.push(payload.action);return {ok:true,status:'sent',notification_only:true}}
+    const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
+    await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
+    assert.equal(calls.includes('approval_register'),false,JSON.stringify(response))
+    assert.equal(record.approval,null)
   }
 })
 

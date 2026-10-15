@@ -5,7 +5,7 @@ import { jsx } from 'react/jsx-runtime'
 // App-level disk plugin: explicit settings writes use the fixed native helper.
 export const VERSION = '1.8.1'
 export const APPROVAL_COMPAT_VERSION = '1.8.0'
-export const APPROVAL_CAPABILITY = 'desktop-command-approval-v4'
+export const APPROVAL_CAPABILITY = 'desktop-command-approval-v5'
 export const COMPLETION_RECOVERY_CAPABILITY = 'desktop-completion-recovery-v1'
 export const COMPLETION_RECOVERY_TTL_MS = 30 * 60_000
 export const APPROVAL_LEASE_MS = 45_000
@@ -104,37 +104,104 @@ export function validReplySnapshot(bridge, route, row, snapshot) {
     ask.params?.session_id === d.sid && stableJSON(ask) === d.fingerprint
 }
 
-const APPROVAL_REQUEST_KEYS = ['session_id','request_id','command','description','pattern_key','pattern_keys',
-  'allow_permanent','allow_session','choices']
-const APPROVAL_QUEUE_KEYS = ['request_id','command','description','pattern_key','pattern_keys',
-  'allow_permanent','allow_session']
+const NATIVE_APPROVAL_CHOICES = new Set(['once','session','always','deny'])
+function nativeJSONValue(value, depth=0) {
+  if (depth > 32) return false
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (Array.isArray(value)) return value.every(item => nativeJSONValue(item, depth + 1))
+  if (!value || typeof value !== 'object' ||
+      ![Object.prototype,null].includes(Object.getPrototypeOf(value))) return false
+  return Object.entries(value).every(([key,item]) => typeof key === 'string' && nativeJSONValue(item, depth + 1))
+}
 
-export function validateApprovalPair(request, pending, runtimeSid) {
-  if (!request || typeof request !== 'object' || Array.isArray(request) || request.method !== 'approval' ||
-      typeof request.id !== 'string' || !/^srq-[0-9a-f]{4,32}$/u.test(request.id) ||
-      !pending || typeof pending !== 'object' || Array.isArray(pending) ||
-      typeof runtimeSid !== 'string' || !runtimeSid) return false
-  const p = request.params
-  if (!p || typeof p !== 'object' || Array.isArray(p)) return false
-  const queueKeys = [...APPROVAL_QUEUE_KEYS]
-  const paramKeys = [...APPROVAL_REQUEST_KEYS]
-  if (Object.hasOwn(pending, 'smart_denied')) { queueKeys.push('smart_denied'); paramKeys.push('smart_denied') }
-  if (!exactKeys(pending, queueKeys) || !exactKeys(p, paramKeys)) return false
-  if (p.session_id !== runtimeSid || p.request_id !== pending.request_id ||
-      typeof pending.request_id !== 'string' || !/^[0-9a-f]{32}$/u.test(pending.request_id)) return false
-  if (pending.smart_denied !== undefined && pending.smart_denied !== false) return false
-  if (p.smart_denied !== undefined && p.smart_denied !== false) return false
-  if (typeof pending.command !== 'string' || !pending.command || p.command !== pending.command ||
-      typeof pending.description !== 'string' || !pending.description || p.description !== pending.description) return false
-  if (typeof pending.pattern_key !== 'string' || !pending.pattern_key ||
-      /^(?:plugin_rule:|tirith:|execute_code(?:$|:))/u.test(pending.pattern_key) ||
-      !Array.isArray(pending.pattern_keys) || pending.pattern_keys.length !== 1 ||
-      pending.pattern_keys[0] !== pending.pattern_key || p.pattern_key !== pending.pattern_key ||
-      stableJSON(p.pattern_keys) !== stableJSON(pending.pattern_keys)) return false
-  if (typeof pending.allow_permanent !== 'boolean' || p.allow_permanent !== pending.allow_permanent ||
-      pending.allow_session !== true || p.allow_session !== true) return false
-  const expected = pending.allow_permanent ? ['once','session','always','deny'] : ['once','session','deny']
-  return Array.isArray(p.choices) && stableJSON(p.choices) === stableJSON(expected)
+function validApprovalChoices(params) {
+  const choices=params?.choices
+  if (!Array.isArray(choices) || choices.length<2 || choices.length>4 ||
+      choices.some(choice=>typeof choice!=='string'||!NATIVE_APPROVAL_CHOICES.has(choice)) ||
+      new Set(choices).size!==choices.length || !choices.includes('once') || !choices.includes('deny')) return false
+  for(const key of ['allow_permanent','allow_session','smart_denied']){
+    if(Object.hasOwn(params,key)&&typeof params[key]!=='boolean')return false
+  }
+  if(params.allow_session===false&&(choices.includes('session')||choices.includes('always')))return false
+  if(params.allow_permanent===false&&choices.includes('always'))return false
+  if(params.allow_permanent===true&&params.allow_session===false)return false
+  if(params.smart_denied===true&&
+      (params.allow_session!==false||params.allow_permanent!==false||stableJSON([...choices].sort())!==stableJSON(['deny','once'])))return false
+  return true
+}
+
+function validNativeApprovalRequest(request,runtimeSid) {
+  if(!request||typeof request!=='object'||Array.isArray(request)||request.method!=='approval'||
+      typeof request.id!=='string'||!/^srq-[0-9a-f]{12}$/u.test(request.id)||
+      !request.params||typeof request.params!=='object'||Array.isArray(request.params)||
+      !nativeJSONValue(request)||typeof runtimeSid!=='string'||!runtimeSid)return false
+  const p=request.params
+  if(p.session_id!==runtimeSid||typeof p.request_id!=='string'||!/^[0-9a-f]{32}$/u.test(p.request_id)||
+      typeof p.command!=='string'||!p.command||typeof p.description!=='string'||!p.description||
+      typeof p.pattern_key!=='string'||!p.pattern_key||!Array.isArray(p.pattern_keys)||!p.pattern_keys.length||
+      p.pattern_keys.some(key=>typeof key!=='string'||!key)||new Set(p.pattern_keys).size!==p.pattern_keys.length||
+      !p.pattern_keys.includes(p.pattern_key)||
+      (p.pattern_key.startsWith('editor-')&&!/^editor-[0-9a-f]{32}$/u.test(p.pattern_key))||
+      !validApprovalChoices(p))return false
+  if(Object.hasOwn(p,'session_key')&&(typeof p.session_key!=='string'||!p.session_key))return false
+  try{return new TextEncoder().encode(stableJSON(request)).byteLength<=22_500}catch{return false}
+}
+
+function validNativeQueueRow(row) {
+  if(!row||typeof row!=='object'||Array.isArray(row)||!nativeJSONValue(row)||
+      typeof row.request_id!=='string'||! /^[0-9a-f]{32}$/u.test(row.request_id)||
+      typeof row.command!=='string'||!row.command||typeof row.description!=='string'||!row.description||
+      typeof row.pattern_key!=='string'||!row.pattern_key||!Array.isArray(row.pattern_keys)||!row.pattern_keys.length||
+      row.pattern_keys.some(key=>typeof key!=='string'||!key)||new Set(row.pattern_keys).size!==row.pattern_keys.length||
+      !row.pattern_keys.includes(row.pattern_key)||
+      (row.pattern_key.startsWith('editor-')&&!/^editor-[0-9a-f]{32}$/u.test(row.pattern_key)))return false
+  for(const key of ['allow_permanent','allow_session','smart_denied']){
+    if(Object.hasOwn(row,key)&&typeof row[key]!=='boolean')return false
+  }
+  return !Object.hasOwn(row,'choices')||validApprovalChoices(row)
+}
+
+function queuePairMatches(request,pending,runtimeSid) {
+  if(!validNativeApprovalRequest(request,runtimeSid)||!validNativeQueueRow(pending)||
+      pending.request_id!==request.params.request_id||
+      (Object.hasOwn(pending,'choices')&&stableJSON(pending.choices)!==stableJSON(request.params.choices)))return false
+  const requestFields=Object.fromEntries(Object.entries(request.params).filter(([key])=>!['session_id','choices'].includes(key)))
+  const queueFields=Object.fromEntries(Object.entries(pending).filter(([key])=>key!=='choices'))
+  return stableJSON(requestFields)===stableJSON(queueFields)
+}
+
+function queuePayloadConflicts(request,row) {
+  const p=request.params
+  if(row.request_id===p.request_id)return false
+  const keys=['command','description','pattern_key','pattern_keys','edit'].filter(key=>
+    Object.hasOwn(p,key)&&Object.hasOwn(row,key))
+  try{return keys.length>=2&&keys.every(key=>stableJSON(p[key])===stableJSON(row[key]))}catch{return true}
+}
+
+export function classifyApprovalAuthority(request,queueSnapshot,runtimeSid) {
+  if(!validNativeApprovalRequest(request,runtimeSid)||!queueSnapshot||typeof queueSnapshot!=='object'||
+      Array.isArray(queueSnapshot)||!exactKeys(queueSnapshot,['approvals'])||!Array.isArray(queueSnapshot.approvals)||
+      queueSnapshot.approvals.length>100)return null
+  const ids=new Set()
+  for(const row of queueSnapshot.approvals){
+    if(!validNativeQueueRow(row)||ids.has(row.request_id))return null
+    ids.add(row.request_id)
+  }
+  const matches=queueSnapshot.approvals.filter(row=>row.request_id===request.params.request_id)
+  if(matches.length){
+    if(matches.length!==1||!queuePairMatches(request,matches[0],runtimeSid))return null
+    return {mode:'queue',pending:matches[0]}
+  }
+  if(queueSnapshot.approvals.some(row=>queuePayloadConflicts(request,row)))return null
+  return {mode:'server_request',pending:{request_id:request.params.request_id,missing:true}}
+}
+
+export function validateApprovalPair(request,pending,runtimeSid,dispatchMode='queue') {
+  if(!validNativeApprovalRequest(request,runtimeSid))return false
+  if(dispatchMode==='queue')return queuePairMatches(request,pending,runtimeSid)
+  return dispatchMode==='server_request'&&stableJSON(pending)===stableJSON(
+    {request_id:request.params.request_id,missing:true})
 }
 
 export async function approvalFingerprint(value) {
@@ -154,15 +221,19 @@ export function validApprovalSnapshot(bridge, route, row, snapshot, pending, own
         row?.session_key !== d.session_key || row?.status !== 'waiting' ||
         !snapshot || !((typeof snapshot.epoch === 'string' && snapshot.epoch) ||
           (typeof snapshot.epoch === 'number' && Number.isFinite(snapshot.epoch))) ||
-        String(snapshot.epoch) !== d.epoch || !Array.isArray(snapshot.open_requests) ||
-        !Array.isArray(pending)) return false
+        !Array.isArray(snapshot.open_requests) || !Array.isArray(pending)) return false
     const requests = validateOpenRequests(snapshot)
     const matches = requests.filter(q => q.id === d.request_id)
-    if (matches.length !== 1 || !validateApprovalPair(matches[0], bridge.pending, d.sid)) return false
-    const queue = pending.filter(item => item?.request_id === d.queue_id)
-    if (queue.length !== 1 || !validateApprovalPair(matches[0], queue[0], d.sid)) return false
+    if (matches.length !== 1 || matches[0].method !== 'approval') return false
+    if (matches[0].params?.request_id !== d.queue_id ||
+        (matches[0].params?.session_key != null && matches[0].params.session_key !== d.session_key)) return false
+    const authority=classifyApprovalAuthority(matches[0],{approvals:pending},d.sid)
+    if(!authority||authority.mode!==d.dispatch_mode||
+        !validateApprovalPair(matches[0],authority.pending,d.sid,d.dispatch_mode)||
+        stableJSON(authority.pending)!==stableJSON(bridge.pending))return false
     return stableJSON(matches[0]) === stableJSON(bridge.request) &&
-      stableJSON(queue[0]) === stableJSON(bridge.pending)
+      stableJSON(authority.pending) === stableJSON(bridge.pending) &&
+      String(snapshot.epoch) === d.epoch
   } catch {
     return false
   }
@@ -2056,18 +2127,20 @@ export class CompletionMonitor {
     if (matches.length !== 1 || matches[0].method !== 'approval') return false
     const pendingReply = await this.api.requestProfile(route, 'approval.pending', {session_id:r.sid})
     if (!pendingReply || !Array.isArray(pendingReply.approvals)) throw new Error('approval pending snapshot unavailable')
-    const pending = pendingReply.approvals.filter(value => value?.request_id === ask.params?.request_id)
-    if (pending.length !== 1 || !validateApprovalPair(ask, pending[0], r.sid)) {
-      if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+    const authority = classifyApprovalAuthority(ask,pendingReply,r.sid)
+    if (!authority) {
+      if(r.approval){this.approvalSweepUnverified.add(r.approval.id);return true}
       return false
     }
+    const pending=authority.pending
+    const dispatchMode=authority.mode
     const requestFingerprint = await approvalFingerprint(ask)
-    const pendingFingerprint = await approvalFingerprint(pending[0])
+    const pendingFingerprint = await approvalFingerprint(pending)
     const descriptor = {
       owner:this.replyOwner, connectionId:route.connectionId, profile:route.profile,
       targetProfile:route.targetProfile, sid:r.sid, session_key:row.session_key,
-      epoch:String(since.epoch), request_id:ask.id, queue_id:pending[0].request_id,
-      request_fingerprint:requestFingerprint, pending_fingerprint:pendingFingerprint
+      epoch:String(since.epoch), request_id:ask.id, queue_id:ask.params.request_id,
+      dispatch_mode:dispatchMode, request_fingerprint:requestFingerprint, pending_fingerprint:pendingFingerprint
     }
     if (!descriptor.connectionId || !descriptor.profile || !descriptor.targetProfile || !descriptor.session_key ||
         !((typeof since.epoch === 'string' && since.epoch) || (typeof since.epoch === 'number' && Number.isFinite(since.epoch)))) {
@@ -2077,7 +2150,7 @@ export class CompletionMonitor {
     const previous = r.approval
     if (previous) {
       const same = stableJSON(previous.descriptor) === stableJSON(descriptor) &&
-        stableJSON(previous.request) === stableJSON(ask) && stableJSON(previous.pending) === stableJSON(pending[0])
+        stableJSON(previous.request) === stableJSON(ask) && stableJSON(previous.pending) === stableJSON(pending)
       if (!same) {
         this.approvalSweepAbsent.add(previous.id)
         return true
@@ -2090,13 +2163,13 @@ export class CompletionMonitor {
     let registered = {ok:false, reason:'receiver_unavailable'}
     if (heartbeat?.feature_ready === true && heartbeat.version === APPROVAL_COMPAT_VERSION && heartbeat.capability === APPROVAL_CAPABILITY) {
       registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
-        owner:this.replyOwner, descriptor, request:ask, pending:pending[0], route:{
+        owner:this.replyOwner, descriptor, request:ask, pending, route:{
           mode:route.mode, connectionId:route.connectionId, profile:route.profile, targetProfile:route.targetProfile
         }, session:{id:row.id, session_key:row.session_key, status:row.status}, epoch:since.epoch})
     }
     if (registered?.ok === true && typeof registered.id === 'string' &&
         ['posting','open','queued','applying'].includes(registered.status)) {
-      r.approval = {id:registered.id, descriptor, request:ask, pending:pending[0],
+      r.approval = {id:registered.id, descriptor, request:ask, pending,
         requestFingerprint, pendingFingerprint, route:{...route}}
       r.ask = {id:ask.id, method:'approval'}
       return true
@@ -2109,7 +2182,7 @@ export class CompletionMonitor {
     // Once the pair is supported, no failure category may re-enter generic
     // attention with command text. Unknown/malformed failures are guidance-only.
     const notice = await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
-      owner:this.replyOwner, descriptor, request:ask, pending:pending[0],
+      owner:this.replyOwner, descriptor, request:ask, pending,
       reason:typeof registered?.reason === 'string' ? registered.reason : 'review_unavailable'})
     r.ask = {id:ask.id, method:'approval'}
     this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
@@ -2136,13 +2209,15 @@ export class CompletionMonitor {
     const rows = validateActiveSessions(active)
     const row = rows.find(value => value.id === d.sid)
     if (!pendingReply || !Array.isArray(pendingReply.approvals)) throw new Error('approval pending snapshot unavailable')
-    const valid = validApprovalSnapshot(bridge, route, row, snapshot, pendingReply.approvals, this.replyOwner)
-    if (!valid) return null
-    const request = snapshot.open_requests.find(value => value.id === d.request_id)
-    const pending = pendingReply.approvals.find(value => value.request_id === d.queue_id)
-    if (await approvalFingerprint(request) !== d.request_fingerprint ||
-        await approvalFingerprint(pending) !== d.pending_fingerprint) return null
-    return {route, row, snapshot, request, pending}
+    const request=snapshot?.open_requests?.filter(value=>value?.id===d.request_id)
+    if(!Array.isArray(request)||request.length!==1)return null
+    const currentRequest=request[0]
+    const authority=classifyApprovalAuthority(currentRequest,pendingReply,d.sid)
+    if(!authority||authority.mode!==d.dispatch_mode||
+        !validApprovalSnapshot(bridge,route,row,snapshot,pendingReply.approvals,this.replyOwner))return null
+    if (await approvalFingerprint(currentRequest) !== d.request_fingerprint ||
+        await approvalFingerprint(authority.pending) !== d.pending_fingerprint) return null
+    return {route,row,snapshot,request:currentRequest,pending:authority.pending,dispatchMode:authority.mode}
   }
 
   async pumpApprovals() {
@@ -2201,7 +2276,7 @@ export class CompletionMonitor {
         // A post-claim fresh route, session, open-request and native queue snapshot
         // is required immediately before the only RPC write.
         const fresh = await this.approvalSnapshot(bridge)
-        if (!fresh || this.stopped || Date.now() >= item.deadline * 1000 ||
+        if (!fresh || fresh.dispatchMode !== bridge.descriptor.dispatch_mode || this.stopped || Date.now() >= item.deadline * 1000 ||
             stableJSON(item.request) !== stableJSON(fresh.request) ||
             stableJSON(item.pending) !== stableJSON(fresh.pending)) throw new Error('approval snapshot changed')
         const authority = await approvalFingerprint(bridge.descriptor)
@@ -2219,21 +2294,31 @@ export class CompletionMonitor {
         status = 'unknown'
         let receipt
         try {
-          receipt = await this.api.requestProfile(fresh.route, 'approval.respond', {
-            session_id:bridge.descriptor.sid, request_id:bridge.descriptor.queue_id,
-            choice:item.choice, all:false
-          }, 15_000)
+          if (bridge.descriptor.dispatch_mode === 'queue') {
+            receipt = await this.api.requestProfile(fresh.route, 'approval.respond', {
+              session_id:bridge.descriptor.sid, request_id:bridge.descriptor.queue_id,
+              choice:item.choice, all:false
+            }, 15_000)
+            if (!exactKeys(receipt, ['resolved']) || typeof receipt.resolved !== 'number' ||
+                !Number.isFinite(receipt.resolved)) {
+              status = 'unknown'
+            } else if (receipt.resolved === 1) {
+              status = 'applied'
+            } else if (receipt.resolved === 0) {
+              status = 'expired'
+            } else {
+              status = 'unknown'
+            }
+          } else if (bridge.descriptor.dispatch_mode === 'server_request') {
+            receipt = await this.api.requestProfile(fresh.route, 'request.answer', {
+              id:bridge.descriptor.request_id, result:{choice:item.choice, all:false}
+            }, 15_000)
+            if (exactKeys(receipt, ['status']) && receipt.status === 'expired') status = 'expired'
+            else status = 'unknown' // Gateway acceptance is not child queue settlement or command completion.
+          } else {
+            throw new Error('approval dispatch mode invalid')
+          }
         } catch { throw new Error('approval response unknown') }
-        if (!receipt || typeof receipt !== 'object' || typeof receipt.resolved !== 'number' ||
-            !Number.isFinite(receipt.resolved) || receipt.all === true) {
-          status = 'unknown'
-        } else if (receipt.resolved === 1) {
-          status = 'applied'
-        } else if (receipt.resolved === 0) {
-          status = 'expired'
-        } else {
-          status = 'unknown'
-        }
       } catch {
         if (status !== 'unknown') status = 'rejected'
       }

@@ -9,18 +9,25 @@ permissions:
 
 jobs:
   test:
-    name: Tests (${{ matrix.os }})
+    name: Tests (${{ matrix.os }}, core ${{ matrix.core.generation }})
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
         python: ['3.14']
         node: ['24']
+        core:
+          - generation: legacy
+            ref: 74306c1d1b080837744faca3e371267dd09dda4b
+          - generation: current
+            ref: 297552a9d646119871391d202509822cd86330df
     runs-on: ${{ matrix.os }}
     env:
       # All Hermes homes and tempfile fixtures are disposable runner-owned data.
       HERMES_HOME: ${{ github.workspace }}/.ci-scratch/home
       HERMES_TEST_TMPDIR: ${{ github.workspace }}/.ci-scratch/scratch
+      HERMES_CORE_GENERATION: ${{ matrix.core.generation }}
+      HERMES_CORE_REF: ${{ matrix.core.ref }}
       # Dependencies are already synced from the immutable checkout below; do not
       # let the source-checkout auto-bootstrap rebuild or re-home this CI venv.
       HERMES_DISABLE_LAZY_INSTALLS: '1'
@@ -37,7 +44,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: NousResearch/hermes-agent
-          ref: 74306c1d1b080837744faca3e371267dd09dda4b
+          ref: ${{ matrix.core.ref }}
           path: hermes-agent
           fetch-depth: 1
           persist-credentials: false
