@@ -116,6 +116,16 @@ class LightCorrectionFixture(unittest.TestCase):
         self.followup = importlib.import_module(f"{self.package_name}.followup_bridge")
         self.approval = importlib.import_module(f"{self.package_name}.approval_bridge")
         self.state = self.home / "plugin-data" / PLUGIN_ID
+        # Model the real read-only native owner/config relation, not an opaque
+        # object that bypasses the production default-transport admission seam.
+        from types import SimpleNamespace
+        from gateway.config import Platform, PlatformConfig, HomeChannel
+        native_config = PlatformConfig(enabled=True, token=TOKEN,
+            home_channel=HomeChannel(Platform.TELEGRAM, str(CHAT), "Fixture Home"))
+        native_runner = SimpleNamespace(config=SimpleNamespace(platforms={Platform.TELEGRAM: native_config}))
+        self.native_adapter = SimpleNamespace(platform=Platform.TELEGRAM, name="fixture",
+            config=native_config, gateway_runner=native_runner, _plugin_handler_native=None,
+            _plugin_handlers_wired=None, _update_admission=None)
 
     def remove_package_modules(self):
         for name in tuple(sys.modules):
@@ -262,7 +272,7 @@ class PartialWiringCorrectionTests(LightCorrectionFixture):
                 with patch.object(self.notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(self.notifier, "telegram", return_value={"ok": False}):
                     with patch.object(type(app), "add_handler", new=add_once):
-                        self.factory(app, object())
+                        self.factory(app, self.native_adapter)
                     wired_after_failure = app.bot_data.get("_newmetaw_session_complete_telegram_wired")
                     tasks_after_failure = len(set(asyncio.all_tasks()) - baseline_tasks)
                     receiver_after_failure = self.approval.receiver_info(state=self.state)
@@ -270,10 +280,10 @@ class PartialWiringCorrectionTests(LightCorrectionFixture):
                     await app.process_update(self.clarify_text_update(Update, app, 2, 802))
                     await app.process_update(self.completion_text_update(Update, app, 3, 803))
 
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     handlers_after_retry = {group: len(items) for group, items in app.handlers.items()}
                     tasks_after_retry = len(set(asyncio.all_tasks()) - baseline_tasks)
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     handlers_after_repeat = {group: len(items) for group, items in app.handlers.items()}
                     tasks_after_repeat = len(set(asyncio.all_tasks()) - baseline_tasks)
                     await app.process_update(self.approval_text_update(Update, app, 2, 802))
@@ -312,7 +322,7 @@ class PartialWiringCorrectionTests(LightCorrectionFixture):
                 with patch.object(self.notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(self.notifier, "telegram", return_value={"ok": False}), \
                         patch.object(self.approval, "wire", return_value=False):
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     ready = app.bot_data.get("_newmetaw_session_complete_telegram_wired")
                     tasks = len(set(asyncio.all_tasks()) - baseline_tasks)
                     await app.process_update(self.approval_text_update(Update, app, 3, 803))
@@ -352,7 +362,7 @@ class PartialWiringCorrectionTests(LightCorrectionFixture):
                         patch.object(self.notifier, "telegram", return_value={"ok": False}):
                     with patch.object(self.followup, "wire", side_effect=install_then_fail):
                         try:
-                            self.factory(app, object())
+                            self.factory(app, self.native_adapter)
                         except RuntimeError:
                             pass
                     ready = app.bot_data.get("_newmetaw_session_complete_telegram_wired")
@@ -360,9 +370,9 @@ class PartialWiringCorrectionTests(LightCorrectionFixture):
                     tasks_after_failure = len(set(asyncio.all_tasks()) - baseline_tasks)
                     await app.process_update(self.approval_text_update(Update, app, 4, 804))
 
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     handlers_after_retry = {group: len(items) for group, items in app.handlers.items()}
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     handlers_after_repeat = {group: len(items) for group, items in app.handlers.items()}
                     tasks_after_repeat = len(set(asyncio.all_tasks()) - baseline_tasks)
                     await app.process_update(self.approval_text_update(Update, app, 5, 805))
@@ -404,7 +414,7 @@ class NativeEffectiveGateCorrectionTests(LightCorrectionFixture):
             try:
                 with patch.object(self.notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(self.notifier, "telegram", return_value={"ok": False}):
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     with patch.object(self.approval, "choose", side_effect=lambda *a, **k: choose_calls.append(a) or {"ok": False}), \
                             patch.object(self.reply, "intake", side_effect=lambda *a, **k: intake_calls.append(a) or {"ok": True}), \
                             patch.object(self.reply, "flush"):
@@ -473,7 +483,7 @@ class NativeEffectiveGateCorrectionTests(LightCorrectionFixture):
             try:
                 with patch.object(self.notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(self.notifier, "telegram", return_value={"ok": False}):
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     self.write_managed(True, feature="approvals_enabled", selection={
                         "enabled": [], "disabled": [PLUGIN_ID],
                     })
@@ -536,7 +546,7 @@ class NativeEffectiveGateCorrectionTests(LightCorrectionFixture):
             try:
                 with patch.object(self.notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(self.notifier, "telegram", return_value={"ok": False}):
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     for index, failure in enumerate((False, "true", None, RuntimeError("synthetic context read error"))):
                         if isinstance(failure, BaseException):
                             getter = patch.object(self.ctx, "get_config", side_effect=failure)
@@ -678,6 +688,12 @@ class CachedPublicV161MigrationTests(unittest.TestCase):
                 new_package.register(new_ctx)
                 new_factory, owner = new_manager.get_platform_handler_factories("telegram")[0]
                 self.assertEqual(owner, PLUGIN_ID)
+                from types import SimpleNamespace
+                from gateway.config import Platform, PlatformConfig, HomeChannel
+                native_config = PlatformConfig(enabled=True, token=TOKEN,
+                    home_channel=HomeChannel(Platform.TELEGRAM, str(CHAT), "Fixture Home"))
+                native_adapter = SimpleNamespace(platform=Platform.TELEGRAM, config=native_config,
+                    gateway_runner=SimpleNamespace(config=SimpleNamespace(platforms={Platform.TELEGRAM:native_config})))
 
                 # The old factory now resolves the replaced package bytes, but its old
                 # Application marker is untracked by the new transactional installer.
@@ -687,8 +703,8 @@ class CachedPublicV161MigrationTests(unittest.TestCase):
                 with patch.object(new_notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(new_notifier, "telegram", return_value={"ok": False}):
                     self.old_factory(app, object())
-                    new_factory(app, object())
-                    new_factory(app, object())
+                    new_factory(app, native_adapter)
+                    new_factory(app, native_adapter)
                 state = app.bot_data.get("_newmetaw_session_complete_telegram_wiring_state")
                 self.assertIsInstance(state, dict)
                 self.assertIs(state.get("untracked_existing"), True)
@@ -734,11 +750,11 @@ class CachedPublicV161MigrationTests(unittest.TestCase):
                 current_notifier = importlib.import_module(f"{new_package.__package__}.notifier")
                 with patch.object(current_notifier, "credentials", return_value=(TOKEN, CHAT, None)), \
                         patch.object(current_notifier, "telegram", return_value={"ok": False}):
-                    self.assertIs(new_factory(fresh_app, object()), True)
+                    self.assertIs(new_factory(fresh_app, native_adapter), True)
                     ready_counts = {group: len(items) for group, items in fresh_app.handlers.items()}
                     self.assertEqual(ready_counts.get(0), 5, "fresh package installs exactly one approval/reply/followup set")
                     self.assertIs(fresh_app.bot_data.get("_newmetaw_session_complete_telegram_wired"), True)
-                    new_factory(fresh_app, object())
+                    new_factory(fresh_app, native_adapter)
                     self.assertEqual({group: len(items) for group, items in fresh_app.handlers.items()}, ready_counts)
                     fresh_intake = []
                     fresh_later = []

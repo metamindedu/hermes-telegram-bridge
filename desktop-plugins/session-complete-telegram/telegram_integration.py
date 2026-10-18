@@ -308,6 +308,159 @@ def feature_enabled(name: str, *, root: str | Path, ctx=None) -> bool:
     return feature_status(name, root=root, ctx=ctx)[0]
 
 
+# Native receiver bindings belong only to the public SDK Application/adapter pair.
+# Weak values do not keep a disposed application or adapter alive.
+import hmac
+import re
+import weakref
+import time
+
+_NATIVE_BINDINGS = weakref.WeakValueDictionary()
+_NATIVE_BINDING_KEY = "_newmetaw_session_complete_native_transport"
+
+
+class _NativeNotifier:
+    """Explicit receiver-only facade over an already host-bound transport.
+
+    This is not a secret-scope fallback: CLI credentials still use get_secret.
+    The current host's public runner/config identity must prove default ownership;
+    unsupported hosts, named adapters and changed native bindings are refused.
+    """
+    def __init__(self, base, application, adapter, home):
+        self._base, self._application, self._adapter, self._home = base, application, adapter, home
+        self._retired = False
+        self._ever_running = False
+        self._startup_deadline = time.monotonic() + 180
+        self._identity = self._snapshot()
+
+    def _snapshot(self):
+        if self._retired or resolve_package_home(__file__) != self._home:
+            raise RuntimeError("native_transport_binding_unavailable")
+        adapter, application = self._adapter, self._application
+        if application.running:
+            self._ever_running = True
+        elif self._ever_running or time.monotonic() >= self._startup_deadline:
+            raise RuntimeError("native_application_not_live")
+        platform = getattr(adapter, "platform", None)
+        if getattr(platform, "value", platform) != "telegram":
+            raise RuntimeError("native_transport_platform_invalid")
+        config = getattr(adapter, "config", None)
+        runner = getattr(adapter, "gateway_runner", None)
+        platforms = getattr(getattr(runner, "config", None), "platforms", None)
+        if (not isinstance(platforms, dict) or platforms.get(platform) is not config or config is None
+                or getattr(config, "enabled", None) is not True):
+            raise RuntimeError("native_default_transport_unverified")
+        token = getattr(config, "token", None)
+        native_token = getattr(getattr(application, "bot", None), "token", None)
+        if (not isinstance(token, str) or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token)
+                or not isinstance(native_token, str) or not hmac.compare_digest(token, native_token)):
+            raise RuntimeError("native_transport_identity_mismatch")
+        destination = getattr(config, "home_channel", None)
+        if getattr(destination, "platform", None) != platform:
+            raise RuntimeError("native_destination_platform_invalid")
+        raw_chat = getattr(destination, "chat_id", None)
+        match = re.fullmatch(r"([0-9]+)(?::([0-9]+))?", raw_chat) if isinstance(raw_chat, str) else None
+        if not match or int(match[1]) <= 0:
+            raise RuntimeError("native_private_destination_invalid")
+        chat, inline_topic = int(match[1]), int(match[2]) if match[2] else None
+        raw_topic = getattr(destination, "thread_id", None)
+        if raw_topic is not None and (type(raw_topic) not in (str, int) or not re.fullmatch(r"[0-9]+", str(raw_topic))):
+            raise RuntimeError("native_topic_invalid")
+        topic = int(raw_topic) if raw_topic is not None else inline_topic
+        if inline_topic is not None and raw_topic is not None and inline_topic != topic:
+            raise RuntimeError("native_topic_conflict")
+        # If the host DID supply a scope, its stricter current credential policy
+        # must agree too. An unscoped ordinary helper is never made permissive.
+        from agent.secret_scope import current_secret_scope
+        if current_secret_scope() is not None and self._base.credentials() != (token, chat, topic):
+            raise RuntimeError("native_scoped_destination_mismatch")
+        return token, chat, topic
+
+    def credentials(self, root=None):
+        if root is not None and Path(root).resolve() != self._home:
+            raise RuntimeError("native_transport_home_mismatch")
+        try:
+            current = self._snapshot()
+        except RuntimeError as exc:
+            if exc.args and exc.args[0] in {
+                "native_application_not_live", "native_transport_platform_invalid",
+                "native_default_transport_unverified", "native_transport_identity_mismatch",
+                "native_destination_platform_invalid", "native_private_destination_invalid",
+                "native_topic_invalid", "native_topic_conflict",
+            }:
+                self.retire()
+            raise
+        if not hmac.compare_digest(current[0], self._identity[0]) or current[1:] != self._identity[1:]:
+            self.retire()
+            raise RuntimeError("native_transport_binding_changed")
+        return self._identity
+
+    def binding_valid(self):
+        try:
+            self.credentials()
+            return True
+        except Exception:
+            return False
+
+    def retire(self):
+        self._retired = True
+        state = self._application.bot_data.get("_newmetaw_session_complete_telegram_wiring_state", {})
+        state["ready"] = False
+        task = state.get("task")
+        if task is not None and not task.done():
+            task.get_loop().call_soon_threadsafe(task.cancel)
+
+    @property
+    def ROOT(self):
+        return self._base.ROOT
+
+    @property
+    def STATE(self):
+        return self._base.STATE
+
+    def action_enabled(self, *args, **kwargs):
+        return self.binding_valid() and self._base.action_enabled(*args, **kwargs)
+
+    def telegram(self, token, method, payload):
+        expected, chat, topic = self.credentials()
+        if (not isinstance(token, str) or not hmac.compare_digest(token, expected)
+                or not isinstance(payload, dict) or payload.get("chat_id") != chat
+                or ("message_thread_id" in payload and payload["message_thread_id"] != topic)):
+            return {"ok": False, "reason": "native_transport_destination_mismatch"}
+        return self._base.telegram(token, method, payload)
+
+    def inspect_ask(self, *args, **kwargs):
+        return self._base.inspect_ask(*args, **kwargs)
+
+    def legacy_message_id(self, *args, **kwargs):
+        return self._base.legacy_message_id(*args, **kwargs)
+
+    def final_preview(self, *args, **kwargs):
+        return self._base.final_preview(*args, **kwargs)
+
+    def profile_home(self, *args, **kwargs):
+        return self._base.profile_home(*args, **kwargs)
+
+    def state_db(self, *args, **kwargs):
+        return self._base.state_db(*args, **kwargs)
+
+
+def _native_notifier(base, application, adapter, home):
+    existing = application.bot_data.get(_NATIVE_BINDING_KEY)
+    if existing is not None:
+        if (not isinstance(existing, _NativeNotifier) or existing._adapter is not adapter
+                or not existing.binding_valid()):
+            raise RuntimeError("native_transport_reuse_refused")
+        return existing
+    binding = _NativeNotifier(base, application, adapter, home)
+    previous = _NATIVE_BINDINGS.get(id(adapter))
+    if previous is not None and previous._application is not application:
+        previous.retire()
+    _NATIVE_BINDINGS[id(adapter)] = binding
+    application.bot_data[_NATIVE_BINDING_KEY] = binding
+    return binding
+
+
 def _factory(ctx, captured_owner: object):
     def telegram_factory(application, adapter):
         if captured_owner != PLUGIN_ID or getattr(ctx, "plugin_id", None) != PLUGIN_ID:
@@ -345,12 +498,17 @@ def _factory(ctx, captured_owner: object):
         # strict raw and native effective policy through the captured context.
         from . import approval_bridge, followup_bridge, notifier, reply_bridge
 
-        reply_bridge._NOTIFIER = notifier
+        try:
+            native_notifier = _native_notifier(notifier, application, adapter, home)
+        except Exception as exc:
+            logger.warning("Telegram gateway transport binding refused: %s", type(exc).__name__)
+            return False
         return reply_bridge.wire(
             application,
             adapter,
             followup_bridge,
             approval_bridge,
+            notifier=native_notifier,
             replies_enabled=lambda: feature_enabled("clarify_replies_enabled", root=home, ctx=ctx),
             followups_enabled=lambda: feature_enabled("completion_followups_enabled", root=home, ctx=ctx),
             approvals_enabled=lambda: feature_enabled("approvals_enabled", root=home, ctx=ctx),

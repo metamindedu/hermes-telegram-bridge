@@ -749,7 +749,7 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     return result
 
 
-def wire(application, adapter, followup=None, approval=None, *, replies_enabled=None, followups_enabled=None, approvals_enabled=None):
+def wire(application, adapter, followup=None, approval=None, *, notifier=None, replies_enabled=None, followups_enabled=None, approvals_enabled=None):
     """Install scoped consumers transactionally on the existing PTB Application."""
     from telegram.ext import CallbackQueryHandler, MessageHandler, filters, ApplicationHandlerStop
     bot_data = getattr(application, "bot_data", None)
@@ -764,7 +764,7 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         return False
     if bot_data.get(_WIRED_MARKER) is True and isinstance(prior, dict) and prior.get("ready") is True:
         return True
-    notifier = local_notifier()
+    notifier = notifier if notifier is not None else local_notifier()
     try:
         token, chat, topic = notifier.credentials()
         if application.bot.token != token or chat <= 0:
@@ -889,13 +889,24 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
     owned_handlers = []
     task = None
 
+    def transport_live():
+        check = getattr(notifier, "binding_valid", None)
+        if check is None:
+            return True
+        try:
+            return callable(check) and check() is True
+        except Exception:
+            return False
+
     def reply_gate():
+        if not transport_live():return False
         if callable(replies_enabled):
             try:return replies_enabled() is True
             except Exception:return False
         return _feature_status(ROOT)[0]
 
     def followup_gate():
+        if not transport_live():return False
         if callable(followups_enabled):
             try:return followups_enabled() is True
             except Exception:return False
@@ -906,6 +917,7 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         return gateway.feature_enabled("completion_followups_enabled", root=ROOT)
 
     def approval_gate():
+        if not transport_live():return False
         if callable(approvals_enabled):
             try:return approvals_enabled() is True
             except Exception:return False
@@ -928,7 +940,7 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
         verification=None
         retry_at=0
         try:
-            while application.running:
+            while application.running and transport_live():
                 replies_live=reply_gate()
                 followups_live=followup_gate()
                 approvals_live=approval_gate()
@@ -959,8 +971,14 @@ def wire(application, adapter, followup=None, approval=None, *, replies_enabled=
                 await asyncio.gather(verification,return_exceptions=True)
 
     async def ready():
-        while not application.running:await asyncio.sleep(1)
-        await heartbeat_loop()
+        try:
+            while not application.running:
+                if not transport_live():return
+                await asyncio.sleep(1)
+            await heartbeat_loop()
+        finally:
+            if not transport_live():
+                wiring["ready"] = False
 
     def identity(message,user,mid,author):
         return dict(bot=bot,boot=boot,chat=getattr(message.chat,'id',None),user=getattr(user,'id',None),

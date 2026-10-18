@@ -227,6 +227,191 @@ print("native_default_home_envloader_ok")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), 'native_default_home_envloader_ok')
 
+    def native_adapter(self, token, chat='99', topic='7'):
+        from types import SimpleNamespace
+        from gateway.config import HomeChannel, Platform, PlatformConfig
+        config = PlatformConfig(enabled=True, token=token,
+                                home_channel=HomeChannel(Platform.TELEGRAM, chat, 'Fixture Home', thread_id=topic))
+        runner = SimpleNamespace(config=SimpleNamespace(platforms={Platform.TELEGRAM: config}))
+        return SimpleNamespace(platform=Platform.TELEGRAM, config=config, gateway_runner=runner)
+
+    def test_default_multiplex_factory_uses_host_bound_native_transport_without_secret_scope(self):
+        """Cold default connect is unscoped; only the host-bound native transport is authority."""
+        from telegram.ext import Application
+
+        target = self.install(FRONTEND)
+        (self.home / 'config.yaml').write_text(
+            'plugins:\n  enabled: [session-complete-telegram]\n  entries:\n'
+            '    session-complete-telegram:\n      settings: {}\n', encoding='utf-8')
+        token = '765432:native-transport-fixture-token'
+        adapter = self.native_adapter(token)
+        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+            module = self.load(target, 'native_cold_connect')
+            ctx = RecordingContext(FRONTEND)
+            module.register(ctx)
+            cleared = secret_scope.set_secret_scope(None)
+            multiplex = secret_scope.set_multiplex_context(True)
+            try:
+                reply = __import__(module.__name__ + '.reply_bridge', fromlist=['reply_bridge'])
+                async def exercise():
+                    application = Application.builder().token(token).build()
+                    try:
+                        accepted = ctx.factories[0](application, adapter)
+                        self.assertIs(accepted, True)
+                        self.assertFalse(application.running)
+                    finally:
+                        task = application.bot_data.get(reply._WIRING_STATE, {}).get('task')
+                        if task is not None:
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                asyncio.run(exercise())
+            finally:
+                secret_scope.reset_multiplex_context(multiplex)
+                secret_scope.reset_secret_scope(cleared)
+
+    def test_native_binding_identity_lifetime_policy_and_unscoped_flush(self):
+        import time
+        from telegram.ext import Application
+        token = '765432:native-transport-fixture-token'
+        target = self.install(FRONTEND)
+        config_file = self.home / 'config.yaml'
+        config_file.write_text(
+            'plugins:\n  enabled: [session-complete-telegram]\n  entries:\n'
+            '    session-complete-telegram:\n      settings: {replies_enabled: true}\n', encoding='utf-8')
+        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+            module = self.load(target, 'native_lifetime')
+            ctx = RecordingContext(FRONTEND)
+            module.register(ctx)
+            gateway = __import__(module.__name__ + '.telegram_integration', fromlist=['telegram_integration'])
+            reply = __import__(module.__name__ + '.reply_bridge', fromlist=['reply_bridge'])
+            base = __import__(module.__name__ + '.notifier', fromlist=['notifier'])
+            cleared = secret_scope.set_secret_scope(None)
+            multiplex = secret_scope.set_multiplex_context(True)
+            try:
+                async def exercise():
+                    applications = []
+                    def app(tok=token):
+                        value = Application.builder().token(tok).build()
+                        applications.append(value)
+                        return value
+                    try:
+                        adapter = self.native_adapter(token)
+                        foreign = self.native_adapter(token)
+                        foreign.gateway_runner = adapter.gateway_runner
+                        missing = self.native_adapter(token)
+                        missing.gateway_runner = None
+                        for label, candidate, native in [
+                            ('named-config-in-default-context', foreign, app()),
+                            ('missing-owner-provenance', missing, app()),
+                            ('native-token-mismatch', self.native_adapter(token), app('111111:wrong-native-token')),
+                            ('nonprivate-destination', self.native_adapter(token, '-99'), app()),
+                            ('conflicting-topic', self.native_adapter(token, '99:8', '7'), app()),
+                            ('malformed-topic', self.native_adapter(token, '99', 'bad'), app()),
+                        ]:
+                            with self.subTest(boundary=label):
+                                self.assertIs(ctx.factories[0](native, candidate), False)
+                                self.assertEqual(native.handlers, {})
+                        application = app()
+                        self.assertIs(ctx.factories[0](application, adapter), True)
+                        binding = application.bot_data[gateway._NATIVE_BINDING_KEY]
+                        first_task = application.bot_data[reply._WIRING_STATE]['task']
+                        first_handlers = sum(map(len, application.handlers.values()))
+                        self.assertGreater(first_handlers, 0)
+                        self.assertIs(ctx.factories[0](application, adapter), True)
+                        self.assertIs(application.bot_data[reply._WIRING_STATE]['task'], first_task)
+                        self.assertEqual(sum(map(len, application.handlers.values())), first_handlers)
+                        with self.assertRaises(secret_scope.UnscopedSecretError):
+                            base.credentials()
+                        self.assertEqual(await asyncio.to_thread(binding.credentials), (token, 99, 7))
+                        # Exercise the REAL deferred flush, including its credential read,
+                        # SQLite commit and exactly one mocked Telegram request.
+                        now = time.time()
+                        c = reply.connect(reply.STATE)
+                        with c:
+                            c.execute('''INSERT INTO forms
+                                (id,identity,owner,descriptor,params,questions,bot,boot,chat,topic,
+                                 created,expires,seen,status,mids,texts,dirty)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                                ('native-fixture','native-fixture-identity','fixture-owner','{}','{}',
+                                 '[{"qid":"q1","question":"fixture","choices":[],"multi_select":false}]',
+                                 765432,'fixture-boot',99,7,now,now+3600,now,'expired',
+                                 '{"0":123}','{"0":"fixture"}',1))
+                        c.close()
+                        with patch.object(base, 'telegram', return_value={'ok': True}) as send:
+                            self.assertFalse(binding.telegram(token, 'editMessageText', {'chat_id':100})['ok'])
+                            self.assertEqual(send.call_count, 0)
+                            await asyncio.to_thread(reply.flush, binding)
+                            self.assertEqual(send.call_count, 1)
+                            self.assertEqual(send.call_args.args[1], 'editMessageText')
+                            self.assertEqual(send.call_args.args[2]['chat_id'], 99)
+                        c = reply.connect(reply.STATE)
+                        self.assertEqual(c.execute("SELECT dirty FROM forms WHERE id='native-fixture'").fetchone()[0], 0)
+                        c.close()
+                        # Replacing even an application that NEVER started retires
+                        # only its owned watcher and rejects stale-client reuse.
+                        replacement = app()
+                        self.assertIs(ctx.factories[0](replacement, adapter), True)
+                        await asyncio.gather(first_task, return_exceptions=True)
+                        self.assertTrue(first_task.done())
+                        self.assertFalse(binding.binding_valid())
+                        self.assertIs(ctx.factories[0](application, adapter), False)
+                        newer = replacement.bot_data[gateway._NATIVE_BINDING_KEY]
+                        self.assertTrue(newer.binding_valid())
+                        adapter.config.home_channel.chat_id = '100'
+                        self.assertFalse(newer.binding_valid())
+                        with self.assertRaises(RuntimeError):newer.credentials()
+                        self.assertIs(ctx.factories[0](replacement, adapter), False)
+                        never_started = app()
+                        self.assertIs(ctx.factories[0](never_started, self.native_adapter(token)), True)
+                        idle_binding = never_started.bot_data[gateway._NATIVE_BINDING_KEY]
+                        idle_binding._startup_deadline = time.monotonic() - 1
+                        idle_task = never_started.bot_data[reply._WIRING_STATE]['task']
+                        await asyncio.wait_for(asyncio.shield(idle_task), timeout=2)
+                        self.assertTrue(idle_task.done())
+                        self.assertFalse(never_started.bot_data[reply._WIRING_STATE]['ready'])
+                        for field in ('token', 'topic', 'enabled'):
+                            changed_adapter = self.native_adapter(token)
+                            changed_app = app()
+                            self.assertIs(ctx.factories[0](changed_app, changed_adapter), True)
+                            changed_binding = changed_app.bot_data[gateway._NATIVE_BINDING_KEY]
+                            if field == 'token':changed_adapter.config.token = '111111:rotated-token'
+                            elif field == 'topic':changed_adapter.config.home_channel.thread_id = '8'
+                            else:changed_adapter.config.enabled = False
+                            with self.subTest(changed=field):
+                                self.assertFalse(changed_binding.binding_valid())
+                                changed_adapter.config.token = token
+                                changed_adapter.config.home_channel.thread_id = '7'
+                                changed_adapter.config.enabled = True
+                                self.assertFalse(changed_binding.binding_valid(), 'a retired binding must not revive')
+                        # Host-equivalent split and inline topics agree, but an
+                        # installed foreign secret scope is never overridden.
+                        inline_adapter = self.native_adapter(token, '99:7', None)
+                        inline = app()
+                        self.assertIs(ctx.factories[0](inline, inline_adapter), True)
+                        live = inline.bot_data[gateway._NATIVE_BINDING_KEY]
+                        self.assertEqual(live.credentials(), (token,99,7))
+                        scoped = secret_scope.set_secret_scope({'TELEGRAM_BOT_TOKEN':'111111:foreign-token',
+                                                               'TELEGRAM_HOME_CHANNEL':'99:7'}, profile_home=str(self.home))
+                        try:
+                            self.assertFalse(live.binding_valid())
+                            self.assertIs(ctx.factories[0](app(), self.native_adapter(token)), False)
+                        finally:secret_scope.reset_secret_scope(scoped)
+                        self.assertTrue(live.action_enabled('clarify_replies_enabled'))
+                        config_file.write_text(
+                            'plugins:\n  enabled: [session-complete-telegram]\n  entries:\n'
+                            '    session-complete-telegram:\n      settings: {service_enabled: false, replies_enabled: true}\n',
+                            encoding='utf-8')
+                        self.assertFalse(live.action_enabled('clarify_replies_enabled'))
+                    finally:
+                        tasks = [value.bot_data.get(reply._WIRING_STATE, {}).get('task') for value in applications]
+                        tasks = [task for task in tasks if task is not None]
+                        for task in tasks:task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                asyncio.run(exercise())
+            finally:
+                secret_scope.reset_multiplex_context(multiplex)
+                secret_scope.reset_secret_scope(cleared)
+
     def test_default_gateway_factory_matches_the_current_scoped_bot_token(self):
         from agent.secret_scope import reset_secret_scope, set_secret_scope
         from telegram.ext import Application
@@ -251,10 +436,11 @@ print("native_default_home_envloader_ok")
                 reply_bridge = __import__('_bridge_registration_' + module_name + '.reply_bridge', fromlist=['reply_bridge'])
                 async def exercise():
                     mismatch = Application.builder().token('111111:env-only-token').build()
-                    refused = context.factories[0](mismatch, object())
+                    adapter = self.native_adapter('765432:scoped-token')
+                    refused = context.factories[0](mismatch, adapter)
                     self.assertIs(refused, False)
                     matching = Application.builder().token('765432:scoped-token').build()
-                    accepted = context.factories[0](matching, object())
+                    accepted = context.factories[0](matching, adapter)
                     self.assertIs(accepted, True)
                     self.assertFalse(matching.running)
                     task = matching.bot_data[reply_bridge._WIRING_STATE].get('task')
