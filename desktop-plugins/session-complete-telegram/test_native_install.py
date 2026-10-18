@@ -406,6 +406,12 @@ class NativeInstallTests(unittest.TestCase):
 
         async def run():
             app = Application.builder().token("77:synthetic-token").build()
+            from types import SimpleNamespace
+            from gateway.config import Platform, PlatformConfig, HomeChannel
+            native_config = PlatformConfig(enabled=True, token="77:synthetic-token",
+                home_channel=HomeChannel(Platform.TELEGRAM, "99", "Fixture Home"))
+            native_adapter = SimpleNamespace(platform=Platform.TELEGRAM, config=native_config,
+                gateway_runner=SimpleNamespace(config=SimpleNamespace(platforms={Platform.TELEGRAM:native_config})))
             with (
                     patch.object(type(app.bot), "initialize", new=AsyncMock()),
                     patch.object(type(app.bot), "shutdown", new=AsyncMock()),
@@ -414,9 +420,9 @@ class NativeInstallTests(unittest.TestCase):
             ):
                 await app.initialize()
                 before_tasks = set(asyncio.all_tasks())
-                factory(app, object())
+                self.assertIs(factory(app, native_adapter), True)
                 handler_counts = {group: len(handlers) for group, handlers in app.handlers.items()}
-                factory(app, object())
+                self.assertIs(factory(app, native_adapter), True)
                 self.assertEqual({group: len(handlers) for group, handlers in app.handlers.items()}, handler_counts)
                 later = []
                 async def downstream(update, context):
