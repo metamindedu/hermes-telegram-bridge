@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import contextlib
 import importlib.util
@@ -10,11 +11,13 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
 
 import test_support
+from agent import secret_scope
 
 REPO = Path(__file__).resolve().parents[2]
 FRONTEND = 'session-complete-telegram'
@@ -82,19 +85,25 @@ class CatalogRegistrationTests(unittest.TestCase):
     def test_uninstalled_recording_context_declares_both_without_home_or_state_access(self):
         module = self.load(REPO / 'desktop-plugins' / FRONTEND, 'single_primary')
         ctx = RecordingContext(FRONTEND)
-        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
-            module.register(ctx)
-        self.assertEqual([item['name'] for item in ctx.commands], ['desktop-telegram-bridge'])
-        self.assertEqual(len(ctx.factories), 1)
-        self.assertEqual(list(self.home.iterdir()), [])
+        cleared_scope = secret_scope.set_secret_scope(None)
+        multiplex = secret_scope.set_multiplex_context(True)
+        try:
+            with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+                module.register(ctx)
+            self.assertEqual([item['name'] for item in ctx.commands], ['desktop-telegram-bridge'])
+            self.assertEqual(len(ctx.factories), 1)
+            self.assertEqual(list(self.home.iterdir()), [])
 
-        legacy = self.load(REPO / 'plugins' / INGRESS, 'deprecated_legacy')
-        old_ctx = RecordingContext(INGRESS)
-        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
-            legacy.register(old_ctx)
-        self.assertEqual(old_ctx.commands, [])
-        self.assertEqual(old_ctx.factories, [])
-        self.assertEqual(list(self.home.iterdir()), [])
+            legacy = self.load(REPO / 'plugins' / INGRESS, 'deprecated_legacy')
+            old_ctx = RecordingContext(INGRESS)
+            with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+                legacy.register(old_ctx)
+            self.assertEqual(old_ctx.commands, [])
+            self.assertEqual(old_ctx.factories, [])
+            self.assertEqual(list(self.home.iterdir()), [])
+        finally:
+            secret_scope.reset_multiplex_context(multiplex)
+            secret_scope.reset_secret_scope(cleared_scope)
 
     def test_primary_manifest_declares_default_off_independent_native_settings(self):
         import yaml
@@ -175,6 +184,86 @@ class CatalogRegistrationTests(unittest.TestCase):
             legacy.register(old_ctx)
             self.assertEqual(old_ctx.factories, [])
         self.assertFalse((named / 'plugin-data').exists())
+
+    def test_native_cli_default_home_envloader_uses_fake_credentials_in_a_child_process(self):
+        core = Path(secret_scope.__file__).resolve().parents[1]
+        managed = self.root / 'managed'
+        managed.mkdir()
+        self.env_path = self.home / '.env'
+        self.env_path.write_text(
+            'TELEGRAM_BOT_TOKEN=765432:subprocess-fixture-token\n'
+            'TELEGRAM_HOME_CHANNEL=99:7\n', encoding='utf-8')
+        script = '''
+import os, sys
+from pathlib import Path
+core = Path(os.environ["HERMES_CORE_ROOT"]).resolve(strict=True)
+sys.path.insert(0, str(core))
+sys.path.insert(0, os.environ["BRIDGE_PACKAGE"])
+from hermes_cli.env_loader import load_hermes_dotenv
+from agent.secret_scope import get_secret
+from notifier import credentials
+home = Path(os.environ["HERMES_HOME"]).resolve(strict=True)
+loaded = load_hermes_dotenv(hermes_home=home, load_external_secrets=False)
+assert home / ".env" in loaded
+value = credentials(home)
+assert value == ("765432:subprocess-fixture-token", 99, 7)
+assert get_secret("TELEGRAM_BOT_TOKEN") == value[0]
+assert Path(__import__("agent.secret_scope", fromlist=["get_secret"]).__file__).resolve().is_relative_to(core)
+print("native_default_home_envloader_ok")
+'''
+        child_env = os.environ.copy()
+        for key in tuple(child_env):
+            if key.upper().startswith('TELEGRAM_'):
+                child_env.pop(key, None)
+        child_env.update({
+            'HERMES_HOME': str(self.home),
+            'HERMES_CORE_ROOT': str(core),
+            'HERMES_MANAGED_DIR': str(managed),
+            'BRIDGE_PACKAGE': str(REPO / 'desktop-plugins' / FRONTEND),
+            'HERMES_DISABLE_LAZY_INSTALLS': '1',
+        })
+        result = subprocess.run([sys.executable, '-c', script], cwd=str(self.home),
+                                env=child_env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), 'native_default_home_envloader_ok')
+
+    def test_default_gateway_factory_matches_the_current_scoped_bot_token(self):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from telegram.ext import Application
+
+        target = self.install(FRONTEND)
+        (self.home / 'config.yaml').write_text(
+            'plugins:\n  enabled: [session-complete-telegram]\n  entries:\n'
+            '    session-complete-telegram:\n      settings: {}\n', encoding='utf-8')
+        (self.home / '.env').write_text(
+            'TELEGRAM_BOT_TOKEN=111111:env-only-token\n'
+            'TELEGRAM_HOME_CHANNEL=88:8\n', encoding='utf-8')
+        module_name = 'actual_gateway_factory_scope'
+        with patch.dict(os.environ, {'HERMES_HOME': str(self.home)}):
+            module = self.load(target, module_name)
+            context = RecordingContext(FRONTEND)
+            module.register(context)
+            self.assertEqual(len(context.factories), 1)
+            scope = set_secret_scope({'TELEGRAM_BOT_TOKEN': '765432:scoped-token',
+                                      'TELEGRAM_HOME_CHANNEL': '99:7'}, profile_home=str(self.home))
+            try:
+                import asyncio
+                reply_bridge = __import__('_bridge_registration_' + module_name + '.reply_bridge', fromlist=['reply_bridge'])
+                async def exercise():
+                    mismatch = Application.builder().token('111111:env-only-token').build()
+                    refused = context.factories[0](mismatch, object())
+                    self.assertIs(refused, False)
+                    matching = Application.builder().token('765432:scoped-token').build()
+                    accepted = context.factories[0](matching, object())
+                    self.assertIs(accepted, True)
+                    self.assertFalse(matching.running)
+                    task = matching.bot_data[reply_bridge._WIRING_STATE].get('task')
+                    if task is not None:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                asyncio.run(exercise())
+            finally:
+                reset_secret_scope(scope)
 
 
 if __name__ == '__main__':

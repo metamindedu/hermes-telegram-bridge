@@ -27,7 +27,7 @@ test('native fresh materialization retains the existing Desktop ID and exact can
   assert.equal(await native.materializeDesktopHalf(f.packageDir, f.appRoot, id), f.target)
   assert.deepEqual(await fs.readFile(path.join(f.target, 'plugin.js')), await fs.readFile(source))
   const materializedText = await fs.readFile(path.join(f.target, 'plugin.js'), 'utf8')
-  assert.match(materializedText, /APPROVAL_CAPABILITY = 'desktop-command-approval-v5'/u)
+  assert.match(materializedText, /APPROVAL_CAPABILITY = 'desktop-command-approval-v6'/u)
   assert.match(materializedText, /VERSION = '1.8.1'/u)
   const marker = JSON.parse(await fs.readFile(path.join(f.target, '.hermes-package.json'), 'utf8'))
   assert.equal(marker.package, id)

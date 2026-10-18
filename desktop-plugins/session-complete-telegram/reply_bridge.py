@@ -9,6 +9,7 @@ import hmac
 import importlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import sys
@@ -142,8 +143,14 @@ def canonical(value):
 
 def connect(state=STATE):
     state = Path(state) / 'reply-inbox'
-    state.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(state / 'replies.sqlite3', timeout=8, isolation_level=None)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # POSIX permissions are owner-only; Windows inherits the existing plugin-data ACL.
+    try:
+        os.chmod(state, 0o700)
+    except OSError:
+        pass
+    path = state / 'replies.sqlite3'
+    c = sqlite3.connect(path, timeout=8, isolation_level=None)
     c.row_factory = sqlite3.Row
     c.execute('PRAGMA secure_delete=ON')
     c.executescript('''
@@ -161,6 +168,10 @@ def connect(state=STATE):
     CREATE TABLE IF NOT EXISTS send_claims (identity TEXT PRIMARY KEY, form_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS tombstones (bot INTEGER, chat INTEGER, mid INTEGER, form_id TEXT, question_index INTEGER, PRIMARY KEY(bot,chat,mid));
     ''')
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return c
 
 

@@ -20,14 +20,14 @@ import unicodedata
 from pathlib import Path
 
 VERSION = "1.8.0"
-CAPABILITY = "desktop-command-approval-v5"
+CAPABILITY = "desktop-command-approval-v6"
 PREFIX = "hda:"
 LEASE = 45
 MAX_TTL = 31_536_000
 MAX_REVIEW_UNITS = 4096
 MAX_ACTIVE = 100
 ALLOWED_CHOICES = frozenset({"once", "deny"})
-ACTIVE = ("posting", "open", "queued", "applying")
+ACTIVE = ("posting", "open", "queued", "applying", "dispatching")
 TERMINAL = ("applied", "expired", "rejected", "unknown")
 STALE_SEEN = -1e30
 
@@ -152,9 +152,9 @@ def retire_unexecuted(*, state=STATE, now=None):
     c = connect(state)
     try:
         c.execute("BEGIN IMMEDIATE")
-        rows = c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying')").fetchall()
+        rows = c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching')").fetchall()
         for row in rows:
-            status = "unknown" if row["status"] in ("posting", "applying") else (
+            status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                 "rejected" if row["status"] == "queued" else "expired")
             _retire(c, row, status, now)
         c.commit()
@@ -167,22 +167,22 @@ def retire_unexecuted(*, state=STATE, now=None):
 
 
 def _expire_owner(c, owner, now):
-    for row in c.execute("SELECT * FROM approvals WHERE owner=? AND status IN ('posting','open','queued','applying')",
+    for row in c.execute("SELECT * FROM approvals WHERE owner=? AND status IN ('posting','open','queued','applying','dispatching')",
                          (owner,)).fetchall():
-        status = "unknown" if row["status"] in ("posting", "applying") else (
+        status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
         _retire(c, row, status, now)
 
 
 def _prune(c, now):
-    for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying') AND expires<=?",
+    for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching') AND expires<=?",
                          (now,)).fetchall():
-        status = "unknown" if row["status"] in ("posting", "applying") else (
+        status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
         _retire(c, row, status, now)
-    for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying') AND seen<?",
+    for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching') AND seen<?",
                          (now - LEASE,)).fetchall():
-        status = "unknown" if row["status"] in ("posting", "applying") else (
+        status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
         _retire(c, row, status, now)
     # A receiver or owner lease gap is terminal for an already queued choice.
@@ -193,8 +193,8 @@ def _prune(c, now):
     except (TypeError, ValueError, KeyError):
         live, gap = None, True
     if gap:
-        for row in c.execute("SELECT * FROM approvals WHERE status IN ('queued','applying')").fetchall():
-            _retire(c, row, "unknown" if row["status"] == "applying" else "rejected", now)
+        for row in c.execute("SELECT * FROM approvals WHERE status IN ('queued','applying','dispatching')").fetchall():
+            _retire(c, row, "unknown" if row["status"] in {"applying", "dispatching"} else "rejected", now)
     for owner_row in c.execute("SELECT owner,seen FROM owners WHERE seen<? OR seen>?", (now - LEASE, now)).fetchall():
         _expire_owner(c, owner_row["owner"], now)
 
@@ -238,8 +238,8 @@ def bind_receiver(bot, chat, topic, boot, *, private_verified, state=STATE, now=
         if old and (old.get("boot") != boot or old.get("bot") != bot or old.get("chat") != chat or
                     old.get("topic") != topic or old.get("version") != VERSION or
                     now - float(old.get("at", now)) > LEASE):
-            for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying')").fetchall():
-                status = "unknown" if row["status"] in ("posting", "applying") else (
+            for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching')").fetchall():
+                status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
                 _retire(c, row, status, now)
         c.execute("INSERT OR REPLACE INTO receiver VALUES('live',?)",
@@ -412,13 +412,19 @@ def _request_queue_conflict(request, pending):
         return True
 
 
-def supported_pair(request, pending, runtime_sid, dispatch_mode="queue"):
-    """Validate the frozen native approval envelope for exactly one dispatch mode."""
+def supported_pair(request, pending, runtime_sid, dispatch_mode="legacyqueue"):
+    """Validate one explicitly frozen legacy or canonical authority mode."""
+    if dispatch_mode == "canonical_native":
+        backend = _sibling("newcanonical_backend")
+        return (isinstance(request, dict) and isinstance(pending, dict) and
+                backend.validate_prompt(request) and
+                request.get("execution_generation") == (pending.get("execution_generation") if isinstance(pending, dict) else None) and
+                backend.prompt_identity(request) == (request.get("prompt_id"), request.get("execution_generation")))
     if not _valid_native_approval(request, runtime_sid):
         return False
-    if dispatch_mode == "queue":
+    if dispatch_mode == "legacyqueue":
         return _queue_pair_matches(request, pending, runtime_sid)
-    if dispatch_mode == "server_request":
+    if dispatch_mode == "legacyserver_request":
         return pending == {"request_id": request["params"]["request_id"], "missing": True}
     return False
 
@@ -442,10 +448,10 @@ def classify_approval_authority(request, queue_snapshot, runtime_sid):
     if matches:
         if len(matches) != 1 or not _queue_pair_matches(request, matches[0], runtime_sid):
             return None
-        return {"dispatch_mode": "queue", "pending": matches[0]}
+        return {"dispatch_mode": "legacyqueue", "pending": matches[0]}
     if any(_request_queue_conflict(request, row) for row in rows):
         return None
-    return {"dispatch_mode": "server_request",
+    return {"dispatch_mode": "legacyserver_request",
             "pending": {"request_id": request_id, "missing": True}}
 
 
@@ -544,6 +550,34 @@ def review_card(request, timeout_seconds):
     return text
 
 
+def review_canonical_card(prompt, timeout_seconds):
+    """Review exactly the complete native prompt; never manufacture a legacy request envelope."""
+    backend = _sibling("newcanonical_backend")
+    if not backend.validate_prompt(prompt):
+        raise ValueError("review_native_payload_invalid")
+    command = _redact_literal(prompt["command"])
+    description = _redact_literal(prompt["description"])
+    if not command.strip() or not description.strip():
+        raise ValueError("review_text_missing")
+    if prompt["command"] != prompt["description"] and command == description:
+        raise ValueError("redaction_collision")
+    rendered = _review_native_value(prompt)
+    try:
+        supplied = json.dumps(rendered, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError("review_native_payload_invalid") from exc
+    text = ("⚠️ Hermes Desktop 명령 승인\n\n"
+            f"설명\n{description}\n\n명령 (전체)\n$ {command}\n\n"
+            "Desktop에서 받은 전체 승인 요청 (JSON)\n"
+            f"{supplied}\n\n"
+            "표시된 요청에 포함되지 않은 도구 인수·자식 요청의 실제 결정 정착·파일 diff는 이 카드가 증명하지 않습니다.\n"
+            f"이 요청만 한 번 허용하거나 거부합니다. {int(timeout_seconds)}초 후 만료됩니다.\n"
+            "다른 작업·세션에 대한 권한은 저장되지 않습니다.")
+    if len(text.encode("utf-16-le", errors="strict")) // 2 > MAX_REVIEW_UNITS:
+        raise ValueError("review_card_too_large")
+    return text
+
+
 def _approval_timeout(profile, notifier, root):
     """Mirror the pinned approvals.timeout default/clamp; never apply clarify's 1h floor."""
     config = {}
@@ -577,13 +611,51 @@ def _approval_timeout(profile, notifier, root):
 
 
 def _identity_base(descriptor):
-    keys = ("connectionId", "profile", "targetProfile", "sid", "session_key", "epoch",
-            "request_id", "queue_id")
+    if descriptor.get("dispatch_mode") == "canonical_native":
+        # Desktop ownership/connection stays in the stored authorization binding,
+        # but cannot mint a second dispatch identity for the same native approval.
+        keys = ("dispatch_mode", "profile", "targetProfile", "root_binding", "target_home_binding",
+                "sid", "session_key", "instance_id", "authority_epoch", "replay_epoch",
+                "transport_protocol", "prompt_id", "execution_generation",
+                "request_fingerprint", "pending_fingerprint")
+    else:
+        keys = ("connectionId", "profile", "targetProfile", "sid", "session_key", "epoch",
+                "request_id", "queue_id")
     return {key: descriptor[key] for key in keys}
+
+
+_CANONICAL_SLOT_KEYS = (
+    "dispatch_mode", "profile", "targetProfile", "root_binding", "target_home_binding",
+    "sid", "session_key", "instance_id", "authority_epoch", "replay_epoch",
+    "transport_protocol", "prompt_id", "execution_generation",
+)
+
+
+def _canonical_native_slot(descriptor):
+    """Owner/connection/payload-independent native settlement slot; opaque IDs stay literal."""
+    if not isinstance(descriptor, dict) or descriptor.get("dispatch_mode") != "canonical_native":
+        return None
+    if any(key not in descriptor for key in _CANONICAL_SLOT_KEYS):
+        return None
+    return {key: descriptor[key] for key in _CANONICAL_SLOT_KEYS}
+
+
+def _same_canonical_native_slot(left, right):
+    left_slot, right_slot = _canonical_native_slot(left), _canonical_native_slot(right)
+    return bool(left_slot is not None and right_slot is not None and
+                canonical(left_slot) == canonical(right_slot))
 
 
 def validate_snapshot(descriptor, request, pending, route, row, epoch, owner):
     """Full client-side snapshot/route/session authority matrix, fail-closed."""
+    if isinstance(descriptor, dict) and descriptor.get("dispatch_mode") == "canonical_native":
+        backend = _sibling("newcanonical_backend")
+        return bool(backend._validate_descriptor(descriptor) and descriptor.get("owner") == owner and
+            backend.validate_prompt(request) and backend.pending_matches(descriptor, request, pending) and
+            isinstance(route, dict) and route.get("mode") == "local" and
+            all(route.get(key) == descriptor.get(key) for key in ("connectionId", "profile", "targetProfile")) and
+            isinstance(row, dict) and row.get("id") == descriptor["sid"] and
+            row.get("session_key") == descriptor["session_key"] and row.get("status") == "waiting")
     required = ("owner", "connectionId", "profile", "targetProfile", "sid", "session_key",
                 "epoch", "request_id", "queue_id", "dispatch_mode",
                 "request_fingerprint", "pending_fingerprint")
@@ -615,6 +687,8 @@ def validate_snapshot(descriptor, request, pending, route, row, epoch, owner):
 
 
 def _validate_descriptor(descriptor):
+    if isinstance(descriptor, dict) and descriptor.get("dispatch_mode") == "canonical_native":
+        return _sibling("newcanonical_backend")._validate_descriptor(descriptor)
     required = {"owner", "connectionId", "profile", "targetProfile", "sid", "session_key",
                 "epoch", "request_id", "queue_id", "dispatch_mode",
                 "request_fingerprint", "pending_fingerprint"}
@@ -622,7 +696,7 @@ def _validate_descriptor(descriptor):
         return False
     if any(not isinstance(descriptor.get(key), str) or not descriptor[key] for key in required):
         return False
-    if descriptor["dispatch_mode"] not in {"queue", "server_request"}:
+    if descriptor["dispatch_mode"] not in {"legacyqueue", "legacyserver_request"}:
         return False
     if len(canonical(descriptor).encode("utf-8")) > 12000:
         return False
@@ -646,6 +720,8 @@ def claim_valid(owner, approval_id, claim, descriptor, authority, deadline, *,
             type(deadline) not in (int, float) or not isinstance(deadline, (int, float)) or
             not math.isfinite(deadline) or not _validate_descriptor(descriptor)):
         return {"ok": False, "reason": "invalid_claim"}
+    if descriptor["dispatch_mode"] == "canonical_native":
+        return {"ok": False, "reason": "canonical_apply_required"}
     try:
         expected_authority = _digest(descriptor)
         if authority != expected_authority:
@@ -692,11 +768,181 @@ def claim_valid(owner, approval_id, claim, descriptor, authority, deadline, *,
         return {"ok": False, "reason": "approval_store_unavailable"}
 
 
+def _canonical_snapshot_inputs(req, notifier, root):
+    backend = _sibling("newcanonical_backend")
+    descriptor, prompt, pending = req.get("descriptor"), req.get("request"), req.get("pending")
+    owner, route, session = req.get("owner"), req.get("route"), req.get("session")
+    if (not backend._validate_descriptor(descriptor) or descriptor.get("owner") != owner or
+            not backend.validate_prompt(prompt) or not backend.pending_matches(descriptor, prompt, pending)):
+        return None
+    if (not isinstance(route, dict) or set(route) != {"mode", "connectionId", "profile", "targetProfile"} or
+            route.get("mode") != "local" or
+            any(route.get(key) != descriptor.get(key) for key in
+                ("connectionId", "profile", "targetProfile"))):
+        return None
+    if (not isinstance(session, dict) or session.get("id") != descriptor["sid"] or
+            session.get("session_key") != descriptor["session_key"] or session.get("status") != "waiting"):
+        return None
+    try:
+        resolved_root = Path(root).expanduser().resolve(strict=True)
+        target_home = notifier.profile_home(descriptor["targetProfile"], root=resolved_root)
+        if (backend.root_binding(resolved_root) != descriptor["root_binding"] or
+                backend._path_binding(target_home) != descriptor["target_home_binding"]):
+            return None
+    except Exception:
+        return None
+    return descriptor, prompt, pending, resolved_root
+
+
+def _canonical_timeout(descriptor, prompt, notifier, root):
+    configured = _approval_timeout(descriptor["targetProfile"], notifier, root)
+    if configured is None:
+        return None
+    native_timeout = prompt.get("timeout_s")
+    seconds = min(configured, native_timeout) if type(native_timeout) is int else configured
+    return max(0, seconds)
+
+
+def register_canonical(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=None):
+    now = time.time() if now is None else now
+    if result_budget is not None and (type(result_budget) is not int or result_budget <= 0):
+        return {"ok": False, "reason": "invalid_result_budget"}
+    validated = _canonical_snapshot_inputs(req, notifier, root)
+    if validated is None:
+        return {"ok": False, "reason": "stale_snapshot"}
+    descriptor, prompt, pending, resolved_root = validated
+    fresh = _sibling("newcanonical_backend").observe_bound(
+        descriptor, prompt, root=resolved_root, notifier=notifier)
+    if fresh.get("ok") is not True:
+        return {"ok": False, "reason": "stale_snapshot"}
+    timeout = _canonical_timeout(descriptor, prompt, notifier, resolved_root)
+    if timeout is None:
+        return {"ok": False, "reason": "timeout_unavailable"}
+    if timeout <= 0:
+        return {"ok": False, "reason": "approval_expired"}
+    expires = now + min(timeout, MAX_TTL)
+    try:
+        text = review_canonical_card(prompt, timeout)
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc) if str(exc).startswith(("review_", "redaction_")) else "review_unavailable"}
+    if result_budget is not None:
+        projected = {"id": "0" * 32, "claim": "0" * 32,
+                     "deadline": min(float(expires), now + LEASE), "descriptor": descriptor,
+                     "request": prompt, "pending": pending, "choice": "once"}
+        try:
+            if len(_response_bytes({"ok": True, "items": [projected], "terminal": []})) > result_budget:
+                return {"ok": False, "reason": "approval_result_too_large"}
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            return {"ok": False, "reason": "approval_result_too_large"}
+    identity = _digest(_identity_base(descriptor))
+    c = connect(state)
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        _prune(c, now)
+        live = _receiver(c, now)
+        if not live:
+            c.commit()
+            return {"ok": False, "feature_ready": False, "reason": "receiver_unavailable"}
+        if not _owner_live(c, descriptor["owner"], now):
+            c.commit()
+            return {"ok": False, "feature_ready": False, "reason": "owner_unavailable"}
+        token, chat, topic = notifier.credentials(resolved_root)
+        bot = int(token.split(":", 1)[0])
+        if (live["bot"], live["chat"], live["topic"]) != (bot, chat, topic) or chat <= 0:
+            c.commit()
+            return {"ok": False, "feature_ready": False, "reason": "destination_mismatch"}
+
+        # Owner and connection are authorization bindings, not dispatch identity.
+        # Serialize the cross-owner check with BEGIN IMMEDIATE and inspect terminal
+        # rows too: legacy owner-bound JSON descriptors remain valid historical proof.
+        all_rows = c.execute("SELECT * FROM approvals ORDER BY created DESC").fetchall()
+        slot_rows = []
+        for prior_generation in all_rows:
+            try:
+                prior_descriptor = json.loads(prior_generation["descriptor"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(prior_descriptor, dict) or prior_descriptor.get("dispatch_mode") != "canonical_native":
+                continue
+            if _same_canonical_native_slot(prior_descriptor, descriptor):
+                slot_rows.append((prior_generation, prior_descriptor))
+                continue
+            same_prompt_scope = all(prior_descriptor.get(key) == descriptor.get(key) for key in (
+                "root_binding", "target_home_binding", "profile", "targetProfile", "sid", "prompt_id"))
+            if same_prompt_scope and prior_generation["status"] in ACTIVE:
+                status = "unknown" if prior_generation["status"] in {"posting", "applying", "dispatching"} else "expired"
+                _retire(c, prior_generation, status, now)
+
+        if slot_rows:
+            # Payload fingerprints detect mutation within a slot; they cannot mint
+            # a new native dispatch slot. Preserve every existing owner-bound row.
+            if any(row["request_fingerprint"] != descriptor["request_fingerprint"] or
+                   row["pending_fingerprint"] != descriptor["pending_fingerprint"]
+                   for row, _prior_descriptor in slot_rows):
+                for row, _prior_descriptor in slot_rows:
+                    if row["status"] in ACTIVE:
+                        status = "unknown" if row["status"] in {"posting", "applying", "dispatching"} else "expired"
+                        _retire(c, row, status, now)
+                c.commit()
+                return {"ok": False, "reason": "immutable_mismatch"}
+            if any(row["owner"] != descriptor["owner"] or
+                   prior_descriptor.get("connectionId") != descriptor["connectionId"]
+                   for row, prior_descriptor in slot_rows):
+                c.commit()
+                return {"ok": False, "reason": "prior_owner"}
+            if any(prior_descriptor != descriptor for _row, prior_descriptor in slot_rows):
+                c.commit()
+                return {"ok": False, "reason": "immutable_mismatch"}
+            prior, _prior_descriptor = slot_rows[0]
+            c.commit()
+            return {"ok": prior["status"] in ACTIVE, "duplicate": True,
+                    "id": prior["id"], "status": prior["status"]}
+
+        prior = c.execute("SELECT * FROM approvals WHERE identity=?", (identity,)).fetchone()
+        if prior:
+            if (prior["request_fingerprint"] != descriptor["request_fingerprint"] or
+                    prior["pending_fingerprint"] != descriptor["pending_fingerprint"]):
+                if prior["status"] in ACTIVE:
+                    status = "unknown" if prior["status"] in {"posting", "applying", "dispatching"} else "expired"
+                    _retire(c, prior, status, now)
+                c.commit()
+                return {"ok": False, "reason": "immutable_mismatch"}
+            if prior["owner"] != descriptor["owner"]:
+                c.commit()
+                return {"ok": False, "reason": "prior_owner"}
+            c.commit()
+            return {"ok": prior["status"] in ACTIVE, "duplicate": True,
+                    "id": prior["id"], "status": prior["status"]}
+        if c.execute("SELECT count(*) FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching')").fetchone()[0] >= MAX_ACTIVE:
+            c.commit()
+            return {"ok": False, "reason": "capacity"}
+        approval_id = secrets.token_hex(16)
+        callback_token = secrets.token_urlsafe(18)
+        c.execute("INSERT INTO approvals(id,identity,owner,descriptor,request_json,pending_json,request_fingerprint,pending_fingerprint,review_text,token,bot,chat,topic,boot,created,expires,seen,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'posting')",
+                  (approval_id, identity, descriptor["owner"], canonical(descriptor), canonical(prompt), canonical(pending),
+                   descriptor["request_fingerprint"], descriptor["pending_fingerprint"], text, callback_token,
+                   bot, chat, topic, live["boot"], now, expires, now))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback()
+        return {"ok": False, "reason": "duplicate"}
+    except Exception:
+        c.rollback()
+        return {"ok": False, "reason": "approval_store_unavailable"}
+    finally:
+        c.close()
+    result = publish(approval_id, notifier, state=state, root=resolved_root)
+    return {**result, "id": approval_id, "status": result.get("status", "unknown"), "expires": expires}
+
+
 def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=None):
     now = time.time() if now is None else now
     if result_budget is not None and (type(result_budget) is not int or result_budget <= 0):
         return {"ok": False, "reason": "invalid_result_budget"}
     descriptor, request, pending = req.get("descriptor"), req.get("request"), req.get("pending")
+    if isinstance(descriptor, dict) and descriptor.get("dispatch_mode") == "canonical_native":
+        return register_canonical(req, notifier, root=root, state=state, now=now,
+                                  result_budget=result_budget)
     route, row, epoch, owner = req.get("route"), req.get("session"), req.get("epoch"), req.get("owner")
     if not _validate_descriptor(descriptor) or descriptor.get("owner") != owner:
         return {"ok": False, "reason": "invalid_descriptor"}
@@ -751,7 +997,7 @@ def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=N
             if (prior_descriptor.get("request_fingerprint") != descriptor["request_fingerprint"] or
                     prior_descriptor.get("pending_fingerprint") != descriptor["pending_fingerprint"]):
                 if prior["status"] in ACTIVE:
-                    status = "unknown" if prior["status"] in ("posting", "applying") else (
+                    status = "unknown" if prior["status"] in ("posting", "applying", "dispatching") else (
                         "rejected" if prior["status"] == "queued" else "expired")
                     _retire(c, prior, status, now)
                 c.commit()
@@ -765,7 +1011,7 @@ def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=N
         if c.execute("SELECT 1 FROM approvals WHERE identity=?", (identity,)).fetchone():
             c.commit()
             return {"ok": False, "reason": "duplicate"}
-        if c.execute("SELECT count(*) FROM approvals WHERE status IN ('posting','open','queued','applying')").fetchone()[0] >= MAX_ACTIVE:
+        if c.execute("SELECT count(*) FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching')").fetchone()[0] >= MAX_ACTIVE:
             c.commit()
             return {"ok": False, "reason": "capacity"}
         approval_id = secrets.token_hex(16)
@@ -1006,30 +1252,30 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
             c.commit()
             return {"ok": False, "feature_ready": False, "reason": "lease_stale", "items": []}
         candidates = []
-        for row in c.execute("SELECT * FROM approvals WHERE owner=? AND status IN ('posting','open','queued','applying') ORDER BY created,id",
+        for row in c.execute("SELECT * FROM approvals WHERE owner=? AND status IN ('posting','open','queued','applying','dispatching') ORDER BY created,id",
                              (owner,)).fetchall():
             if row["boot"] != live["boot"]:
-                status = "unknown" if row["status"] in ("posting", "applying") else (
+                status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
                 _retire(c, row, status, now)
                 continue
             if row["id"] in unverifiable:
                 if row["status"] == "queued":
                     _retire(c, row, "rejected", now)
-                elif row["status"] == "applying":
+                elif row["status"] in {"applying", "dispatching"}:
                     _retire(c, row, "unknown", now)
                 elif row["status"] == "open":
                     c.execute("UPDATE approvals SET seen=? WHERE id=?", (STALE_SEEN, row["id"]))
                 continue
             if row["id"] in definitive_absent or row["id"] not in by_id:
-                status = "unknown" if row["status"] in ("posting", "applying") else (
+                status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
                 _retire(c, row, status, now)
                 continue
             if not _observation_matches(row, by_id[row["id"]]):
                 if row["status"] == "queued":
                     _retire(c, row, "rejected", now)
-                elif row["status"] == "applying":
+                elif row["status"] in {"applying", "dispatching"}:
                     _retire(c, row, "unknown", now)
                 else:
                     _retire(c, row, "expired", now)
@@ -1101,6 +1347,14 @@ def settle(approval_id, claim, status, *, state=STATE, now=None):
         c.execute("BEGIN IMMEDIATE")
         row = c.execute("SELECT * FROM approvals WHERE id=? AND claim=? AND status='applying'",
                         (approval_id, claim)).fetchone()
+        if row is not None:
+            try:
+                if json.loads(row["descriptor"]).get("dispatch_mode") == "canonical_native":
+                    c.rollback()
+                    return {"ok": False, "reason": "canonical_apply_required"}
+            except (TypeError, ValueError):
+                c.rollback()
+                return {"ok": False, "reason": "invalid_descriptor"}
         if not row or row["deadline"] is None or row["deadline"] <= now:
             if row:
                 _retire(c, row, "unknown", now)
@@ -1111,6 +1365,212 @@ def settle(approval_id, claim, status, *, state=STATE, now=None):
         return {"ok": True, "status": status}
     finally:
         c.close()
+
+
+def _stored_canonical(owner, approval_id, *, claim=None, state=STATE):
+    if (not isinstance(owner, str) or not owner or len(owner) > 128 or
+            not isinstance(approval_id, str) or not re.fullmatch(r"[0-9a-f]{32}", approval_id) or
+            (claim is not None and (not isinstance(claim, str) or not re.fullmatch(r"[0-9a-f]{32}", claim)))):
+        return None
+    c = connect_readonly(state)
+    if c is None:
+        return None
+    try:
+        row = c.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        if row is None or row["owner"] != owner or (claim is not None and row["claim"] != claim):
+            return None
+        descriptor = json.loads(row["descriptor"])
+        prompt = json.loads(row["request_json"])
+        pending = json.loads(row["pending_json"])
+        backend = _sibling("newcanonical_backend")
+        if (descriptor.get("dispatch_mode") != "canonical_native" or
+                not backend._validate_descriptor(descriptor) or
+                not backend.validate_prompt(prompt) or
+                not backend.pending_matches(descriptor, prompt, pending) or
+                row["request_fingerprint"] != descriptor["request_fingerprint"] or
+                row["pending_fingerprint"] != descriptor["pending_fingerprint"]):
+            return None
+        return dict(row), descriptor, prompt, pending
+    except (sqlite3.Error, OSError, TypeError, ValueError, RecursionError):
+        return None
+    finally:
+        c.close()
+
+
+def _canonical_live_claim(row, descriptor, owner, claim, *, state, now):
+    c = connect_readonly(state)
+    if c is None:
+        return False, "approval_store_unavailable", None
+    try:
+        live_row = c.execute("SELECT * FROM approvals WHERE id=?", (row["id"],)).fetchone()
+        live = _receiver(c, now)
+        owner_seen = c.execute("SELECT seen FROM owners WHERE owner=?", (owner,)).fetchone()
+        if (live_row is None or live_row["owner"] != owner or live_row["claim"] != claim or
+                live_row["status"] != "applying" or live_row["deadline"] is None or
+                float(live_row["deadline"]) <= now or float(live_row["expires"]) <= now or
+                not 0 <= now - float(live_row["seen"]) <= LEASE or
+                live is None or live_row["boot"] != live["boot"] or
+                (live_row["bot"], live_row["chat"], live_row["topic"]) !=
+                (live["bot"], live["chat"], live["topic"]) or
+                owner_seen is None or not 0 <= now - float(owner_seen["seen"]) <= LEASE):
+            return False, "claim_lost", owner_seen["seen"] if owner_seen else None
+        try:
+            stored_descriptor = json.loads(live_row["descriptor"])
+        except (TypeError, ValueError):
+            return False, "invalid_descriptor", None
+        if (stored_descriptor != descriptor or canonical(stored_descriptor) != live_row["descriptor"] or
+                _digest(stored_descriptor) != _digest(descriptor)):
+            return False, "binding_changed", owner_seen["seen"]
+        return True, "ok", owner_seen["seen"]
+    except (sqlite3.Error, OSError, TypeError, ValueError, OverflowError, RecursionError):
+        return False, "approval_store_unavailable", None
+    finally:
+        c.close()
+
+
+def observe_canonical(req, notifier, *, root=ROOT, state=STATE):
+    """Fresh read-only native attach, bound to the stored row rather than browser data."""
+    if set(req) != {"action", "capability", "owner", "id"}:
+        return {"ok": False, "reason": "invalid_native_observe"}
+    stored = _stored_canonical(req.get("owner"), req.get("id"), state=state)
+    if stored is None:
+        return {"ok": False, "reason": "approval_missing_or_unowned"}
+    row, descriptor, prompt, _pending = stored
+    if row["status"] not in {"open", "queued", "applying"}:
+        return {"ok": False, "reason": "approval_terminal"}
+    now = time.time()
+    valid, reason, _ = _canonical_live_claim(row, descriptor, req["owner"], row["claim"],
+                                              state=state, now=now) if row["status"] == "applying" else (True, "ok", None)
+    if not valid:
+        return {"ok": False, "reason": reason}
+    gateway = _sibling("telegram_integration")
+    enabled, reason = gateway.feature_status("approvals_enabled", root=root)
+    if not enabled:
+        return {"ok": False, "feature_ready": False, "reason": reason}
+    result = _sibling("newcanonical_backend").observe_bound(
+        descriptor, prompt, root=root, notifier=notifier)
+    if result.get("ok") is not True:
+        return {"ok": False, "reason": result.get("reason", "native_snapshot_unavailable"),
+                "phase": result.get("phase", "prewrite")}
+    return {"ok": True, "id": row["id"],
+            "request_fingerprint": row["request_fingerprint"],
+            "pending_fingerprint": row["pending_fingerprint"],
+            "authority": _digest(descriptor)}
+
+
+def _finish_canonical_apply(approval_id, claim, status, *, state=STATE):
+    if status not in TERMINAL:
+        status = "unknown"
+    c = connect(state)
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT * FROM approvals WHERE id=? AND claim=? AND status IN ('applying','dispatching')",
+                        (approval_id, claim)).fetchone()
+        if row is None:
+            c.commit()
+            return {"ok": False, "reason": "claim_lost"}
+        _retire(c, row, status, time.time())
+        c.commit()
+        return {"ok": True, "status": status}
+    except Exception:
+        c.rollback()
+        return {"ok": False, "reason": "approval_store_unavailable"}
+    finally:
+        c.close()
+
+
+def apply_canonical(req, notifier, *, root=ROOT, state=STATE):
+    """Apply only the stored native prompt using one dispatching CAS and one four-field RPC."""
+    if set(req) != {"action", "capability", "owner", "id", "claim"}:
+        return {"ok": False, "reason": "invalid_native_claim"}
+    owner, approval_id, claim = req.get("owner"), req.get("id"), req.get("claim")
+    stored = _stored_canonical(owner, approval_id, claim=claim, state=state)
+    if stored is None:
+        return {"ok": False, "reason": "approval_missing_or_unowned"}
+    row, descriptor, prompt, pending = stored
+    now = time.time()
+    if (row["status"] != "applying" or row["choice"] not in ALLOWED_CHOICES or
+            row["deadline"] is None or float(row["deadline"]) <= now):
+        if row["status"] == "applying":
+            _finish_canonical_apply(approval_id, claim, "expired", state=state)
+        return {"ok": False, "status": "expired", "reason": "claim_expired"}
+    gateway = _sibling("telegram_integration")
+    enabled, reason = gateway.feature_status("approvals_enabled", root=root)
+    if not enabled:
+        _finish_canonical_apply(approval_id, claim, "rejected", state=state)
+        return {"ok": False, "status": "rejected", "reason": reason}
+    live, live_reason, owner_seen = _canonical_live_claim(
+        row, descriptor, owner, claim, state=state, now=now)
+    if not live:
+        _finish_canonical_apply(approval_id, claim, "expired" if live_reason == "claim_lost" else "rejected", state=state)
+        return {"ok": False, "status": "expired" if live_reason == "claim_lost" else "rejected",
+                "reason": live_reason}
+    budget = min(float(row["deadline"]) - now, float(row["expires"]) - now,
+                 LEASE - (now - float(row["seen"])), LEASE - (now - float(owner_seen)), 22.0)
+    if budget <= 0:
+        _finish_canonical_apply(approval_id, claim, "expired", state=state)
+        return {"ok": False, "status": "expired", "reason": "claim_expired"}
+    deadline_monotonic = time.monotonic() + budget
+
+    def begin_dispatch():
+        allowed, current_reason = gateway.feature_status("approvals_enabled", root=root)
+        if not allowed:
+            return {"ok": False, "reason": current_reason}
+        current = time.time()
+        c = connect(state)
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            fresh = c.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            receiver = _receiver(c, current)
+            if (fresh is None or fresh["status"] != "applying" or fresh["owner"] != owner or
+                    fresh["claim"] != claim or fresh["choice"] != row["choice"] or
+                    fresh["deadline"] is None or float(fresh["deadline"]) <= current or
+                    float(fresh["expires"]) <= current or
+                    not 0 <= current - float(fresh["seen"]) <= LEASE or
+                    receiver is None or receiver["boot"] != fresh["boot"] or
+                    (receiver["bot"], receiver["chat"], receiver["topic"]) !=
+                    (fresh["bot"], fresh["chat"], fresh["topic"]) or
+                    not _owner_live(c, owner, current) or
+                    fresh["descriptor"] != canonical(descriptor) or
+                    fresh["request_fingerprint"] != descriptor["request_fingerprint"] or
+                    fresh["pending_fingerprint"] != descriptor["pending_fingerprint"]):
+                c.rollback()
+                return {"ok": False, "reason": "claim_lost"}
+            updated = c.execute(
+                "UPDATE approvals SET status='dispatching',seen=?,dirty=1 WHERE id=? AND owner=? AND claim=? AND status='applying'",
+                (current, approval_id, owner, claim))
+            if updated.rowcount != 1:
+                c.rollback()
+                return {"ok": False, "reason": "claim_lost"}
+            c.commit()
+            return {"ok": True}
+        except Exception:
+            c.rollback()
+            return {"ok": False, "reason": "approval_store_unavailable"}
+        finally:
+            c.close()
+
+    result = _sibling("newcanonical_backend").apply_bound(
+        descriptor, prompt, choice=row["choice"], before_dispatch=begin_dispatch,
+        root=root, notifier=notifier, deadline_monotonic=deadline_monotonic)
+    if result.get("phase") == "postwrite":
+        status = result.get("status") if result.get("status") in TERMINAL else "unknown"
+    elif result.get("reason") == "prompt_stale":
+        status = "expired"
+    elif result.get("reason") in {"native_helper_deadline", "authority_changed"}:
+        status = "expired"
+    else:
+        status = "rejected"
+    settled = _finish_canonical_apply(approval_id, claim, status, state=state)
+    try:
+        flush(notifier, state=state)
+    except Exception:
+        pass
+    if settled.get("ok") is not True:
+        return {"ok": False, "status": "unknown", "reason": "settle_unverified", "receipt": None}
+    return {"ok": status == "applied", "status": status,
+            "reason": result.get("reason"),
+            "receipt": result.get("receipt") if status == "applied" else None}
 
 
 def flush(notifier, *, state=STATE):
@@ -1138,6 +1598,8 @@ def flush(notifier, *, state=STATE):
                 text = "⚠️ Hermes Desktop 명령 승인\n\n⏳ 응답을 받았습니다. Desktop 연결과 현재 승인을 확인 중입니다."
             elif row["status"] == "applying":
                 text = "⚠️ Hermes Desktop 명령 승인\n\n⏳ Desktop에 응답을 전달하고 있습니다. 완료 여부를 확인 중입니다."
+            elif row["status"] == "dispatching":
+                text = "⚠️ Hermes Desktop 명령 승인\n\n⏳ Gateway에 승인 응답을 한 번 전달하고 있습니다. 결과가 불명확하면 재전송하지 않습니다."
             elif row["status"] == "applied":
                 text = "⚠️ Hermes Desktop 명령 승인\n\n✅ Desktop이 이 명령 승인 응답을 받았습니다. 실행 완료 여부는 별도로 확인해 주세요."
             elif row["status"] == "unknown":
@@ -1147,6 +1609,14 @@ def flush(notifier, *, state=STATE):
             elif row["status"] == "rejected":
                 text = "⚠️ Hermes Desktop 명령 승인\n\n⛔ 이 명령 승인 응답은 안전하게 전달되지 않아 폐기되었습니다. Desktop에서 현재 요청을 확인해 주세요."
             markup = {"inline_keyboard": []}
+        if row["status"] == "applied":
+            try:
+                canonical_mode = json.loads(row["descriptor"]).get("dispatch_mode") == "canonical_native"
+            except (TypeError, ValueError):
+                canonical_mode = False
+            if canonical_mode:
+                text = ("⚠️ Hermes Desktop 명령 승인" + chr(10) * 2 +
+                        "✅ Gateway가 이 승인 응답을 접수했습니다. 자식 요청의 결정 정착이나 명령 실행 완료를 보장하지 않습니다.")
         response = notifier.telegram(token, "editMessageText", {
             "chat_id": chat, "message_id": row["message_id"], "text": text,
             "reply_markup": markup, "link_preview_options": {"is_disabled": True}})
@@ -1169,14 +1639,38 @@ def approval_notice(req, notifier, *, root=ROOT, state=STATE, api=None):
     request = req.get("request")
     pending = req.get("pending")
     descriptor = req.get("descriptor")
-    if not supported_pair(request, pending, (request or {}).get("params", {}).get("session_id"),
-                          (descriptor or {}).get("dispatch_mode")):
-        return {"ok": False, "reason": "not_supported"}
-    if (not _validate_descriptor(descriptor) or descriptor.get("request_id") != request.get("id") or
-            descriptor.get("queue_id") != request.get("params", {}).get("request_id") or
-            descriptor.get("request_fingerprint") != _digest(request) or
-            descriptor.get("pending_fingerprint") != _digest(pending)):
-        return {"ok": False, "reason": "invalid_descriptor"}
+    if isinstance(descriptor, dict) and descriptor.get("dispatch_mode") == "canonical_native":
+        backend = _sibling("newcanonical_backend")
+        try:
+            resolved_root = Path(root).expanduser().resolve(strict=True)
+            target_home = notifier.profile_home(descriptor.get("targetProfile"), root=resolved_root)
+            native_valid = (backend._validate_descriptor(descriptor) and
+                backend.validate_prompt(request) and backend.pending_matches(descriptor, request, pending) and
+                descriptor.get("owner") == req.get("owner") and
+                descriptor.get("root_binding") == backend.root_binding(resolved_root) and
+                descriptor.get("target_home_binding") == backend._path_binding(target_home))
+        except Exception:
+            native_valid = False
+        if not native_valid:
+            return {"ok": False, "reason": "invalid_descriptor"}
+        profile = descriptor["targetProfile"]
+        session_key = descriptor["session_key"]
+        ask_identity = [descriptor["root_binding"], descriptor["target_home_binding"],
+                        descriptor["connectionId"], descriptor["sid"], descriptor["prompt_id"],
+                        descriptor["execution_generation"], "canonical-approval-notice-v1"]
+    else:
+        if not supported_pair(request, pending, (request or {}).get("params", {}).get("session_id"),
+                              (descriptor or {}).get("dispatch_mode")):
+            return {"ok": False, "reason": "not_supported"}
+        if (not _validate_descriptor(descriptor) or descriptor.get("request_id") != request.get("id") or
+                descriptor.get("queue_id") != request.get("params", {}).get("request_id") or
+                descriptor.get("request_fingerprint") != _digest(request) or
+                descriptor.get("pending_fingerprint") != _digest(pending)):
+            return {"ok": False, "reason": "invalid_descriptor"}
+        profile = descriptor["targetProfile"]
+        session_key = descriptor["session_key"]
+        ask_identity = [str(Path(root).resolve()), profile, session_key,
+                        descriptor["request_id"], descriptor["queue_id"], "approval-notice-v1"]
     kind = req.get("reason")
     safe_reasons = {"review_text_missing", "invalid_review_text", "redaction_not_stable", "redaction_omission", "redaction_collision",
                     "review_unicode_ambiguous", "review_control_character", "review_card_too_large",
@@ -1189,8 +1683,7 @@ def approval_notice(req, notifier, *, root=ROOT, state=STATE, api=None):
     text = (f"⚠️ Hermes Desktop — 명령 승인 알림\n프로필: {profile}\n\n"
             "텔레그램에서 이 명령을 안전하고 완전하게 표시할 수 없어 승인 버튼을 제공하지 않았습니다.\n"
             "명령 전체와 현재 권한 상태를 Desktop에서 확인해 주세요.")
-    key = _digest([str(Path(root).resolve()), profile, descriptor["session_key"],
-                   descriptor["request_id"], descriptor["queue_id"], "approval-notice-v1"])
+    key = _digest(ask_identity)
     # Reuse the existing same-text at-most-once sender; never attach approval controls.
     token, target, topic = notifier.credentials(root)
     with notifier.state_db(state) as c:
@@ -1240,14 +1733,15 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     if action == "approval_notice":
         return approval_notice(req, notifier, root=root, state=state)
     if action not in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
-                       "approval_claim_valid"}:
+                      "approval_claim_valid", "canonical_approval_observe", "approval_native_observe",
+                      "approval_native_apply"}:
         return {"ok": False, "reason": "unknown_approval_action"}
     if __package__:
         gateway = importlib.import_module('.telegram_integration', __package__)
     else:
         gateway = importlib.import_module('telegram_integration')
     allowed, reason = gateway.feature_status('approvals_enabled', root=root)
-    if not allowed and action not in {"approval_settle"}:
+    if not allowed and action not in {"approval_settle", "approval_native_apply"}:
         if action == "approval_poll":
             return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
         if action == "approval_claim_valid":
@@ -1255,6 +1749,17 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
                     "authority": req.get("authority"), "deadline": req.get("deadline"), "reason": reason}
         return {"ok": False, "feature_ready": False, "reason": reason}
     try:
+        if action == "canonical_approval_observe":
+            native_request = {key: req[key] for key in ("action", "owner", "route", "session_id", "prompt") if key in req}
+            result = _sibling("newcanonical_backend").observe(native_request, root=root, notifier=notifier)
+            if (result.get("ok") is True and result_budget is not None and
+                    len(_response_bytes(result)) > result_budget):
+                return {"ok": False, "phase": "prewrite", "reason": "approval_result_too_large"}
+            return result
+        if action == "approval_native_observe":
+            return observe_canonical(req, notifier, root=root, state=state)
+        if action == "approval_native_apply":
+            return apply_canonical(req, notifier, root=root, state=state)
         if action == "approval_claim_valid":
             return claim_valid(req.get("owner"), req.get("id"), req.get("claim"), req.get("descriptor"),
                                req.get("authority"), req.get("deadline"), root=root, state=state)

@@ -11,6 +11,155 @@ from unittest.mock import patch
 import test_support
 from hermes_state import SessionDB
 import notifier
+from agent.secret_scope import (
+    UnscopedSecretError, get_secret, reset_multiplex_context, reset_secret_scope,
+    set_multiplex_context, set_secret_scope,
+)
+
+
+class CredentialScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = test_support.temporary_directory(prefix='credential-scope-')
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.env_path = self.home / '.env'
+        self.env_path.write_text(
+            'TOKEN=dotenv-token\nTOPIC=6\n'
+            'TELEGRAM_BOT_TOKEN=123456:${TOKEN}\n'
+            'TELEGRAM_HOME_CHANNEL=98:${TOPIC}\n', encoding='utf-8')
+
+    def scoped(self, values, *, home=None):
+        return set_secret_scope(values, profile_home=str(home or self.home))
+
+    def test_credentials_uses_real_default_scope_not_env_file_or_process_fallback(self):
+        import dotenv
+
+        original_read_text = Path.read_text
+        env_path = self.env_path.resolve()
+
+        def trap_fixture_env(path, *args, **kwargs):
+            if Path(path).resolve() == env_path:
+                raise AssertionError('credentials must not read the fixture .env')
+            return original_read_text(path, *args, **kwargs)
+
+        multiplex = set_multiplex_context(True)
+        scope = self.scoped({'TELEGRAM_BOT_TOKEN': '654321:scoped-token',
+                             'TELEGRAM_HOME_CHANNEL': '99:7'})
+        try:
+            with (patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': '111111:process-token',
+                                          'TELEGRAM_HOME_CHANNEL': '88:8'}),
+                  patch.object(Path, 'read_text', new=trap_fixture_env),
+                  patch.object(dotenv, 'dotenv_values', side_effect=AssertionError('dotenv_values must not read credentials'))):
+                self.assertEqual(notifier.credentials(self.home), ('654321:scoped-token', 99, 7))
+        finally:
+            reset_secret_scope(scope)
+            reset_multiplex_context(multiplex)
+
+    def test_secret_scope_preserves_literal_dollar_and_braces_without_interpolation(self):
+        import dotenv
+
+        literal = '654321:literal-$${MISSING}-{brace}'
+        original_read_text = Path.read_text
+        env_path = self.env_path.resolve()
+        def trap_fixture_env(path, *args, **kwargs):
+            if Path(path).resolve() == env_path:
+                raise AssertionError('credentials must not read the fixture .env')
+            return original_read_text(path, *args, **kwargs)
+
+        multiplex = set_multiplex_context(True)
+        scope = self.scoped({'TELEGRAM_BOT_TOKEN': literal,
+                             'TELEGRAM_HOME_CHANNEL': '99:7'})
+        try:
+            with (
+                patch.object(Path, 'read_text', new=trap_fixture_env),
+                patch.object(dotenv, 'dotenv_values', side_effect=AssertionError('dotenv_values must not read credentials')),
+            ):
+                self.assertEqual(get_secret('TELEGRAM_BOT_TOKEN'), literal)
+                with self.assertRaisesRegex(ValueError, 'telegram_token_missing'):
+                    notifier.credentials(self.home)
+        finally:
+            reset_secret_scope(scope)
+            reset_multiplex_context(multiplex)
+
+    def test_default_and_named_scope_are_context_owned_and_unscoped_multiplex_fails_closed(self):
+        default = {'TELEGRAM_BOT_TOKEN': '654321:default-token',
+                   'TELEGRAM_HOME_CHANNEL': '99:7'}
+        named = {'TELEGRAM_BOT_TOKEN': '765432:named-token',
+                 'TELEGRAM_HOME_CHANNEL': '88:6'}
+        named_home = self.home / 'profiles' / 'taxkeeper'
+        named_home.mkdir(parents=True)
+        multiplex = set_multiplex_context(True)
+        try:
+            with patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': '111111:process-token',
+                                         'TELEGRAM_HOME_CHANNEL': '77:5'}):
+                default_scope = self.scoped(default, home=self.home)
+                try:
+                    self.assertEqual(notifier.credentials(named_home), ('654321:default-token', 99, 7))
+                finally:
+                    reset_secret_scope(default_scope)
+                named_scope = self.scoped(named, home=named_home)
+                try:
+                    # ``root`` remains the authority/state context; secret selection follows
+                    # Hermes' active scope and never borrows another profile's process env.
+                    self.assertEqual(notifier.credentials(self.home), ('765432:named-token', 88, 6))
+                    missing_scope = set_secret_scope({}, profile_home=str(named_home))
+                    try:
+                        with self.assertRaisesRegex(ValueError, 'telegram_token_missing'):
+                            notifier.credentials(self.home)
+                    finally:
+                        reset_secret_scope(missing_scope)
+                finally:
+                    reset_secret_scope(named_scope)
+                cleared = set_secret_scope(None)
+                try:
+                    with self.assertRaises(UnscopedSecretError):
+                        notifier.credentials(self.home)
+                finally:
+                    reset_secret_scope(cleared)
+        finally:
+            reset_multiplex_context(multiplex)
+
+    def test_standalone_unscoped_secret_failure_stays_denied_without_error_text(self):
+        multiplex = set_multiplex_context(True)
+        cleared = set_secret_scope(None)
+        fake_token = '111111:synthetic-process-token'
+        try:
+            with patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': fake_token,
+                                         'TELEGRAM_HOME_CHANNEL': '77:5'}):
+                result = notifier.dispatch_request({'action': 'probe'}, root=self.home,
+                                                   state=self.home / 'state')
+        finally:
+            reset_secret_scope(cleared)
+            reset_multiplex_context(multiplex)
+        self.assertEqual(result, {'ok': False, 'reason': 'UnscopedSecretError'})
+        self.assertNotIn(fake_token, json.dumps(result))
+
+    def test_credentials_rejects_malformed_home_and_topic_without_dotenv_parsing(self):
+        multiplex = set_multiplex_context(True)
+        try:
+            malformed_token = self.scoped({'TELEGRAM_BOT_TOKEN': 'not-a-telegram-token',
+                                           'TELEGRAM_HOME_CHANNEL': '99:7'})
+            try:
+                with self.assertRaisesRegex(ValueError, 'telegram_token_missing'):
+                    notifier.credentials(self.home)
+            finally:
+                reset_secret_scope(malformed_token)
+            malformed_chat = self.scoped({'TELEGRAM_BOT_TOKEN': '654321:scoped-token',
+                                          'TELEGRAM_HOME_CHANNEL': 'private-chat'})
+            try:
+                with self.assertRaisesRegex(ValueError, 'telegram_home_missing_or_unsupported'):
+                    notifier.credentials(self.home)
+            finally:
+                reset_secret_scope(malformed_chat)
+            malformed_topic = self.scoped({'TELEGRAM_BOT_TOKEN': '654321:scoped-token',
+                                           'TELEGRAM_HOME_CHANNEL': '99:topic{7}'})
+            try:
+                with self.assertRaisesRegex(ValueError, 'telegram_home_missing_or_unsupported'):
+                    notifier.credentials(self.home)
+            finally:
+                reset_secret_scope(malformed_topic)
+        finally:
+            reset_multiplex_context(multiplex)
 
 
 class NotificationTests(unittest.TestCase):

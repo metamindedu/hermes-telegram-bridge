@@ -30,7 +30,7 @@ async function bridgeFixture() {
   const f=fixture()
   const descriptor={owner:f.owner,connectionId:f.route.connectionId,profile:f.route.profile,
     targetProfile:f.route.targetProfile,sid:f.row.id,session_key:f.row.session_key,epoch:'epoch-1',
-    request_id:f.request.id,queue_id:f.pending.request_id,dispatch_mode:'queue',
+    request_id:f.request.id,queue_id:f.pending.request_id,dispatch_mode:'legacyqueue',
     request_fingerprint:await approvalFingerprint(f.request),pending_fingerprint:await approvalFingerprint(f.pending)}
   return {...f,descriptor,bridge:{id:'approval-row-1',descriptor,request:f.request,pending:f.pending,
     requestFingerprint:descriptor.request_fingerprint,pendingFingerprint:descriptor.pending_fingerprint,
@@ -103,7 +103,7 @@ test('all native producer families preserve full payloads and reject malformed s
 test('healthy empty queue freezes server-request authority; failures and conflicts never downgrade', () => {
   const f=fixture()
   const empty=classifyApprovalAuthority(f.request,{approvals:[]},f.row.id)
-  assert.equal(empty?.mode,'server_request')
+  assert.equal(empty?.mode,'legacyserver_request')
   assert.deepEqual(empty?.pending,{request_id:f.request.params.request_id,missing:true})
   for(const queue of [null,{}, {approvals:'bad'}, {approvals:[{}]},
     {approvals:[f.pending,f.pending]},
@@ -159,9 +159,9 @@ test('approval registration freezes full fingerprints and binds queue not just s
 
 async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimValidity=true,
   gateVariant=null, pausePostClaim=false, runStoppedOnGate=false, expireOnGate=false,
-  dispatchMode='queue', modeChangeOnFinal=false}={}) {
+  dispatchMode='legacyqueue', modeChangeOnFinal=false}={}) {
   const f=await bridgeFixture();const owner=f.owner
-  const pending=dispatchMode==='queue' ? f.pending : {request_id:f.request.params.request_id,missing:true}
+  const pending=dispatchMode==='legacyqueue' ? f.pending : {request_id:f.request.params.request_id,missing:true}
   const descriptor={...f.descriptor,dispatch_mode:dispatchMode,
     pending_fingerprint:await approvalFingerprint(pending)}
   const item={id:'stored-card',claim:'b'.repeat(32),deadline:Date.now()/1000+30,descriptor,
@@ -176,7 +176,7 @@ async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimVali
       calls.push({route,method,args})
       if(method==='session.active_list')return {sessions:[f.row]}
       if(method==='session.events.since')return f.snapshot
-      if(method==='approval.pending')return {approvals:dispatchMode==='queue'?[f.pending]:[]}
+      if(method==='approval.pending')return {approvals:dispatchMode==='legacyqueue'?[f.pending]:[]}
       if(method==='approval.respond'||method==='request.answer') {if(throwRpc)throw new Error('synthetic timeout');return resolved}
       throw new Error('unexpected RPC '+method)
     }}
@@ -189,8 +189,8 @@ async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimVali
     snapshots++
     if(pausePostClaim&&snapshots===2){reachSnapshot();await resumePostClaimSnapshot}
     if(changeOnFinal && snapshots===2)return null
-    const currentMode=modeChangeOnFinal&&snapshots===2?'queue':dispatchMode
-    const currentPending=currentMode==='queue'?f.pending:{request_id:f.request.params.request_id,missing:true}
+    const currentMode=modeChangeOnFinal&&snapshots===2?'legacyqueue':dispatchMode
+    const currentPending=currentMode==='legacyqueue'?f.pending:{request_id:f.request.params.request_id,missing:true}
     return {route:f.route,row:f.row,snapshot:f.snapshot,request:f.request,pending:currentPending,dispatchMode:currentMode}
   }
   monitor.helper=async request=>{
@@ -238,29 +238,29 @@ test('malformed numeric/bool response receipts are unknown and never retried', a
 })
 
 test('server-request authority sends once to the frozen srq and never treats gateway acceptance as delivery', async () => {
-  const accepted=await runPump({status:'ok'},{dispatchMode:'server_request'})
+  const accepted=await runPump({status:'ok'},{dispatchMode:'legacyserver_request'})
   const writes=accepted.calls.filter(call=>call.method==='request.answer')
   assert.equal(writes.length,1)
   assert.deepEqual(writes[0].args,{id:'srq-aabbcc112233',result:{choice:'once',all:false}})
   assert.equal(accepted.calls.some(call=>call.method==='approval.respond'),false)
   assert.equal(accepted.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
-  const expired=await runPump({status:'expired'},{dispatchMode:'server_request'})
+  const expired=await runPump({status:'expired'},{dispatchMode:'legacyserver_request'})
   assert.equal(expired.helperCalls.find(call=>call.action==='approval_settle').status,'expired')
   for(const receipt of [{status:'ok',extra:true},{status:'resolved'},{},null]){
-    const out=await runPump(receipt,{dispatchMode:'server_request'})
+    const out=await runPump(receipt,{dispatchMode:'legacyserver_request'})
     assert.equal(out.calls.filter(call=>call.method==='request.answer').length,1)
     assert.equal(out.calls.some(call=>call.method==='approval.respond'),false)
     assert.equal(out.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
     assert.equal(out.helperCalls.filter(call=>call.action==='approval_poll').length,1)
   }
-  const ambiguous=await runPump({}, {dispatchMode:'server_request',throwRpc:true})
+  const ambiguous=await runPump({}, {dispatchMode:'legacyserver_request',throwRpc:true})
   assert.equal(ambiguous.calls.filter(call=>call.method==='request.answer').length,1)
   assert.equal(ambiguous.calls.some(call=>call.method==='approval.respond'),false)
   assert.equal(ambiguous.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
 })
 
 test('a frozen server-request card cannot switch to queue dispatch when mode changes after its tap', async () => {
-  const changed=await runPump({resolved:1},{dispatchMode:'server_request',modeChangeOnFinal:true})
+  const changed=await runPump({resolved:1},{dispatchMode:'legacyserver_request',modeChangeOnFinal:true})
   assert.equal(changed.calls.some(call=>call.method==='request.answer'||call.method==='approval.respond'),false)
   assert.equal(changed.helperCalls.find(call=>call.action==='approval_settle').status,'rejected')
   assert.equal(changed.helperCalls.filter(call=>call.action==='approval_poll').length,1)
@@ -316,10 +316,10 @@ test('approval_claim_valid is explicitly dispatched but remains a read-only non-
   await assert.rejects(monitor.helper(request),error=>error?.ambiguousWrite===false)
 })
 
-test('package version 1.8.1 keeps the 1.8.0 approval compatibility value and fences with v5', () => {
+test('package version 1.8.1 keeps the 1.8.0 approval compatibility value and fences with v6', () => {
   assert.equal(VERSION,'1.8.1')
   assert.equal(APPROVAL_COMPAT_VERSION,'1.8.0')
-  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v5')
+  assert.equal(APPROVAL_CAPABILITY,'desktop-command-approval-v6')
 })
 
 test('claim validity is the last fresh gate before approval.respond and accepts only an exact typed receipt', async () => {
@@ -447,7 +447,7 @@ test('generic native approval producers can register only from a healthy empty p
     const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
     await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
     assert.deepEqual(calls.map(call=>call.action),['approval_owner_heartbeat','approval_register'],key)
-    assert.equal(record.approval?.descriptor.dispatch_mode,'server_request',key)
+    assert.equal(record.approval?.descriptor.dispatch_mode,'legacyserver_request',key)
     assert.equal(record.approval?.request.params.pattern_key,key)
   }
 })

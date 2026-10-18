@@ -24,7 +24,7 @@ from pathlib import Path
 
 VERSION = "1.8.1"
 APPROVAL_COMPAT_VERSION = "1.8.0"
-APPROVAL_CAPABILITY = "desktop-command-approval-v5"
+APPROVAL_CAPABILITY = "desktop-command-approval-v6"
 RECOVERY_CAPABILITY = "desktop-completion-recovery-v1"
 
 
@@ -581,10 +581,11 @@ def diagnostic(name, data, state=STATE):
 
 
 def credentials(root=ROOT):
-    from dotenv import dotenv_values
-    values = dotenv_values(root / ".env", interpolate=False)
-    token = values.get("TELEGRAM_BOT_TOKEN") or ""
-    target = values.get("TELEGRAM_HOME_CHANNEL") or ""
+    """Read only the active Hermes secret scope; ``root`` is caller authority/state context, not a credential file path."""
+    from agent.secret_scope import get_secret
+
+    token = get_secret("TELEGRAM_BOT_TOKEN") or ""
+    target = get_secret("TELEGRAM_HOME_CHANNEL") or ""
     if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
         raise ValueError("telegram_token_missing")
     # Notifications are to the user's already configured home, never a supplied
@@ -1153,12 +1154,14 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             else:
                 result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                              result_budget=result_budget if native else None)
-        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice", "approval_claim_valid"}:
+        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
+                        "approval_notice", "approval_claim_valid", "canonical_approval_observe",
+                        "approval_native_observe", "approval_native_apply"}:
             gateway = _sibling_module("telegram_integration")
             gate = ("attention_notifications_enabled" if action == "approval_notice"
                     else "approvals_enabled")
             allowed, reason = gateway.feature_status(gate, root=root, ctx=ctx)
-            if not allowed and action not in {"approval_settle"}:
+            if not allowed and action not in {"approval_settle", "approval_native_apply"}:
                 if action == "approval_poll":
                     return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
                 if action == "approval_claim_valid":

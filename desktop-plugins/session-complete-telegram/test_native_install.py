@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import patch
 
 import test_support
+from agent.secret_scope import reset_secret_scope, set_secret_scope
 
 REPO = Path(__file__).resolve().parents[2]
 FRONTEND_ID = "session-complete-telegram"
@@ -129,6 +130,13 @@ class NativeInstallTests(unittest.TestCase):
             "current": _copy_candidate(self.root / "candidate unified 1.8.1", "1.8.1"),
         }
         self.revisions = {"old": "1" * 40, "current": "8" * 40}
+
+    def _scope_fake_telegram_credentials(self):
+        scope = set_secret_scope({"TELEGRAM_BOT_TOKEN": "77:synthetic-token",
+                                  "TELEGRAM_HOME_CHANNEL": "99"},
+                                 profile_home=str(self.home))
+        self.addCleanup(reset_secret_scope, scope)
+        return scope
 
     def _assert_pm_fixture_scope(self):
         from hermes_constants import get_default_hermes_root, get_hermes_home
@@ -558,6 +566,8 @@ class NativeInstallTests(unittest.TestCase):
     def test_registered_native_dispatcher_frames_real_reply_unicode_claims_and_fragments(self):
         from hermes_state import SessionDB
 
+        self._scope_fake_telegram_credentials()
+
         plugin, handler, parser = self._native_frontend_handler("phase2_real_reply_dispatch")
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
             notifier = importlib.import_module("phase2_real_reply_dispatch.notifier")
@@ -698,6 +708,7 @@ class NativeInstallTests(unittest.TestCase):
             self.assertEqual(after_settle["reason"], "fragment_unavailable")
 
     def test_registered_native_followup_settle_and_reject_dispatch_receipts(self):
+        self._scope_fake_telegram_credentials()
         plugin, handler, parser = self._native_frontend_handler("phase2_real_followup_dispatch")
         self.config.write_text("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n", encoding="utf-8")
         (self.home / ".env").write_text(
@@ -828,7 +839,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                     session={'id':'runtime-native','session_key':'durable-native','status':'waiting'}
                     descriptor={'owner':owner,'connectionId':route['connectionId'],'profile':'default','targetProfile':'default',
                         'sid':session['id'],'session_key':session['session_key'],'epoch':'native-epoch',
-                        'request_id':request['id'],'queue_id':queue_id,'dispatch_mode':'queue',
+                        'request_id':request['id'],'queue_id':queue_id,'dispatch_mode':'legacyqueue',
                         'request_fingerprint':bridge._digest(request),'pending_fingerprint':bridge._digest(pending)}
                     heartbeat,_=self._call_native(handler,parser,{'action':'approval_owner_heartbeat','capability':bridge.CAPABILITY,'owner':owner})
                     registration,_=self._call_native(handler,parser,{'action':'approval_register','capability':bridge.CAPABILITY,
@@ -859,6 +870,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
 
     def test_registered_native_dispatcher_frames_real_approval_inbox_claim(self):
         """Run approval_* through the actual registered CLI handler in a fake Hermes home."""
+        self._scope_fake_telegram_credentials()
         plugin, handler, parser = self._native_frontend_handler("phase2_real_approval_dispatch",candidate="current")
         with patch.dict(os.environ, {"HERMES_HOME": str(self.home), "LOCALAPPDATA": str(self.local_app_data)}):
             notifier_module = importlib.import_module("phase2_real_approval_dispatch.notifier")
@@ -890,7 +902,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
         session = {"id":"runtime-native", "session_key":"durable-native", "status":"waiting"}
         descriptor = {"owner":owner, "connectionId":route["connectionId"], "profile":route["profile"],
             "targetProfile":route["targetProfile"], "sid":session["id"], "session_key":session["session_key"],
-            "epoch":"native-epoch", "request_id":request["id"], "queue_id":queue_id, "dispatch_mode":"queue",
+            "epoch":"native-epoch", "request_id":request["id"], "queue_id":queue_id, "dispatch_mode":"legacyqueue",
             "request_fingerprint":bridge._digest(request), "pending_fingerprint":bridge._digest(pending)}
         calls=[]
         def telegram_stub(token, method, payload):
@@ -1109,8 +1121,8 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             result, _ = self._call_native(handler, parser, {"action":"loaded","version":"1.6.1","profiles":[]})
         self.assertEqual(result["version"], "1.8.0")
         self.assertEqual(result["package_version"], "1.8.1")
-        self.assertEqual(result["capabilities"], ["desktop-command-approval-v5", "desktop-completion-recovery-v1"])
-        self.assertNotEqual((result["version"], "desktop-command-approval-v5"),
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v6", "desktop-completion-recovery-v1"])
+        self.assertNotEqual((result["version"], "desktop-command-approval-v6"),
                             ("1.6.1", "desktop-command-approval-v2"))
 
     def test_immutable_180_helper_and_renderer_keep_approval_v4_while_181_adds_recovery(self):
@@ -1154,7 +1166,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             new_reply, _ = self._call_native(new_handler, new_parser, {"action":"loaded","version":"1.8.0","profiles":[]})
         self.assertEqual(new_reply["version"], "1.8.0")
         self.assertEqual(new_reply["package_version"], "1.8.1")
-        self.assertEqual(new_reply["capabilities"], ["desktop-command-approval-v5", "desktop-completion-recovery-v1"])
+        self.assertEqual(new_reply["capabilities"], ["desktop-command-approval-v6", "desktop-completion-recovery-v1"])
         self.assertEqual(old_reply["version"], new_reply["version"])
         self.assertEqual(old_reply["capabilities"], ["desktop-command-approval-v4"])
         self.assertNotEqual(old_reply["capabilities"][0], new_reply["capabilities"][0])
@@ -1221,7 +1233,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 {"action": "reply_poll", "owner": "fixture", "observations": [], "unverified": []})[0],
                 {"ok": False, "feature_ready": False, "reason": "legacy_package_migration_required"})
             self.assertEqual(self._call_native(registration["handler_fn"], parser,
-                {"action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v5",
+                {"action": "approval_owner_heartbeat", "capability": "desktop-command-approval-v6",
                  "owner": "fixture"})[0],
                 {"ok": False, "feature_ready": False, "reason": "legacy_package_migration_required"})
         self.assertEqual(manager.get_platform_handler_factories("telegram"), [(factory, FRONTEND_ID)])
@@ -1242,11 +1254,11 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
             }, root=self.home, state=self.state, native=True)
         self.assertEqual(result["version"], "1.8.0")
         self.assertEqual(result["package_version"], "1.8.1")
-        self.assertEqual(result["capabilities"], ["desktop-command-approval-v5", "desktop-completion-recovery-v1"])
+        self.assertEqual(result["capabilities"], ["desktop-command-approval-v6", "desktop-completion-recovery-v1"])
         self.assertNotEqual(result["version"], "1.6.1")
         self.assertEqual(old_helper, {"ok": False, "reason": "capability_mismatch"})
         self.assertEqual(bridge.VERSION, "1.8.0")
-        self.assertEqual(bridge.CAPABILITY, "desktop-command-approval-v5")
+        self.assertEqual(bridge.CAPABILITY, "desktop-command-approval-v6")
     def test_legacy_compatibility_package_is_deprecated_and_registers_no_factory(self):
         from hermes_cli.plugins import PluginContext, PluginManager
         from hermes_cli.plugins_manifest import PluginManifest
@@ -1285,7 +1297,7 @@ console.log('actual native timeout receipt: command-free renderer boundary verif
                 gateway_module = importlib.import_module(f"{module_name}.telegram_integration")
             package_modules.append((notifier_module, reply_module, followup_module, approval_module, gateway_module))
             self.assertEqual(notifier_module.VERSION, "1.8.1")
-            self.assertEqual(approval_module.CAPABILITY, "desktop-command-approval-v5")
+            self.assertEqual(approval_module.CAPABILITY, "desktop-command-approval-v6")
             self.assertEqual(approval_module.VERSION, notifier_module.APPROVAL_COMPAT_VERSION)
             self.assertEqual(notifier_module.ROOT, home.resolve())
             self.assertTrue(all(module.__name__.startswith(module_name + ".") for module in package_modules[-1]))

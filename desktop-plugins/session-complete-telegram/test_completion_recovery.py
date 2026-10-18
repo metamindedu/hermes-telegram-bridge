@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import test_support
 from hermes_state import SessionDB
+from agent.secret_scope import reset_secret_scope, set_secret_scope
 
 REPO=Path(__file__).resolve().parents[2]
 PACKAGE=REPO/"desktop-plugins"/"session-complete-telegram"
@@ -28,6 +29,9 @@ class CompletionRecoveryTests(unittest.TestCase):
         (self.home/".env").write_text(f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_HOME_CHANNEL={CHAT}:{TOPIC}\n",encoding="utf-8")
         (self.home/"config.yaml").write_text("plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings: {}\n",encoding="utf-8")
         self.home_patch=patch.dict(os.environ,{"HERMES_HOME":str(self.home)});self.home_patch.start();self.addCleanup(self.home_patch.stop)
+        self.secret_values={"TELEGRAM_BOT_TOKEN":TOKEN,"TELEGRAM_HOME_CHANNEL":f"{CHAT}:{TOPIC}"}
+        secret_scope=set_secret_scope(self.secret_values,profile_home=str(self.home))
+        self.addCleanup(reset_secret_scope,secret_scope)
         self.profile_patch=patch("hermes_cli.profiles.get_active_profile_name",return_value="default");self.profile_patch.start();self.addCleanup(self.profile_patch.stop)
         self.name="_completion_recovery_native_fixture"
         spec=importlib.util.spec_from_file_location(self.name,self.installed/"__init__.py",submodule_search_locations=[str(self.installed)])

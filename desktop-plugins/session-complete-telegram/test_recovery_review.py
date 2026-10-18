@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.secret_scope import reset_secret_scope, set_secret_scope
 from test_completion_recovery import CompletionRecoveryTests, ROUTE, TOKEN
 
 
@@ -66,7 +68,9 @@ class RecoveryReviewTests(CompletionRecoveryTests):
 
         result = []
         with patch.object(self.recovery, "_resolve_source", side_effect=blocked):
-            worker = threading.Thread(target=lambda: result.append(self.record(identity)))
+            worker_context = contextvars.copy_context()
+            worker = threading.Thread(target=worker_context.run,
+                                      args=(lambda: result.append(self.record(identity)),))
             worker.start()
             self.assertTrue(entered.wait(10), "registered record did not reach the barrier")
             # Same native SQLite generation transitions used by public OFF/ON;
@@ -123,7 +127,7 @@ class RecoveryReviewTests(CompletionRecoveryTests):
             return self.recovery.claim(self.state, self.home, ref, ROUTE)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(claim_connection) for _ in range(2)]
+            futures = [pool.submit(contextvars.copy_context().run, claim_connection) for _ in range(2)]
             outcomes = [future.result(timeout=30) for future in futures]
         winners = [value for value in outcomes if value.get("ok") is True]
         losers = [value for value in outcomes if value.get("reason") == "candidate_changed"]
@@ -391,13 +395,12 @@ class RecoveryReviewTests(CompletionRecoveryTests):
 
         item2 = self.record(self.identity(runtime_id="typed-credential", session_key="typed-credential-session"))
         claim2 = self.claim(item2)
-        env = self.home / ".env"
-        moved_env = self.home / ".env.fixture-held"
-        env.rename(moved_env)
+        missing_scope = set_secret_scope({"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_HOME_CHANNEL": ""},
+                                         profile_home=str(self.home))
         try:
             credential_error = self.invoke(self.send_request(item2, claim2))
         finally:
-            moved_env.rename(env)
+            reset_secret_scope(missing_scope)
         self.assertEqual((credential_error.get("phase"), credential_error.get("retryable"),
                           credential_error.get("reason")),
                          ("pre_dispatch", True, "credentials_unavailable"))
@@ -525,6 +528,7 @@ class RecoveryReviewTests(CompletionRecoveryTests):
         # Private recipient verification is required; the usual supergroup fixture
         # intentionally cannot create a completion-followup binding.
         (self.home / ".env").write_text(f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
+        self.secret_values["TELEGRAM_HOME_CHANNEL"] = "99"
         enabled = self.invoke({"action": "settings_set", "key": "replies_enabled",
                                "value": True, "expected": False})
         self.assertTrue(enabled["ok"], enabled)
@@ -561,6 +565,7 @@ class RecoveryReviewTests(CompletionRecoveryTests):
 
     def test_h10_followup_off_on_during_send_keeps_old_card_reject_only(self):
         (self.home / ".env").write_text(f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
+        self.secret_values["TELEGRAM_HOME_CHANNEL"] = "99"
         enabled = self.invoke({"action": "settings_set", "key": "replies_enabled",
                                "value": True, "expected": False})
         self.assertTrue(enabled["ok"], enabled)
@@ -596,6 +601,7 @@ class RecoveryReviewTests(CompletionRecoveryTests):
 
     def test_h10_followup_destination_change_after_send_does_not_rebind_private_card(self):
         (self.home / ".env").write_text(f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_HOME_CHANNEL=99\n", encoding="utf-8")
+        self.secret_values["TELEGRAM_HOME_CHANNEL"] = "99"
         enabled = self.invoke({"action": "settings_set", "key": "replies_enabled",
                                "value": True, "expected": False})
         self.assertTrue(enabled["ok"], enabled)

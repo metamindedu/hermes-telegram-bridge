@@ -21,9 +21,14 @@ jobs:
             ref: 74306c1d1b080837744faca3e371267dd09dda4b
           - generation: current
             ref: 297552a9d646119871391d202509822cd86330df
+          - generation: installed
+            ref: d923a5eb487a17c0a68801bba9ef0f56c81040a8
     runs-on: ${{ matrix.os }}
     env:
-      # All Hermes homes and tempfile fixtures are disposable runner-owned data.
+      # The guarded runner creates a unique marked fixture root under this existing runner-owned base.
+      HERMES_TEST_ISOLATION_BASE: ${{ github.workspace }}/.ci-scratch
+      # Non-Python setup/Node steps retain their prior disposable scratch locations; the guarded
+      # Python entrypoint replaces these with per-run fixture-owned paths before any imports.
       HERMES_HOME: ${{ github.workspace }}/.ci-scratch/home
       HERMES_TEST_TMPDIR: ${{ github.workspace }}/.ci-scratch/scratch
       HERMES_CORE_GENERATION: ${{ matrix.core.generation }}
@@ -75,9 +80,7 @@ jobs:
             WORKSPACE="$GITHUB_WORKSPACE"
           fi
           uv pip install --python "$CORE_PY" -r "$WORKSPACE/desktop-plugins/session-complete-telegram/requirements-test.txt"
-          "$CORE_PY" -c "from pathlib import Path; import os; Path(os.environ['HERMES_HOME']).mkdir(parents=True, exist_ok=True); Path(os.environ['HERMES_TEST_TMPDIR']).mkdir(parents=True, exist_ok=True)"
-          # Export tempfile roots only after creating them; checkout/setup steps
-          # retain the runner's valid original temporary directories.
+          "$CORE_PY" -I -S -c "from pathlib import Path; import os; base=Path(os.environ['HERMES_TEST_ISOLATION_BASE']); base.mkdir(parents=True, exist_ok=True); Path(os.environ['HERMES_HOME']).mkdir(parents=True, exist_ok=True); Path(os.environ['HERMES_TEST_TMPDIR']).mkdir(parents=True, exist_ok=True)"
           printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$HERMES_TEST_TMPDIR" "$HERMES_TEST_TMPDIR" "$HERMES_TEST_TMPDIR" >> "$GITHUB_ENV"
 
       - name: Node syntax and behavior tests
@@ -85,7 +88,7 @@ jobs:
         working-directory: desktop-plugins/session-complete-telegram
         run: |
           node --check desktop/plugin.js
-          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
+          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
 
       - name: Full Python bridge and native-install tests
         shell: bash
@@ -96,4 +99,49 @@ jobs:
           else
             CORE_PY="$GITHUB_WORKSPACE/hermes-agent/.venv/bin/python"
           fi
-          "$CORE_PY" -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review -v
+          "$CORE_PY" -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_canonical_backend test_db_isolation test_canonical_integration test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review
+
+  native-pm-container:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        core:
+          - generation: legacy
+            ref: 74306c1d1b080837744faca3e371267dd09dda4b
+          - generation: current
+            ref: 297552a9d646119871391d202509822cd86330df
+          - generation: installed
+            ref: d923a5eb487a17c0a68801bba9ef0f56c81040a8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.core.ref }}
+          path: hermes-agent
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Export only code and immutable Git objects
+        working-directory: .
+        run: python tests/support/prepare_native_container.py --bridge . --core hermes-agent --output .native-context
+      - name: Build the credential-free native PM image
+        working-directory: .
+        run: docker build --build-arg CORE_REF=${{ matrix.core.ref }} --build-arg CORE_GENERATION=${{ matrix.core.generation }} --tag bridge-native-pm:${{ matrix.core.generation }} .native-context
+      - name: Verify boundary before real native install, upgrade and rollback tests
+        working-directory: .
+        run: python tests/support/run_native_container.py --image bridge-native-pm:${{ matrix.core.generation }} --output .native-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-pm-${{ matrix.core.generation }}
+          path: |
+            .native-context/inputs.json
+            .native-evidence/boundary.json
+            .native-evidence/stdout.log
+            .native-evidence/scratch-evidence/**/metadata/*.json

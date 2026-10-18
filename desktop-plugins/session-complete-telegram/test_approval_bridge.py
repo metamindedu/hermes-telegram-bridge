@@ -10,6 +10,7 @@ import test_support
 CORE_GENERATION_REFS={
     'legacy':'74306c1d1b080837744faca3e371267dd09dda4b',
     'current':'297552a9d646119871391d202509822cd86330df',
+    'installed':'d923a5eb487a17c0a68801bba9ef0f56c81040a8',
 }
 
 class ApprovalBridgeTests(unittest.TestCase):
@@ -49,7 +50,8 @@ class ApprovalBridgeTests(unittest.TestCase):
         inferred='current' if editor_path.is_file() else 'legacy'
         generation=os.environ.get('HERMES_CORE_GENERATION',inferred)
         self.assertIn(generation,CORE_GENERATION_REFS)
-        self.assertEqual(generation,inferred,
+        api_generation='legacy' if generation=='installed' else generation
+        self.assertEqual(api_generation,inferred,
             f'declared generation {generation} contradicts actual editor producer availability at {editor_path}')
         expected_ref=CORE_GENERATION_REFS[generation]
         declared_ref=os.environ.get('HERMES_CORE_REF')
@@ -63,7 +65,7 @@ class ApprovalBridgeTests(unittest.TestCase):
         elif os.environ.get('CI','').lower()=='true':
             self.fail('CI core checkout must expose Git metadata for immutable-ref verification')
 
-        if generation=='current':
+        if api_generation=='current':
             self.assertTrue(editor_path.is_file())
             editor=importlib.import_module('gateway.session_local_editor')
             self.assertEqual(Path(editor.__file__).resolve(),editor_path.resolve())
@@ -71,7 +73,7 @@ class ApprovalBridgeTests(unittest.TestCase):
             self.assertFalse(editor_path.exists(),'legacy core unexpectedly contains the editor producer')
             self.assertIsNone(importlib.util.find_spec('gateway.session_local_editor'),
                 'a newer namespace module leaked into the exact legacy-core test')
-        return generation,root
+        return api_generation,root
 
     @staticmethod
     def pair(command='rm -rf approval-fixture',description='recursive delete',key='recursive delete',
@@ -92,7 +94,7 @@ class ApprovalBridgeTests(unittest.TestCase):
         return {'owner':owner or self.owner,'connectionId':route['connectionId'],'profile':route['profile'],
             'targetProfile':route['targetProfile'],'sid':session['id'],'session_key':session['session_key'],
             'epoch':str(epoch),'request_id':request['id'],'queue_id':pending['request_id'],
-            'dispatch_mode':'queue','request_fingerprint':b._digest(request),'pending_fingerprint':b._digest(pending)}
+            'dispatch_mode':'legacyqueue','request_fingerprint':b._digest(request),'pending_fingerprint':b._digest(pending)}
 
     def telegram(self,token,method,payload):
         self.calls.append((method,copy.deepcopy(payload)))
@@ -151,21 +153,21 @@ class ApprovalBridgeTests(unittest.TestCase):
 
     def test_server_request_authority_requires_valid_approval_and_exact_empty_queue_marker(self):
         marker={'request_id':self.request['params']['request_id'],'missing':True}
-        self.assertTrue(b.supported_pair(self.request,marker,self.session['id'],'server_request'))
+        self.assertTrue(b.supported_pair(self.request,marker,self.session['id'],'legacyserver_request'))
         for request in [
             {**self.request,'id':'srq-short'},
             {**self.request,'method':'sudo'},
             {**self.request,'params':{**self.request['params'],'choices':['once','deny','deny']}},
             {**self.request,'params':{**self.request['params'],'allow_session':False}},
         ]:
-            self.assertFalse(b.supported_pair(request,marker,self.session['id'],'server_request'))
-        self.assertFalse(b.supported_pair(self.request,{},self.session['id'],'server_request'))
+            self.assertFalse(b.supported_pair(request,marker,self.session['id'],'legacyserver_request'))
+        self.assertFalse(b.supported_pair(self.request,{},self.session['id'],'legacyserver_request'))
 
     def test_native_queue_snapshot_classifier_distinguishes_absence_from_malformed_and_conflict(self):
         queue=b.classify_approval_authority(self.request,{'approvals':[self.pending]},self.session['id'])
-        self.assertEqual(queue,{'dispatch_mode':'queue','pending':self.pending})
+        self.assertEqual(queue,{'dispatch_mode':'legacyqueue','pending':self.pending})
         absent=b.classify_approval_authority(self.request,{'approvals':[]},self.session['id'])
-        self.assertEqual(absent,{'dispatch_mode':'server_request',
+        self.assertEqual(absent,{'dispatch_mode':'legacyserver_request',
             'pending':{'request_id':self.request['params']['request_id'],'missing':True}})
         for snapshot in (None,{},False,{'approvals':'bad'}, {'approvals':[{}]},
                          {'approvals':[self.pending,self.pending]},
@@ -322,19 +324,19 @@ class ApprovalBridgeTests(unittest.TestCase):
     def test_server_request_card_registration_freezes_mode_and_terminal_unknown_never_replays(self):
         marker={'request_id':self.request['params']['request_id'],'missing':True}
         self.descriptor=self.descriptor_for(self.request,marker)
-        self.descriptor['dispatch_mode']='server_request'
+        self.descriptor['dispatch_mode']='legacyserver_request'
         self.descriptor['pending_fingerprint']=b._digest(marker)
         result=self.register(pending=marker,descriptor=self.descriptor)
         self.assertTrue(result.get('ok'),result)
         row=self.row(result['id'])
-        self.assertEqual(json.loads(row['descriptor'])['dispatch_mode'],'server_request')
+        self.assertEqual(json.loads(row['descriptor'])['dispatch_mode'],'legacyserver_request')
         tap_now=max(self.now+.1,time.time()+.1)
         tapped=b.choose(row['token'],'deny',self.identity(result['id'],event='server-request-deny'),
             state=self.state,now=tap_now)
         self.assertTrue(tapped.get('ok'),tapped)
         observation=self.observe(result['id'])
         polled=b.poll(self.owner,[observation],state=self.state,now=tap_now+.1)
-        self.assertEqual(polled['items'][0]['descriptor']['dispatch_mode'],'server_request')
+        self.assertEqual(polled['items'][0]['descriptor']['dispatch_mode'],'legacyserver_request')
         item=polled['items'][0]
         self.assertTrue(b.settle(result['id'],item['claim'],'unknown',state=self.state,now=tap_now+.2)['ok'])
         self.assertEqual(self.row(result['id'])['status'],'unknown')
@@ -559,6 +561,11 @@ class ApprovalBridgeTests(unittest.TestCase):
         from contextlib import ExitStack
         from tools import approval as native_approval, approval_context
         from tui_gateway import server, server_requests
+        # Legacy emission lazily imports the real Gateway redactor and its dependency
+        # tree. Qualify that setup before starting the five-second publication oracle;
+        # otherwise a cold import can be mistaken for a missing native approval.
+        prepared = server._approval_request_payload({'command':'synthetic redactor preparation'})
+        self.assertEqual(prepared['command'],'synthetic redactor preparation')
 
         sid='native-approval-'+uuid.uuid4().hex[:12]
         session_key='native-session-key-'+uuid.uuid4().hex[:12]
@@ -596,7 +603,12 @@ class ApprovalBridgeTests(unittest.TestCase):
                     stack.enter_context(patch.object(prompt._ctx,'_is_cron_approval_context',return_value=False))
                 thread=threading.Thread(target=invoke,name='native-approval-producer-'+label,daemon=True)
                 thread.start()
-                self.assertTrue(notified.wait(5),f'{label} did not emit a native approval request: {thread_error!r}')
+                published = notified.wait(5)
+                if not published:
+                    import sys, traceback
+                    frame = sys._current_frames().get(thread.ident)
+                    observed = [(item.name, item.lineno) for item in traceback.extract_stack(frame)] if frame else []
+                    self.fail(f'{label} did not emit a native approval request: errors={thread_error!r}; outcome={outcome!r}; thread_frames={observed!r}')
                 self.assertFalse(thread_error,repr(thread_error))
                 self.assertTrue(captured, label)
                 request=json.loads(json.dumps(captured[-1],ensure_ascii=False))

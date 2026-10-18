@@ -1,4 +1,4 @@
-import asyncio, copy, json, time, unittest
+import asyncio, copy, json, os, stat, time, unittest
 from pathlib import Path
 from unittest.mock import patch
 import test_support
@@ -12,6 +12,25 @@ class FollowupTests(unittest.TestCase):
   self.d=dict(owner='owner',connectionId='local',profile='default',targetProfile='default',sid='sid',session_key='durable',epoch='epoch',started_at='100',final_row_id=42)
   out=b.register_completion(self.d,bot=77,chat=99,topic=None,message_id=100,state=self.state,now=self.now);self.assertTrue(out['ok']);self.bid=out['binding_id']
   self.ident=dict(inbound_id=200,bot_id=77,author_bot_id=77,user_id=99,chat_id=99,private=True,sender_chat=False,topic=None,reply_topic=None,forwarded=False,edited=False,business=False,command=False,text='후속 입력',boot='boot')
+ def test_private_inbox_paths_are_owner_only_on_posix(self):
+  if os.name!='posix':self.skipTest('POSIX mode bits are not Windows NTFS ACLs')
+  state=self.state/'permission-mode-fixture'
+  b.bind_receiver(77,99,None,'permission-boot',private_verified=True,state=state,now=self.now)
+  b.heartbeat_owner('permission-owner',state=state,now=self.now)
+  inbox=state/'followup-inbox';database=inbox/'followups.sqlite3'
+  self.assertEqual(stat.S_IMODE(inbox.stat().st_mode),0o700)
+  self.assertEqual(stat.S_IMODE(database.stat().st_mode),0o600)
+ def test_private_inbox_data_survives_reopen_and_path_errors_remain_visible(self):
+  state=self.state/'permission-fixture'
+  b.bind_receiver(77,99,None,'permission-boot',private_verified=True,state=state,now=self.now)
+  b.heartbeat_owner('permission-owner',state=state,now=self.now)
+  with b.connect(state) as reopened:
+   receiver=reopened.execute('SELECT boot,chat,private_verified FROM receiver WHERE singleton=1').fetchone()
+   owner=reopened.execute('SELECT seen FROM owners WHERE owner=?',('permission-owner',)).fetchone()
+  self.assertEqual(tuple(receiver),('permission-boot',99,1))
+  self.assertEqual(owner['seen'],self.now)
+  blocked=self.state/'not-a-directory';blocked.write_text('fixture',encoding='utf-8')
+  with self.assertRaises(OSError):b.connect(blocked)
  def ingest(self,**kw):return b.ingest(77,99,100,201,self.bid,{**self.ident,**kw},state=self.state,now=self.now)
  def claim(self):
   row=b.ready('owner',state=self.state,now=self.now)['items'][0]

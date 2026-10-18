@@ -5,7 +5,7 @@ import { jsx } from 'react/jsx-runtime'
 // App-level disk plugin: explicit settings writes use the fixed native helper.
 export const VERSION = '1.8.1'
 export const APPROVAL_COMPAT_VERSION = '1.8.0'
-export const APPROVAL_CAPABILITY = 'desktop-command-approval-v5'
+export const APPROVAL_CAPABILITY = 'desktop-command-approval-v6'
 export const COMPLETION_RECOVERY_CAPABILITY = 'desktop-completion-recovery-v1'
 export const COMPLETION_RECOVERY_TTL_MS = 30 * 60_000
 export const APPROVAL_LEASE_MS = 45_000
@@ -191,16 +191,16 @@ export function classifyApprovalAuthority(request,queueSnapshot,runtimeSid) {
   const matches=queueSnapshot.approvals.filter(row=>row.request_id===request.params.request_id)
   if(matches.length){
     if(matches.length!==1||!queuePairMatches(request,matches[0],runtimeSid))return null
-    return {mode:'queue',pending:matches[0]}
+    return {mode:'legacyqueue',pending:matches[0]}
   }
   if(queueSnapshot.approvals.some(row=>queuePayloadConflicts(request,row)))return null
-  return {mode:'server_request',pending:{request_id:request.params.request_id,missing:true}}
+  return {mode:'legacyserver_request',pending:{request_id:request.params.request_id,missing:true}}
 }
 
-export function validateApprovalPair(request,pending,runtimeSid,dispatchMode='queue') {
+export function validateApprovalPair(request,pending,runtimeSid,dispatchMode='legacyqueue') {
   if(!validNativeApprovalRequest(request,runtimeSid))return false
-  if(dispatchMode==='queue')return queuePairMatches(request,pending,runtimeSid)
-  return dispatchMode==='server_request'&&stableJSON(pending)===stableJSON(
+  if(dispatchMode==='legacyqueue')return queuePairMatches(request,pending,runtimeSid)
+  return dispatchMode==='legacyserver_request'&&stableJSON(pending)===stableJSON(
     {request_id:request.params.request_id,missing:true})
 }
 
@@ -296,6 +296,7 @@ const HELPER_WRITE_ACTIONS = new Set([
   'completion_recovery_claim', 'completion_recovery_send',
   'reply_register', 'reply_poll', 'reply_settle', 'reply_fragment',
   'approval_owner_heartbeat', 'approval_register', 'approval_poll', 'approval_settle', 'approval_notice',
+  'canonical_approval_observe', 'approval_native_observe', 'approval_native_apply',
   'followup_claim', 'followup_begin_submit', 'followup_reject', 'followup_settle',
   'loaded', 'diagnostic', 'settings_set'
 ])
@@ -1114,8 +1115,12 @@ export class CompletionMonitor {
 
   onEvent(event) {
     if (this.stopped) return
-    if (event.type === 'gateway.ready') { void this.mounted(true); return }
-    if (event.replayed || !event.session_id) return
+    if (event?.type === 'gateway.ready') { void this.mounted(true); return }
+    if (event?.type === 'approval.request' || event?.type === 'approval.settled') {
+      if (typeof event.session_id === 'string' && event.session_id) return this.handleCanonicalApprovalEvent(event)
+      return
+    }
+    if (!event || typeof event !== 'object' || event.replayed || !event.session_id) return
     const recoveryBookkeeping = ['session.info','status.update'].includes(event.type)
     const interesting = ['message.start', 'message.complete', 'tool.start', 'tool.complete', 'todo.updated',
       'subagent.start', 'subagent.complete', 'error', 'session.control.update', ...['session.info','status.update']]
@@ -1981,7 +1986,16 @@ export class CompletionMonitor {
           r.sweepAbsent = false
           if (row.status !== 'waiting') {
             r.ask = null
+            r.canonicalAsk = null
             if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+            continue
+          }
+          if (r.canonicalSettled) {
+            if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+            continue
+          }
+          if (r.canonicalAsk) {
+            await this.checkCanonicalApproval(r)
             continue
           }
           await this.checkAsk(r, route, row)
@@ -2006,6 +2020,191 @@ export class CompletionMonitor {
       this.approvalSweepUnverified.clear()
       this.approvalSweepAbsent.clear()
       this.sweeping = false
+    }
+  }
+
+  async handleCanonicalApprovalEvent(event) {
+    if (this.stopped || !event || typeof event !== 'object') return
+    const read = atom => {
+      try { return typeof atom?.get === 'function' ? atom.get() : undefined } catch { return undefined }
+    }
+    const profile = typeof event.profile === 'string' && event.profile ? event.profile : read(this.api.state?.profile)
+    const connectionId = typeof event.connectionId === 'string' && event.connectionId
+      ? event.connectionId : read(this.api.state?.connectionId)
+    if (typeof profile !== 'string' || !profile || typeof connectionId !== 'string' || !connectionId ||
+        typeof event.session_id !== 'string' || !event.session_id) return
+    let routes
+    try { routes = await this.refreshRoutes(true) } catch { return }
+    const matches = routes.filter(route => route.mode === 'local' &&
+      route.connectionId === connectionId && route.profile === profile)
+    if (matches.length !== 1 || !this.currentEventIsActiveLocal(profile, connectionId)) return
+    const key = JSON.stringify([connectionId, profile, event.session_id])
+    let record = this.records.get(key)
+    if (!record) {
+      record = {key, profile, connectionId, sid:event.session_id, generation:0, candidate:null,
+        cancel:null, todos:null, seq:0, settledFinals:new Set(), checking:false, retries:0,
+        ask:null, askChecking:false, canonicalAsk:null, canonicalSettled:null}
+      this.records.set(key, record)
+    }
+    if (Number.isSafeInteger(event.seq) && event.seq > record.seq) record.seq = event.seq
+    const payload = event.payload
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return
+    if (event.type === 'approval.settled') {
+      if (typeof payload.prompt_id !== 'string' || !payload.prompt_id ||
+          !Number.isSafeInteger(payload.execution_generation) || payload.execution_generation < 1) return
+      const prior = record.canonicalAsk
+      if (prior && prior.prompt.prompt_id === payload.prompt_id &&
+          prior.prompt.execution_generation === payload.execution_generation) record.canonicalAsk = null
+      if (record.approval?.descriptor?.dispatch_mode === 'canonical_native' &&
+          record.approval.descriptor.prompt_id === payload.prompt_id &&
+          record.approval.descriptor.execution_generation === payload.execution_generation &&
+          (!record.canonicalAsk || (record.canonicalAsk.prompt.prompt_id === payload.prompt_id &&
+            record.canonicalAsk.prompt.execution_generation === payload.execution_generation))) {
+        record.canonicalSettled = {prompt_id:payload.prompt_id, execution_generation:payload.execution_generation}
+      }
+      if (!record.canonicalAsk || (record.canonicalAsk.prompt.prompt_id === payload.prompt_id &&
+          record.canonicalAsk.prompt.execution_generation === payload.execution_generation)) {
+        record.ask = {id:payload.prompt_id, method:'approval'}
+      }
+      return
+    }
+    if (event.type !== 'approval.request' || payload.kind !== 'approval' ||
+        typeof payload.prompt_id !== 'string' || !payload.prompt_id ||
+        !Number.isSafeInteger(payload.execution_generation) || payload.execution_generation < 1) return
+    // The public host adapter projects native prompt_id as a legacy request_id alias.
+    // Remove only that verified same-ID projection on our own detached copy; never
+    // mutate the SDK cache, repair an ID, or discard unknown native review fields.
+    let nativePrompt
+    try {
+      nativePrompt = structuredClone(payload)
+      if (Object.prototype.hasOwnProperty.call(nativePrompt, 'request_id')) {
+        if (nativePrompt.request_id !== nativePrompt.prompt_id) return
+        delete nativePrompt.request_id
+      }
+    } catch { return }
+    const previous = record.canonicalAsk
+    if (previous && (previous.prompt.prompt_id !== nativePrompt.prompt_id ||
+        previous.prompt.execution_generation !== nativePrompt.execution_generation ||
+        stableJSON(previous.prompt) !== stableJSON(nativePrompt) ||
+        previous.replayEpoch !== (event.replay_epoch ?? null) ||
+        previous.authorityEpoch !== (event.authority_epoch ?? null))) {
+      if (record.approval?.descriptor?.dispatch_mode === 'canonical_native') {
+        this.approvalSweepAbsent.add(record.approval.id)
+      }
+    }
+    record.canonicalAsk = {prompt:nativePrompt, seq:Number.isSafeInteger(event.seq) ? event.seq : null,
+      replayEpoch:event.replay_epoch ?? null, authorityEpoch:event.authority_epoch ?? null}
+    record.canonicalSettled = null
+    record.ask = {id:nativePrompt.prompt_id, method:'approval'}
+    await this.checkCanonicalApproval(record)
+  }
+
+  async checkCanonicalApproval(record) {
+    if (this.stopped || !this.approvalCapable || !record?.canonicalAsk || record.canonicalChecking) return
+    const prompt = record.canonicalAsk.prompt
+    const key = stableJSON([prompt.prompt_id, prompt.execution_generation,
+      record.canonicalAsk.replayEpoch, record.canonicalAsk.authorityEpoch, record.canonicalAsk.seq])
+    const currentApproval = record.approval?.descriptor
+    if (record.canonicalObservedKey === key) return
+    if (currentApproval?.dispatch_mode === 'canonical_native' &&
+        currentApproval.prompt_id === prompt.prompt_id &&
+        currentApproval.execution_generation === prompt.execution_generation) {
+      const replayMatches = record.canonicalAsk.replayEpoch == null ||
+        currentApproval.replay_epoch === record.canonicalAsk.replayEpoch
+      const authorityMatches = record.canonicalAsk.authorityEpoch == null ||
+        currentApproval.authority_epoch === record.canonicalAsk.authorityEpoch
+      if (replayMatches && authorityMatches) return
+      this.approvalSweepAbsent.add(record.approval.id)
+      return
+    }
+    record.canonicalChecking = true
+    try {
+      const routes = await this.refreshRoutes(true)
+      const matches = routes.filter(route => route.mode === 'local' &&
+        route.connectionId === record.connectionId && route.profile === record.profile)
+      if (matches.length !== 1 || !this.currentEventIsActiveLocal(record.profile, record.connectionId)) return
+      const route = matches[0]
+      const publicRoute = {mode:'local', connectionId:route.connectionId,
+        profile:route.profile, targetProfile:route.targetProfile}
+      const observed = await this.helper({action:'canonical_approval_observe', capability:APPROVAL_CAPABILITY,
+        owner:this.replyOwner, route:publicRoute, session_id:record.sid, prompt})
+      if (!observed || observed.ok !== true ||
+          observed.descriptor?.dispatch_mode !== 'canonical_native' ||
+          observed.descriptor.owner !== this.replyOwner ||
+          observed.descriptor.connectionId !== route.connectionId ||
+          observed.descriptor.profile !== route.profile ||
+          observed.descriptor.targetProfile !== route.targetProfile ||
+          observed.descriptor.sid !== record.sid ||
+          observed.descriptor.prompt_id !== prompt.prompt_id ||
+          observed.descriptor.execution_generation !== prompt.execution_generation ||
+          stableJSON(observed.request) !== stableJSON(prompt) ||
+          !observed.pending || typeof observed.pending !== 'object' || Array.isArray(observed.pending)) {
+        record.canonicalObservedKey = key
+        this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
+          message:'현재 요청을 안전하게 확인할 수 없습니다. Desktop에서 실제 승인 상태를 확인해 주세요.'})
+        return
+      }
+      const descriptor = observed.descriptor
+      const previous = record.approval
+      if (previous && previous.descriptor.dispatch_mode === 'canonical_native' &&
+          stableJSON(previous.descriptor) !== stableJSON(descriptor)) {
+        this.approvalSweepAbsent.add(previous.id)
+        return
+      }
+      // A new canonical-only monitor has no owner lease yet. Establish the same
+      // exact v6 receiver/owner capability gate used by the legacy registration
+      // path before asking the fixed CLI to create the first card. A transient,
+      // stale, or disabled heartbeat is read-only and remains eligible for the
+      // next sweep; it must not poison this native event permanently.
+      let heartbeat
+      try {
+        heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
+          capability:APPROVAL_CAPABILITY})
+      } catch { return }
+      if (heartbeat?.ok !== true || heartbeat.feature_ready !== true ||
+          heartbeat.version !== APPROVAL_COMPAT_VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) return
+      const registration = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
+        owner:this.replyOwner, descriptor, request:observed.request, pending:observed.pending,
+        route:publicRoute, session:{id:record.sid, session_key:descriptor.session_key, status:'waiting'}})
+      if (registration?.ok === true && typeof registration.id === 'string' &&
+          ['posting','open','queued','applying','dispatching'].includes(registration.status)) {
+        record.approval = {id:registration.id, descriptor, request:observed.request,
+          pending:observed.pending, requestFingerprint:descriptor.request_fingerprint,
+          pendingFingerprint:descriptor.pending_fingerprint, route:{...route}}
+        record.canonicalObservedKey = key
+        record.ask = {id:prompt.prompt_id, method:'approval'}
+        return
+      }
+      if (registration?.duplicate && typeof registration.id === 'string' &&
+          ['posting','open','queued','applying','dispatching'].includes(registration.status)) {
+        record.approval = {id:registration.id, descriptor, request:observed.request,
+          pending:observed.pending, requestFingerprint:descriptor.request_fingerprint,
+          pendingFingerprint:descriptor.pending_fingerprint, route:{...route}}
+        record.canonicalObservedKey = key
+        return
+      }
+      if (registration?.reason === 'prior_owner' ||
+          ['expired','rejected','unknown','applied'].includes(registration?.status)) {
+        record.canonicalObservedKey = key
+        return
+      }
+      // Once a real canonical approval is recognized, no failure can fall back to
+      // legacy srq handling or a generic attention card containing partial command text.
+      try {
+        await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
+          owner:this.replyOwner, descriptor, request:observed.request, pending:observed.pending,
+          reason:typeof registration?.reason === 'string' ? registration.reason : 'review_unavailable'})
+      } catch { /* one command-free notice attempt; never replay an uncertain send */ }
+      record.canonicalObservedKey = key
+      this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
+        message:'이 요청은 Telegram에서 안전하게 검토할 수 없습니다. 전체 명령과 현재 승인을 Desktop에서 확인해 주세요.'})
+    } catch {
+      // A failed helper invocation is not retried within this approval event.
+      record.canonicalObservedKey = key
+      this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
+        message:'현재 요청을 확인하지 못했습니다. 중복 방지를 위해 Telegram 승인 카드를 만들지 않았습니다.'})
+    } finally {
+      record.canonicalChecking = false
     }
   }
 
@@ -2196,6 +2395,30 @@ export class CompletionMonitor {
 
   async approvalSnapshot(bridge) {
     const d = bridge.descriptor
+    if (d.dispatch_mode === 'canonical_native') {
+      const routes = await this.refreshRoutes(true)
+      const matches = routes.filter(route => route.mode === 'local' &&
+        route.connectionId === d.connectionId && route.profile === d.profile &&
+        route.targetProfile === d.targetProfile)
+      if (matches.length !== 1 || !this.currentEventIsActiveLocal(d.profile, d.connectionId)) {
+        throw new Error('canonical approval route is not the captured active owner')
+      }
+      const reply = await this.helper({action:'approval_native_observe', capability:APPROVAL_CAPABILITY,
+        owner:this.replyOwner, id:bridge.id})
+      if (exactKeys(reply, ['ok','id','request_fingerprint','pending_fingerprint','authority']) &&
+          reply.ok === true && reply.id === bridge.id &&
+          reply.request_fingerprint === d.request_fingerprint &&
+          reply.pending_fingerprint === d.pending_fingerprint &&
+          typeof reply.authority === 'string' && /^[0-9a-f]{64}$/u.test(reply.authority)) {
+        return {route:bridge.route, request:bridge.request, pending:bridge.pending,
+          dispatchMode:'canonical_native', observation:reply}
+      }
+      const reason = typeof reply?.reason === 'string' ? reply.reason : 'native_snapshot_unavailable'
+      if (['snapshot_stale','prompt_stale','authority_changed','binding_changed','approval_terminal',
+        'approval_missing_or_unowned','not_found','stale_generation','permission_denied',
+        'profile_mismatch','runtime_retired','root_binding_changed'].includes(reason)) return null
+      throw new Error(reason)
+    }
     const routes = await this.refreshRoutes(true)
     const matches = routes.filter(route => route.mode === 'local' && route.connectionId === d.connectionId &&
       route.profile === d.profile && route.targetProfile === d.targetProfile)
@@ -2241,9 +2464,13 @@ export class CompletionMonitor {
       try {
         const current = await this.approvalSnapshot(bridge)
         if (!current) { absent.push(bridge.id); continue }
-        const authority = await approvalFingerprint(bridge.descriptor)
-        observations.push({id:bridge.id, request_fingerprint:bridge.descriptor.request_fingerprint,
-          pending_fingerprint:bridge.descriptor.pending_fingerprint, authority})
+        if (bridge.descriptor.dispatch_mode === 'canonical_native') {
+          observations.push(current.observation)
+        } else {
+          const authority = await approvalFingerprint(bridge.descriptor)
+          observations.push({id:bridge.id, request_fingerprint:bridge.descriptor.request_fingerprint,
+            pending_fingerprint:bridge.descriptor.pending_fingerprint, authority})
+        }
         bridges.set(bridge.id, {...bridge, route:current.route})
       } catch {
         unverified.push(bridge.id)
@@ -2273,8 +2500,22 @@ export class CompletionMonitor {
             !Number.isFinite(item.deadline) || Date.now() >= item.deadline * 1000) {
           throw new Error('approval claim invalid')
         }
-        // A post-claim fresh route, session, open-request and native queue snapshot
-        // is required immediately before the only RPC write.
+        if (bridge.descriptor.dispatch_mode === 'canonical_native') {
+          // The fixed CLI reads the SQLite row as authority, reattaches through the
+          // native client, refreshes the complete snapshot, CASes dispatching, and
+          // sends the exact four native fields once. Desktop never RPCs approval.respond.
+          status = 'unknown'
+          try {
+            const receipt = await this.helper({action:'approval_native_apply',
+              capability:APPROVAL_CAPABILITY, owner:this.replyOwner, id:item.id, claim:item.claim})
+            if (receipt?.ok === true && receipt.status === 'applied' &&
+                receipt.receipt === 'decision_resolved') status = 'applied'
+            else if (['expired','rejected','unknown'].includes(receipt?.status)) status = receipt.status
+          } catch { /* write boundary is ambiguous; the stored claim is never replayed */ }
+          for (const record of this.records.values()) if (record.approval?.id === item.id) record.approval = null
+          continue
+        }
+        // The legacy queue modes retain their original SDK dispatch semantics.
         const fresh = await this.approvalSnapshot(bridge)
         if (!fresh || fresh.dispatchMode !== bridge.descriptor.dispatch_mode || this.stopped || Date.now() >= item.deadline * 1000 ||
             stableJSON(item.request) !== stableJSON(fresh.request) ||
@@ -2294,7 +2535,7 @@ export class CompletionMonitor {
         status = 'unknown'
         let receipt
         try {
-          if (bridge.descriptor.dispatch_mode === 'queue') {
+          if (bridge.descriptor.dispatch_mode === 'legacyqueue') {
             receipt = await this.api.requestProfile(fresh.route, 'approval.respond', {
               session_id:bridge.descriptor.sid, request_id:bridge.descriptor.queue_id,
               choice:item.choice, all:false
@@ -2309,7 +2550,7 @@ export class CompletionMonitor {
             } else {
               status = 'unknown'
             }
-          } else if (bridge.descriptor.dispatch_mode === 'server_request') {
+          } else if (bridge.descriptor.dispatch_mode === 'legacyserver_request') {
             receipt = await this.api.requestProfile(fresh.route, 'request.answer', {
               id:bridge.descriptor.request_id, result:{choice:item.choice, all:false}
             }, 15_000)
