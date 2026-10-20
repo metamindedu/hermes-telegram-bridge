@@ -6,6 +6,7 @@ No Telegram polling, second Application, or message send lives in this module.
 from __future__ import annotations
 import json
 import math
+import os
 import secrets
 import sqlite3
 import time
@@ -45,9 +46,14 @@ class ClosingConnection(sqlite3.Connection):
 
 def connect(state=STATE):
     directory = Path(state) / "followup-inbox"
-    directory.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(directory / "followups.sqlite3", timeout=8,
-                        isolation_level=None, factory=ClosingConnection)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # POSIX permissions are owner-only; Windows inherits the existing plugin-data ACL.
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    path = directory / "followups.sqlite3"
+    c = sqlite3.connect(path, timeout=8, isolation_level=None, factory=ClosingConnection)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA secure_delete=ON")
     c.executescript("""
@@ -74,6 +80,10 @@ def connect(state=STATE):
     CREATE INDEX IF NOT EXISTS receipt_status ON receipts(status,created);
     CREATE TABLE IF NOT EXISTS feedback(bot INTEGER,chat INTEGER,mid INTEGER,PRIMARY KEY(bot,chat,mid));
     """)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return c
 
 

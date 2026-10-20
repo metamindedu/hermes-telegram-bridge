@@ -1,43 +1,43 @@
-# Unified native Telegram package — Phase 3 candidate
+# Source status and maintenance plan
 
-## Scope and ownership
+Updated: 2026-10-20.
 
-The user's approval of **one installation package** authorizes this source/test/documentation candidate only. `session-complete-telegram` remains the stable native package and Desktop ID. Main/Heavy owns the plan, independent final review, release approval, and catalog/PR updates. This Light task does not commit, push, publish, deploy, modify a live Hermes home, change user config, or send Telegram messages.
+## One source, separate delivery states
 
-Only task-owned fake homes may be used for Hermes Package Manager install/Doctor/runtime tests. Windows PM fixture calls must isolate `LOCALAPPDATA` and `HERMES_HOME` and prove the dependency root, default home, and complete dependency-home set are fixture-owned before invoking PM. Preserve resolver/CAS/scanner/lease protections and classify bootstrap/dependency failures separately from product behavior.
+| Surface | Status |
+| --- | --- |
+| Active source | One personal-use package, `session-complete-telegram`, in this repository. No public/private split. |
+| Source version | 1.8.1, approval capability `desktop-command-approval-v6` and recovery capability `desktop-completion-recovery-v1`. No 1.8.1 release tag is published. |
+| Last public release | Historical v1.8.0 at `4874276f519f68fdbacb9767f70c5ed760b5c6fb`; its approval-v4 bytes and tag remain immutable. |
+| Catalog | Withdrawn. Upstream PRs #135956 and #135957 are closed and unmerged, not awaiting admission. |
+| Local operation | Installation, loaded code, receiver readiness and human Telegram interaction require their own evidence; a main merge is not activation. |
 
-## Unified package contract
+## Current consolidation scope
 
-- `desktop-plugins/session-complete-telegram/` installs as `session-complete-telegram`; its Desktop entry remains `desktop/plugin.js`, and native CLI remains `desktop-telegram-bridge`.
-- One `register(ctx)` declares both the fixed CLI command and one Telegram handler factory with the public Hermes SDK. Declaration remains pure for RecordingContext/admission. Runtime factory authority comes from captured `ctx.plugin_id`, physical package location, and `runtime.resolve_package_home`; imports stay package-relative without a second poller, broad `sys.path`, global module aliases, or core overrides.
-- Gateway wiring is limited to the existing configured Telegram bot/private home and the default installed-owner path. Successfully installed handlers consume recognized stale/tombstoned cards even when optional actions are off. Existing profile, owner, bot/chat/topic/message, route/session/request/queue, TTL, lease, claim, no-replay and read-only validity checks remain in force.
-- `plugins/desktop-clarify-telegram/` remains only as a clearly deprecated inert/no-factory compatibility stub. It is not a required or advertised install package. While that legacy ID remains effectively enabled, the unified factory and helper readiness return `legacy_package_migration_required`; no config cleanup, state deletion/copy, schema migration, or consent inheritance is automatic.
-- Native settings live only at `plugins.entries.session-complete-telegram.settings`: `replies_enabled` (clarify + ordinary completion followups) and `approvals_enabled` (Allow Once/Deny), each declared as boolean with default `false`. The two gates are independent and never suppress outbound notification actions. Raw root/plugins/enabled/entries/settings types, unknown flags, and wrong-typed values fail closed. Reads use Hermes `PluginContext.get_config` at factory admission plus strict raw YAML validation and native `plugins.enabled`/`plugins.disabled` semantics; the plugin never writes user config.
-- Package/helper/renderer/approval handshake version is **1.7.0** / `desktop-command-approval-v3`. v2/v3 mixed and cached combinations deny approval capability. Preserve all v2 approval authority checks, command-free fallback notices, exact original message/private owner/route/session/request/queue, `all:false`, no session/permanent grant, and ambiguous-write no-replay behavior.
-- Minimum Hermes remains `>=0.21.5`; exact unrelated dependency pins remain unchanged.
+The 2026-10-20 user request authorizes tidying the accumulated work into main. Consolidate completion-notification recovery, expanded approvals, compatibility/test isolation, default transport binding and concurrent-approval fixes through a squash PR. Keep the original working branch and its commits as historical evidence; do not force-push, rewrite tags or silently turn an earlier WIP/NO-GO/failed run into acceptance.
 
-## Migration and lifecycle
+This is source integration and documentation cleanup, not a new implementation or deployment. Do not reinstall the plugin, change settings or credentials, send a Telegram test message, alter runtime databases/epochs, restart the shared Gateway, reopen catalog submissions or publish a new release as part of this step.
 
-Historical public v1.6.1 at `1a76ed54ccf8a279d4dc4d9bfe1553b90d81d5ca` used two packages and is already released. The v1.7.0 source is an unreleased candidate. Migration is explicit: use Hermes CLI to disable the legacy ID, enable the primary package and set only desired optional switches, then restart the existing Gateway normally. An already-wired factory is not hot-reloaded by file replacement; callback/helper gates are re-read for each operation. A disabled package requires normal plugin loading/restart to install its factory. Rollback to historical 1.6.1 restores the old two-package runtime by its historical pin; keep config and all ledgers/tombstones intact. No automatic migration or guaranteed newer-core compatibility is claimed.
+## Source evidence and its limits
 
-## Verification acceptance
+- Functional source is pinned to `239806cc2383f065141660132a574561d0b80d12` (tree `fb63e2262c3243054594e6ac01ae0fd909f50fe1`). Consolidation changes documentation only; executable/package/test/workflow bytes must remain identical to that source.
+- Its commit-bound GitHub Actions run `39353863839` succeeded: Windows/Ubuntu bridge tests for legacy/current/installed immutable core generations, plus the separate native-PM container suite for each generation. The workflow and actual job results, not a historical plan, define that execution coverage.
+- The concurrent-approval fix has independent Heavy GO with Critical/High/Medium zero for that exact reviewed tree. This does not certify every future Hermes API or every user's installation.
+- Earlier local native-install aggregates failed or were interrupted. Keep those receipts distinct from later focused passes and successful hosted native-PM runs; do not relabel an old exit 1/137 as success.
+- Human Telegram reply/approval-button roundtrip and other users' GUI behavior remain unverified. Receiver heartbeat is readiness, not delivery or command-completion proof.
+- Before completing integration, verify the exact PR head/tree, its CI, the resulting main commit/tree, and main-push CI. Synchronize the local main only from a clean checkout; retain the original working branch.
 
-- Start with meaningful failing registration/default-off gate regressions and keep private RED/GREEN receipts outside package directories.
-- Preserve registration owner/location/home guards; real native PluginContext must declare one CLI and one factory, while pure RecordingContext performs no config/credential/state access. Legacy-enabled must prevent unified wiring and helper readiness.
-- Exercise real PTB `Application.process_update` callback/text delivery, independent default-off/enabled/revoked flags, malformed YAML, known stale-card consumption, duplicate same-Application wiring, old receiver/helper/renderer skew, and synthetic native old-two-package → one-package → old rollback with config sentinel, package IDs, ledgers and tombstones preserved.
-- Preserve resolver/CAS/scanner/lease and all notifier/reply/followup/approval/frame/claim/security regressions. Run the exact Python modules `test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install test_registration test_feature_gates` and all five existing Node suites; no skips or core stubs.
-- Existing `docs/source-manifest.json` is a historical Phase 1 snapshot and is not regenerated as a current manifest.
+## Non-negotiable maintenance boundaries
 
-## Approved SDK scope clarification — 2026-10-10
+- One package/CLI/handler factory on the existing Telegram application; no second poller or core/SDK/app patch.
+- Preserve package IDs, default-home ownership, saved opt-in settings, private destination/card identity, exact prompt/generation bindings, TTL/leases, once/deny-only decisions and ambiguous-write no-replay.
+- The canonical adapter uses feature-detected exported native utilities outside the documented plugin import allowlist. It is a compatibility adapter, not stable plugin-API certification. Unsupported hosts fail closed. Catalog withdrawal does not remove this compatibility limitation.
+- Keep the existing SDK limitation visible: when the host cannot install the old-card rejection guard, the bridge refuses readiness but cannot stop ordinary Telegram chat input.
+- Run canonical/session tests only with the before-first-access fixture database confinement in `tests/support/guarded_unittest.py`. Native-PM tests use the separate credential-free container path, never operational homes, config, SQLite stores or authentication mounts.
+- Keep secrets, private conversations, runtime databases, inboxes, diagnostic content and private evidence out of Git. Do not reset ledgers/tombstones or weaken the native installer/scanner to make tests green.
 
-The user explicitly chose to proceed without SDK development. Use the existing public API and preserve bridge authorization, consent, ownership, queue binding, replay protection and state. Whole-platform input blocking when the SDK cannot attach even the reject-only guard is excluded: the host can continue ordinary Telegram input. Keep that behavior as an executed characterization test, together with denied bridge receiver/owner readiness and unchanged approval state; do not skip it or hide previous RED/NO-GO evidence. Startup managed-policy errors still require scoped consumers to install when host installation succeeds, with every bridge action denied until policy is healthy. Disclose the limitation in README, package README, SECURITY and setup/operations docs. No core patch, private override, second poller or shared Gateway stop is authorized by this clarification. Final independent review applies to this explicit narrower contract, not the retired platform-wide guarantee.
+## Historical checkpoints
 
-## Modular-settings follow-on (1.8.0 candidate)
+`549b9d5` (2026-10-18) intentionally stored an incomplete WIP candidate after catalog withdrawal. Its source-only authorization did not then authorize a main merge, release or activation. Later corrections and the current integration request supersede that checkpoint's delivery state, not its historical facts or failures.
 
-The current user task adds the dedicated settings page and common/all-profile modular controls, requires immutable independent Heavy review and complete tests/CI, and carries the accepted candidate through publication, common installation and live verification while preserving current active settings. Historical Light-only/source-only statements above describe the preceding 1.7.0 task, not a prohibition on this newly requested delivery. No historical consent is used to enable default-off features or change unrelated settings.
-
-See `docs/modular-settings.md` for the seven-leaf/five-module contract, public native settings writer, revocation/no-replay, v4 handshake and the separately verified shared-Gateway activation boundary. Existing ownership, secret/state preservation and SDK limitation remain binding. Do not label earlier failed test receipts successful; executed native React/SDK and installed-pane verification remain distinct from controller mocks.
-
-## Release boundary
-
-The candidate SHA, commit-bound CI, Heavy GO, catalog disposition, public release, real installation, production config, Desktop/Gateway activation, restart, and Telegram round trip are not established by this task. Do not claim them. `docs/operations.md` and `docs/public-install.md` describe the one-package candidate and its separate activation/migration/rollback boundaries.
+The former phase-by-phase PLAN is retained byte-for-byte in Git at `239806cc2383f065141660132a574561d0b80d12:PLAN.md`; inspect it with `git show 239806cc2383f065141660132a574561d0b80d12:PLAN.md`. It is not the current checklist. Detailed chronological findings remain in [the wiki log](docs/wiki/log.md); operational contracts remain in [operations](docs/operations.md), and public-release installation instructions remain in [public setup](docs/public-install.md).

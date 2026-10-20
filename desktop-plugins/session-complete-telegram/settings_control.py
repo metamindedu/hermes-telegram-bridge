@@ -15,7 +15,7 @@ from typing import Any
 from .runtime import PLUGIN_ID, resolve_package_home
 from . import telegram_integration as gateway
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 
 def _context_reason(ctx: Any, root: str | Path) -> str | None:
@@ -110,6 +110,17 @@ def _receiver_summary(state: Path, effective: dict[str, bool]) -> dict[str, Any]
     return {"version": VERSION, "heartbeat_ready": bool(ready) and all(ready.values())}
 
 
+def _sender_summary(state: Path) -> dict[str, Any]:
+    """Read metadata-only sender recovery counts; never opens the receiver ledger."""
+    empty = {"version": VERSION, "available": True, "awaiting_recovery": 0,
+             "uncertain_delivery": 0, "sent": 0, "expired": 0}
+    try:
+        from . import completion_recovery
+        return {**empty, **completion_recovery.diagnostics(state)}
+    except Exception:
+        return {**empty, "available": False}
+
+
 def _status(ctx: Any, root: str | Path, state: str | Path, *, read_only: bool) -> dict[str, Any]:
     reason = _context_reason(ctx, root)
     if reason is None:
@@ -140,6 +151,7 @@ def _status(ctx: Any, root: str | Path, state: str | Path, *, read_only: bool) -
         "read_only": read_only,
         "selection_reason": selection_reason,
         "receiver": receiver,
+        "sender": _sender_summary(state_path),
     }
 
 
@@ -148,18 +160,19 @@ def settings_status(ctx: Any, *, root: str | Path, state: str | Path) -> dict[st
     return _status(ctx, root, state, read_only=True)
 
 
-def _cancel_for_setting(key: str) -> tuple[bool, bool, bool]:
-    """Return clarify/followup/approval retirement requirements for a false value."""
+def _cancel_for_setting(key: str) -> tuple[bool, bool, bool, bool]:
+    """Return clarify/followup/approval/completion-recovery retirement for OFF."""
     clarify = key in {"service_enabled", "attention_notifications_enabled", "clarify_replies_enabled", "replies_enabled"}
     followups = key in {"service_enabled", "completion_notifications_enabled", "completion_followups_enabled", "replies_enabled"}
     approvals = key in {"service_enabled", "attention_notifications_enabled", "approvals_enabled"}
-    return clarify, followups, approvals
+    completion = key in {"service_enabled", "completion_notifications_enabled"}
+    return clarify, followups, approvals, completion
 
 
 def _retire_unexecuted(key: str, state: Path) -> dict[str, Any]:
-    clarify, followups, approvals = _cancel_for_setting(key)
+    clarify, followups, approvals, completion = _cancel_for_setting(key)
     results: dict[str, Any] = {"ok": True, "clarify": 0, "followups": 0, "approvals": 0,
-                               "outcomes": {}}
+                               "completion_recovery": 0, "outcomes": {}}
 
     def attempt(store: str, retire) -> None:
         try:
@@ -188,6 +201,11 @@ def _retire_unexecuted(key: str, state: Path) -> dict[str, Any]:
             from . import approval_bridge
             return approval_bridge.retire_unexecuted(state=state)
         attempt("approvals", retire_approvals)
+    if completion:
+        def retire_completion_recovery():
+            from . import completion_recovery
+            return completion_recovery.retire_unexecuted(state)
+        attempt("completion_recovery", retire_completion_recovery)
     return results
 
 
@@ -217,10 +235,15 @@ def settings_set(request: object, ctx: Any, *, root: str | Path, state: str | Pa
     if not callable(writer):
         return {**denied, "reason": "native_settings_writer_unavailable"}
 
-    cleanup = {"ok": True, "clarify": 0, "followups": 0, "approvals": 0}
-    if current is False and value is True:
+    cleanup = {"ok": True, "clarify": 0, "followups": 0, "approvals": 0, "completion_recovery": 0,
+               "outcomes": {}}
+    pre_cleanup_done = False
+    if value is False or (current is False and value is True):
         cleanup = _retire_unexecuted(key, Path(state))
-        if cleanup.get("ok") is not True:
+        pre_cleanup_done = True
+        # ON never crosses an incomplete retirement. OFF still writes the user's
+        # requested fail-closed value even if cleanup needs repair.
+        if value is True and cleanup.get("ok") is not True:
             result = _status(ctx, root, state, read_only=False)
             result["write_status"] = "not_attempted"
             result["readback"] = {"key": key, "value": current}
@@ -241,8 +264,23 @@ def settings_set(request: object, ctx: Any, *, root: str | Path, state: str | Pa
     readback = gateway.settings_state(root=root, ctx=ctx)
     actual = readback.get("settings", {}).get(key)
     matches = readback.get("ok") is True and type(actual) is bool and actual is value
-    if value is False and type(actual) is bool and actual is False:
+    if value is False and type(actual) is bool and actual is False and not pre_cleanup_done:
         cleanup = _retire_unexecuted(key, Path(state))
+
+    # Reconcile the stored generation to the verified effective ON/OFF state
+    # after the public writer. OFF itself was already fenced before the write.
+    if key in {"service_enabled", "completion_notifications_enabled"} and readback.get("ok") is True:
+        try:
+            completion_allowed, _ = gateway.feature_status("completion_notifications_enabled", root=root, ctx=ctx)
+            from . import completion_recovery
+            completion_policy = completion_recovery.policy(state, enabled=completion_allowed)
+            if completion_policy.get("ok") is not True:
+                raise RuntimeError("completion_policy_unavailable")
+        except Exception:
+            cleanup["ok"] = False
+            cleanup["reason"] = "cleanup_incomplete"
+            cleanup.setdefault("outcomes", {})["completion_policy"] = {"ok": False,
+                "reason": "cleanup_incomplete"}
 
     result = _status(ctx, root, state, read_only=False)
     result["write_status"] = "failed" if write_error else ("verified" if matches else "readback_mismatch")

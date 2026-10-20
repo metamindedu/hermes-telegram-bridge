@@ -3,9 +3,11 @@ import base64
 import copy
 import hashlib
 import json
+import os
+from pathlib import Path
+import stat
 from concurrent.futures import ThreadPoolExecutor
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 import test_support
@@ -19,7 +21,34 @@ class BridgeTests(unittest.TestCase):
         b.bind_receiver(77,99,None,'boot',state=self.state,now=self.now)
         self.ask={'id':'srq-aabbcc112233','method':'clarify','params':{'session_id':'runtime1','questions':[{'qid':'q1','question':'어떤 **방식**?','choices':['첫 번째','두 번째'],'multi_select':False}]}}
         self.d={'owner':'desktop1','connectionId':'local','profile':'default','targetProfile':'default','sid':'runtime1','session_key':'persisted1','epoch':'epoch1','request_id':self.ask['id'],'fingerprint':b.canonical(self.ask)}
+
+    def test_private_inbox_paths_are_owner_only_on_posix(self):
+        if os.name != 'posix':
+            self.skipTest('POSIX mode bits are not Windows NTFS ACLs')
+        state = self.state / 'permission-mode-fixture'
+        b.bind_receiver(77, 99, None, 'permission-boot', state=state, now=self.now)
+        inbox = state / 'reply-inbox'
+        database = inbox / 'replies.sqlite3'
+        self.assertEqual(stat.S_IMODE(inbox.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(database.stat().st_mode), 0o600)
+
+    def test_private_inbox_data_survives_reopen_and_path_errors_remain_visible(self):
+        state = self.state / 'permission-fixture'
+        b.bind_receiver(77, 99, None, 'permission-boot', state=state, now=self.now)
+        reopened = b.connect(state)
+        try:
+            row = reopened.execute("SELECT value FROM receiver WHERE key='live'").fetchone()
+            self.assertEqual(json.loads(row[0]), {'bot': 77, 'chat': 99, 'topic': None,
+                                                  'boot': 'permission-boot', 'at': self.now})
+        finally:
+            reopened.close()
+        blocked = self.state / 'not-a-directory'
+        blocked.write_text('fixture', encoding='utf-8')
+        with self.assertRaises(OSError):
+            b.connect(blocked)
+
     def create(self,ask=None,ttl=300):
+
         ask=ask or self.ask;self.d['fingerprint']=b.canonical(ask)
         out=b.register({'descriptor':self.d,'ask':ask},state=self.state,now=self.now,ttl=ttl)
         self.fid=out['id'];qs=b.shape(ask)[0]

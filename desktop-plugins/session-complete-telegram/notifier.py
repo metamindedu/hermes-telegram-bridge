@@ -14,13 +14,18 @@ import base64
 import hashlib
 import importlib
 import json
+import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
+APPROVAL_COMPAT_VERSION = "1.8.0"
+APPROVAL_CAPABILITY = "desktop-command-approval-v6"
+RECOVERY_CAPABILITY = "desktop-completion-recovery-v1"
 
 
 def _action_status(name, root=None, ctx=None):
@@ -35,6 +40,48 @@ def _action_status(name, root=None, ctx=None):
 
 def action_enabled(name, root=None, ctx=None):
     return _action_status(name, root=root, ctx=ctx)[0]
+
+
+def _completion_recovery_policy(state, *, root=None, ctx=None):
+    """Return generation authority only after native settings have been verified."""
+    root = ROOT if root is None else root
+    try:
+        allowed, reason = _action_status("completion_notifications_enabled", root=root, ctx=ctx)
+        if not allowed and reason not in {"service_disabled", "completion_notifications_disabled"}:
+            return {"ok": False, "reason": reason if reason in {
+                "native_plugin_config_invalid", "native_plugin_owner_mismatch", "legacy_package_migration_required",
+                "session_complete_plugin_disabled", "default_home_required"} else "native_plugin_config_invalid"}
+        recovery = _sibling_module("completion_recovery")
+        return recovery.policy(state, enabled=allowed)
+    except Exception:
+        return {"ok": False, "reason": "recovery_policy_unavailable"}
+
+
+def _pre_dispatch_retry(reason):
+    return {"ok": False, "phase": "pre_dispatch", "retryable": True, "reason": reason}
+
+
+def _pre_dispatch_terminal(reason):
+    return {"ok": False, "phase": "pre_dispatch", "retryable": False, "reason": reason}
+
+
+def _policy_action_result(value):
+    if value.get("ok") is not True and value.get("reason") == "recovery_policy_unavailable":
+        return _pre_dispatch_retry("recovery_storage_unavailable")
+    return value
+
+
+def _storage_reason(exc, *, fallback="recovery_storage_unavailable"):
+    recovery = _sibling_module("completion_recovery")
+    if isinstance(exc, recovery.RecoveryError):
+        code = str(exc)
+        if code in {"credentials_unavailable"}:
+            return "credentials_unavailable"
+        if code in {"source_storage_unavailable", "recovery_database_unavailable", "recovery_schema_unavailable"}:
+            return "source_storage_unavailable" if code == "source_storage_unavailable" else fallback
+        if code in {"source_identity_unavailable"}:
+            return "source_identity_unavailable"
+    return fallback
 
 
 
@@ -214,15 +261,63 @@ def db_read(path):
     return c
 
 
+def _is_state_file(path):
+    """Missing is a verified absence; other filesystem errors stay observable."""
+    try:
+        return stat.S_ISREG(Path(path).stat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _profile_state_files(root):
+    """Enumerate aliases without pathlib.glob's suppressed scandir/entry errors."""
+    profiles = Path(root) / "profiles"
+    try:
+        metadata = profiles.lstat()
+    except FileNotFoundError:
+        return
+    if (stat.S_ISLNK(metadata.st_mode) or
+            getattr(metadata, "st_reparse_tag", None) == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", -1)):
+        raise ValueError("profile_home_retargeted")
+    with os.scandir(profiles) as entries:
+        for entry in entries:
+            # Do not use DirEntry/Path convenience predicates that suppress I/O.
+            if not stat.S_ISDIR(entry.stat(follow_symlinks=True).st_mode):
+                continue
+            path = Path(entry.path) / "state.db"
+            if _is_state_file(path):
+                yield path
+
+
 def profile_home(profile, root=ROOT):
+    root = Path(root).expanduser().resolve(strict=True)
     if profile == "default":
+        state_db = root / "state.db"
+        is_junction = getattr(state_db, "is_junction", lambda: False)()
+        if state_db.is_symlink() or is_junction or (_is_state_file(state_db) and state_db.resolve(strict=True).parent != root):
+            raise ValueError("profile_home_retargeted")
         return root
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", profile):
         raise ValueError("invalid_profile")
-    home = root / "profiles" / profile
-    if not home.is_dir() or home.resolve().parent != (root / "profiles").resolve():
-        raise ValueError("unknown_profile")
-    return home
+    profiles = root / "profiles"
+    home = profiles / profile
+    try:
+        is_junction = getattr(home, "is_junction", lambda: False)()
+        parent_junction = getattr(profiles, "is_junction", lambda: False)()
+        resolved_profiles = profiles.resolve(strict=True)
+        resolved = home.resolve(strict=True)
+        expected = Path(os.path.abspath(os.fspath(home)))
+    except FileNotFoundError as exc:
+        raise ValueError("unknown_profile") from exc
+    state_db = resolved / "state.db"
+    db_junction = getattr(state_db, "is_junction", lambda: False)()
+    if (not stat.S_ISDIR(home.stat().st_mode) or home.is_symlink() or is_junction or profiles.is_symlink() or
+            parent_junction or db_junction or state_db.is_symlink() or
+            os.path.normcase(os.fspath(resolved)) != os.path.normcase(os.fspath(expected)) or
+            resolved.parent != resolved_profiles or
+            (_is_state_file(state_db) and state_db.resolve(strict=True).parent != resolved)):
+        raise ValueError("profile_home_retargeted")
+    return resolved
 
 
 def session_context(req, root=ROOT, anchor_row_id=None, require_anchor=False):
@@ -232,7 +327,12 @@ def session_context(req, root=ROOT, anchor_row_id=None, require_anchor=False):
     exact persisted row; without it the alias resolves by session id only and
     multiple matches fail closed.
     """
-    home = profile_home(req["profile"], root)
+    try:
+        home = profile_home(req["profile"], root)
+    except OSError:
+        return {"ok": False, "reason": "source_storage_unavailable"}
+    except ValueError:
+        return {"ok": False, "reason": "source_identity_unavailable"}
     sid = req.get("session_key")
     if not isinstance(sid, str) or not sid or len(sid) > 200:
         return {"ok": False, "reason": "invalid_session"}
@@ -245,7 +345,7 @@ def session_context(req, root=ROOT, anchor_row_id=None, require_anchor=False):
         # even when that home is a named profile. Resolve only this alias,
         # by exact persisted identity, never by recency.
         matches = []
-        for path in (root / "profiles").glob("*/state.db"):
+        for path in _profile_state_files(root):
             name = path.parent.name
             candidate_home = profile_home(name, root)
             with db_read(candidate_home / "state.db") as other:
@@ -266,6 +366,90 @@ def session_context(req, root=ROOT, anchor_row_id=None, require_anchor=False):
     if req.get("desktop_observed") is not True:
         return {"ok": False, "reason": "unproven_desktop_origin"}
     return {"ok": True, "home": home, "row": dict(row), "profile": req["profile"]}
+
+
+def resolve_recovery_source(identity, *, root=ROOT):
+    """Resolve a candidate's persisted session home natively, never from caller paths."""
+    if not isinstance(identity, dict):
+        return {"ok": False, "reason": "source_identity_unavailable"}
+    route_value = identity.get("route")
+    if isinstance(route_value, dict):
+        route = route_value
+    else:
+        route = {"mode": "local", "connectionId": identity.get("connection_id"),
+                 "profile": identity.get("profile"), "targetProfile": identity.get("target_profile")}
+    target = route.get("targetProfile") if isinstance(route, dict) else None
+    session_key = identity.get("session_key")
+    final_id = identity.get("final_row_id")
+    if (not isinstance(target, str) or not isinstance(session_key, str) or not session_key or
+            type(final_id) is not int or final_id < 1):
+        return {"ok": False, "reason": "source_identity_unavailable"}
+    try:
+        context = session_context({"profile": target, "session_key": session_key,
+                                   "desktop_observed": True}, root=root,
+                                 anchor_row_id=final_id, require_anchor=True)
+    except (sqlite3.Error, OSError):
+        return {"ok": False, "reason": "source_storage_unavailable"}
+    except Exception:
+        return {"ok": False, "reason": "source_identity_unavailable"}
+    if context.get("ok") is not True:
+        return {"ok": False, "reason": "source_storage_unavailable" if context.get("reason") == "source_storage_unavailable" else "source_identity_unavailable"}
+    try:
+        recovery = _sibling_module("completion_recovery")
+        binding = recovery._source_binding(context["home"])
+    except OSError:
+        return {"ok": False, "reason": "source_storage_unavailable"}
+    except Exception as exc:
+        return {"ok": False, "reason": "source_storage_unavailable" if str(exc) == "source_storage_unavailable" else "source_identity_unavailable"}
+    return {"ok": True, "profile": context["profile"], "binding": binding}
+
+
+def resolve_recovery_cancel_source(identity, *, root=ROOT):
+    """Resolve the cancellation's persisted source by runtime/final row, failing closed on ambiguity."""
+    if not isinstance(identity, dict):
+        return {"ok": False, "reason": "source_identity_unavailable"}
+    route_value = identity.get("route")
+    if isinstance(route_value, dict):
+        target = route_value.get("targetProfile")
+    else:
+        target = identity.get("target_profile")
+    runtime_id = identity.get("runtime_id")
+    final_id = identity.get("final_row_id")
+    if (not isinstance(target, str) or not isinstance(runtime_id, str) or not runtime_id or
+            type(final_id) is not int or final_id < 1):
+        return {"ok": False, "reason": "source_identity_unavailable"}
+    try:
+        owner = Path(root).expanduser().resolve(strict=True)
+        homes = []
+        if target == "default":
+            homes.append(("default", profile_home("default", owner)))
+            for path in _profile_state_files(owner):
+                homes.append((path.parent.name, profile_home(path.parent.name, owner)))
+        else:
+            homes.append((target, profile_home(target, owner)))
+        matches = []
+        for profile, home in homes:
+            db_path = home / "state.db"
+            if not _is_state_file(db_path):
+                continue
+            try:
+                with db_read(db_path) as db:
+                    session = db.execute("SELECT source FROM sessions WHERE id=?", (runtime_id,)).fetchone()
+                    message = db.execute("SELECT 1 FROM messages WHERE session_id=? AND id=? AND active=1",
+                                         (runtime_id, final_id)).fetchone()
+            except (sqlite3.Error, OSError):
+                return {"ok": False, "reason": "source_storage_unavailable"}
+            if session and session["source"] in ("desktop", "tui", "cli", "telegram", "discord", "slack") and message:
+                matches.append((profile, home))
+        if len(matches) != 1:
+            return {"ok": False, "reason": "source_identity_unavailable"}
+        profile, home = matches[0]
+        recovery = _sibling_module("completion_recovery")
+        return {"ok": True, "profile": profile, "binding": recovery._source_binding(home)}
+    except (sqlite3.Error, OSError):
+        return {"ok": False, "reason": "source_storage_unavailable"}
+    except Exception:
+        return {"ok": False, "reason": "source_identity_unavailable"}
 
 
 def todo_snapshot(value):
@@ -397,10 +581,11 @@ def diagnostic(name, data, state=STATE):
 
 
 def credentials(root=ROOT):
-    from dotenv import dotenv_values
-    values = dotenv_values(root / ".env", interpolate=False)
-    token = values.get("TELEGRAM_BOT_TOKEN") or ""
-    target = values.get("TELEGRAM_HOME_CHANNEL") or ""
+    """Read only the active Hermes secret scope; ``root`` is caller authority/state context, not a credential file path."""
+    from agent.secret_scope import get_secret
+
+    token = get_secret("TELEGRAM_BOT_TOKEN") or ""
+    target = get_secret("TELEGRAM_HOME_CHANNEL") or ""
     if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
         raise ValueError("telegram_token_missing")
     # Notifications are to the user's already configured home, never a supplied
@@ -423,6 +608,39 @@ def telegram(token, method, payload):
         return value
     except Exception:
         return {"ok": False, "error_code": 0, "ambiguous": True}
+
+
+def completion_telegram(token, method, payload):
+    """One fresh direct request for completion recovery; never retry transport.
+
+    Only httpx ConnectError/ConnectTimeout from the request phase prove that
+    Telegram could not have received this attempt. Everything after connect,
+    including malformed receipts and response/read/write failures, is unknown.
+    """
+    import httpx
+    try:
+        transport = httpx.HTTPTransport(retries=0)
+        with httpx.Client(timeout=8, follow_redirects=False, trust_env=False,
+                          transport=transport) as client:
+            try:
+                response = client.post(f"https://api.telegram.org/bot{token}/{method}", json=payload)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                return {"kind": "proven_unsent"}
+            except Exception:
+                return {"kind": "unknown"}
+            try:
+                value = response.json()
+            except Exception:
+                return {"kind": "unknown"}
+            if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+                return {"kind": "unknown"}
+            if value.get("ok") is False:
+                if type(value.get("error_code")) is int:
+                    return {"kind": "rejected", "response": value}
+                return {"kind": "unknown"}
+            return {"kind": "response", "response": value}
+    except Exception:
+        return {"kind": "unknown"}
 
 
 def probe(root=ROOT):
@@ -487,11 +705,13 @@ def legacy_message_id(message_id, state=STATE):
         return False
 
 
-def _register_followup_binding(req, checked, result, *, root, state, ctx=None, expected_epoch=None):
+def _register_followup_binding(req, checked, result, *, root, state, ctx=None, expected_epoch=None,
+                               expected_destination_binding=None):
     """Bind a verified send only under its pre-send epoch and current module policy."""
     descriptor = req.get("followup")
     if (not isinstance(descriptor, dict) or result.get("duplicate") or result.get("status") != "sent" or
-            result.get("verified") is not True or result.get('followup_verified') is not True or not result.get("message_id")):
+            result.get("verified") is not True or result.get('followup_verified') is not True or
+            not result.get("message_id") or expected_epoch is None):
         return result
     if (checked.get("profile") != descriptor.get("targetProfile") or
             descriptor.get("profile") != descriptor.get("targetProfile") or
@@ -505,6 +725,10 @@ def _register_followup_binding(req, checked, result, *, root, state, ctx=None, e
     try:
         followup_bridge = _sibling_module("followup_bridge")
         token, chat, topic = credentials(root)
+        if expected_destination_binding is not None:
+            recovery = _sibling_module("completion_recovery")
+            if recovery.destination_binding_for(token, chat, topic) != expected_destination_binding:
+                return result
         if chat <= 0 or not followup_bridge.receiver_info(state=state):
             return result
         bot = int(token.split(":", 1)[0])
@@ -517,6 +741,252 @@ def _register_followup_binding(req, checked, result, *, root, state, ctx=None, e
         # Ordinary completion delivery remains successful; follow-up stays disabled.
         return result
     return result
+
+
+def completion_dedupe_key(root, profile, lineage, session_key, final_row_id):
+    """The unchanged completion-v2 dedupe identity shared by old and recovery sends."""
+    identity = [str(Path(root).resolve()), profile, lineage,
+                "completion-v2", session_key, final_row_id]
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+
+
+def deliver_completion_recovery(req, *, root=ROOT, state=STATE, ctx=None):
+    """Send only an exactly claimed completion; uncertain outcomes are never replayed."""
+    recovery = _sibling_module("completion_recovery")
+    policy = _completion_recovery_policy(state, root=root, ctx=ctx)
+    if policy.get("ok") is not True:
+        return _pre_dispatch_terminal(policy.get("reason", "native_plugin_config_invalid"))
+    if policy.get("enabled") is not True:
+        return _pre_dispatch_terminal("settings_disabled")
+
+    candidate = req.get("candidate")
+    route = req.get("route")
+    if (not isinstance(candidate, dict) or set(candidate) !=
+            {"candidate_id", "revision", "claim_token", "generation"} or
+            not isinstance(route, dict) or req.get("desktop_observed") is not True or
+            req.get("profile") != route.get("targetProfile")):
+        return {"ok": False, "reason": "invalid_recovery_request"}
+    if candidate.get("generation") != policy.get("generation"):
+        return _pre_dispatch_terminal("generation_changed")
+
+    try:
+        checked = inspect_session(req, root=root, include_preview=True)
+    except sqlite3.Error:
+        return _pre_dispatch_retry("source_storage_unavailable")
+    except OSError:
+        return _pre_dispatch_retry("source_storage_unavailable")
+    except Exception:
+        return _pre_dispatch_terminal("classification_unavailable")
+    if not checked.get("ok"):
+        reason = checked.get("reason")
+        if reason == "source_storage_unavailable":
+            return _pre_dispatch_retry("source_storage_unavailable")
+        if reason == "awaiting_answer":
+            # Preserve the original ordinary attention route. Never send a
+            # question through the completion recovery transport.
+            return _pre_dispatch_terminal("attention_required")
+        if reason == "quiet_period":
+            return _pre_dispatch_retry("quiet_period")
+        try:
+            recovery.cancel(state, root, {"route": route, "runtime_id": req.get("runtime_id"),
+                "final_row_id": req.get("final_row_id")}, reason="new_work")
+        except Exception:
+            pass
+        return checked
+
+    source = resolve_recovery_source({"route": route, "session_key": req.get("session_key"),
+                                     "final_row_id": req.get("final_row_id")}, root=root)
+    if source.get("ok") is not True:
+        if source.get("reason") == "source_storage_unavailable":
+            return _pre_dispatch_retry("source_storage_unavailable")
+        try:
+            recovery.cancel(state, root, {"route": route, "runtime_id": req.get("runtime_id"),
+                "final_row_id": req.get("final_row_id")}, reason="identity_changed")
+        except Exception:
+            pass
+        return {"ok": False, "reason": "identity_changed"}
+    if source.get("profile") != checked.get("profile"):
+        return {"ok": False, "reason": "identity_changed"}
+
+    key = completion_dedupe_key(root, checked["profile"], checked["lineage"],
+                                req["session_key"], checked["final_row_id"])
+    try:
+        token, target, topic = credentials(root)
+        destination_binding = recovery.destination_binding_for(token, target, topic)
+    except Exception:
+        return _pre_dispatch_retry("credentials_unavailable")
+    try:
+        with state_db(state):
+            pass
+    except Exception:
+        return _pre_dispatch_retry("recovery_storage_unavailable")
+
+    # Capture follow-up producer revocation state before any network dispatch.
+    registration_epoch = None
+    if (isinstance(req.get("followup"), dict) and
+            action_enabled("completion_followups_enabled", root=root, ctx=ctx) and
+            (Path(state) / "followup-inbox" / "followups.sqlite3").is_file()):
+        try:
+            registration_epoch = _sibling_module("followup_bridge").capture_registration_epoch(state=state)
+        except Exception:
+            registration_epoch = None
+
+    try:
+        begun = recovery.begin_dispatch(state, root, candidate, route, dedupe_key=key,
+            profile=checked["profile"], session_key=req["session_key"],
+            runtime_id=req.get("runtime_id"), started_at=req.get("started_at"),
+            epoch=req.get("epoch"), final_row_id=req.get("final_row_id"),
+            destination_binding=destination_binding)
+    except Exception as exc:
+        if isinstance(exc, recovery.RecoveryError) and str(exc) == "source_identity_unavailable":
+            try:
+                recovery.cancel(state, root, {"route": route, "runtime_id": req.get("runtime_id"),
+                    "final_row_id": req.get("final_row_id")}, reason="identity_changed")
+            except Exception:
+                pass
+            return {"ok": False, "reason": "identity_changed"}
+        if recovery.proves_pre_dispatch(state, candidate, route, key):
+            retryable_codes = {"credentials_unavailable", "source_storage_unavailable",
+                               "recovery_database_unavailable", "recovery_schema_unavailable"}
+            proven_failure = isinstance(exc, (sqlite3.Error, OSError)) or (
+                isinstance(exc, recovery.RecoveryError) and str(exc) in retryable_codes)
+            if proven_failure:
+                return _pre_dispatch_retry(_storage_reason(exc))
+        return {"ok": False, "status": "unknown", "reason": "dispatch_state_unavailable"}
+    if begun.get("ok") is not True:
+        return begun
+    if begun.get("duplicate"):
+        delivery_status = begun.get("status")
+        status = "sent" if delivery_status == "sent" else "unknown" if delivery_status in {"sending", "unknown"} else "failed"
+        return {"ok": status == "sent", "duplicate": True, "status": status,
+                "verified": False, "reason": "existing_delivery"}
+
+    attempt = begun.get("attempt_id")
+    candidate_id_value = begun.get("candidate_id")
+    if not isinstance(attempt, str) or not isinstance(candidate_id_value, str):
+        return {"ok": False, "status": "unknown", "reason": "invalid_attempt_receipt"}
+
+    # Recheck both native setting and its opaque generation after the durable
+    # boundary and immediately before the one network send.
+    current_policy = _completion_recovery_policy(state, root=root, ctx=ctx)
+    if (current_policy.get("ok") is not True or current_policy.get("enabled") is not True or
+            current_policy.get("generation") != begun.get("generation")):
+        try:
+            recovery.finish_dispatch(state, candidate_id_value, attempt, key, "rejected")
+        except Exception:
+            pass
+        return _pre_dispatch_terminal("settings_disabled" if current_policy.get("enabled") is not True
+                                      else "generation_changed")
+
+    text = notification_text(checked)
+    payload = {"chat_id": target, "text": text, "disable_notification": False,
+               "protect_content": False, "link_preview_options": {"is_disabled": True}}
+    if topic is not None:
+        payload["message_thread_id"] = topic
+    response = completion_telegram(token, "sendMessage", payload)
+    if response.get("kind") == "proven_unsent":
+        try:
+            receipt = recovery.finish_dispatch(state, candidate_id_value, attempt, key, "proven_unsent")
+            if receipt.get("ok"):
+                return {"ok": False, "status": "unsent_retryable", "reason": "connect_failure",
+                        "revision": receipt["revision"], "generation": receipt["generation"],
+                        "bookkeeping_seq": receipt["bookkeeping_seq"]}
+        except Exception:
+            pass
+        return {"ok": False, "status": "unknown", "reason": "receipt_unavailable"}
+    if response.get("kind") == "rejected":
+        answer = response.get("response", {})
+        try:
+            receipt = recovery.finish_dispatch(state, candidate_id_value, attempt, key, "rejected")
+            if receipt.get("ok"):
+                return {"ok": False, "status": "failed", "error_code": answer.get("error_code")}
+        except Exception:
+            pass
+        return {"ok": False, "status": "unknown", "reason": "receipt_unavailable"}
+    if response.get("kind") != "response":
+        try:
+            receipt = recovery.finish_dispatch(state, candidate_id_value, attempt, key, "unknown")
+            if receipt.get("ok"):
+                return {"ok": False, "status": "unknown", "error_code": 0}
+        except Exception:
+            pass
+        return {"ok": False, "status": "unknown", "reason": "receipt_unavailable"}
+
+    answer = response.get("response", {})
+    message = answer.get("result") if isinstance(answer, dict) else None
+    message = message if isinstance(message, dict) else {}
+    message_id = message.get("message_id")
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    sent = (answer.get("ok") is True and type(message_id) is int and message_id > 0 and
+            type(chat.get("id")) is int and chat.get("id") == target and message.get("text") == text)
+    if not sent:
+        try:
+            receipt = recovery.finish_dispatch(state, candidate_id_value, attempt, key, "unknown")
+            if receipt.get("ok"):
+                return {"ok": False, "status": "unknown", "error_code": 0}
+        except Exception:
+            pass
+        return {"ok": False, "status": "unknown", "reason": "receipt_unavailable"}
+
+    verified = False
+    if _action_status("completion_notifications_enabled", root=root, ctx=ctx)[0]:
+        check_result = completion_telegram(token, "editMessageText", {
+            "chat_id": target, "message_id": message_id, "text": text,
+            "link_preview_options": {"is_disabled": True}})
+        if check_result.get("kind") == "response":
+            check = check_result.get("response", {})
+            checked_message = check.get("result") if isinstance(check.get("result"), dict) else {}
+            verified = bool(check.get("ok") is True and checked_message.get("message_id") == message_id)
+            if not verified and check.get("error_code") == 400 and "message is not modified" in str(check.get("description", "")).lower():
+                verified = True
+        elif check_result.get("kind") == "rejected":
+            check = check_result.get("response", {})
+            verified = bool(check.get("error_code") == 400 and "message is not modified" in str(check.get("description", "")).lower())
+
+    try:
+        receipt = recovery.finish_dispatch(state, candidate_id_value, attempt, key, "sent",
+                                          message_id=message_id, verified=verified)
+    except Exception:
+        receipt = {"ok": False}
+    if receipt.get("ok") is not True:
+        return {"ok": False, "status": "unknown", "reason": "receipt_unavailable"}
+    followup_verified = bool(verified and target > 0 and
+        str(message.get("from", {}).get("id")) == token.split(":", 1)[0] and
+        message.get("from", {}).get("is_bot") is True and chat.get("type") == "private" and
+        message.get("message_thread_id") == topic)
+    result = {"ok": True, "status": "sent", "message_id": message_id,
+              "verified": verified, "followup_verified": followup_verified}
+    return _register_followup_binding(req, checked, result, root=root, state=state,
+                                      ctx=ctx, expected_epoch=registration_epoch,
+                                      expected_destination_binding=destination_binding)
+
+
+def classify_completion_recovery(req, *, root=ROOT, ctx=None):
+    """Read-only native classification used before recovery or ordinary attention send."""
+    if (not isinstance(req, dict) or not isinstance(req.get("route"), dict) or
+            req.get("desktop_observed") is not True or
+            req.get("profile") != req["route"].get("targetProfile")):
+        return {"ok": False, "reason": "invalid_recovery_request"}
+    try:
+        checked = inspect_session(req, root=root)
+    except sqlite3.Error:
+        return _pre_dispatch_retry("source_storage_unavailable")
+    except OSError:
+        return _pre_dispatch_retry("source_storage_unavailable")
+    except Exception:
+        return _pre_dispatch_terminal("classification_unavailable")
+    if not checked.get("ok"):
+        reason = checked.get("reason")
+        if reason == "source_storage_unavailable":
+            return _pre_dispatch_retry("source_storage_unavailable")
+        if reason == "quiet_period":
+            return _pre_dispatch_retry("quiet_period")
+        if reason == "awaiting_answer":
+            attention_allowed, _ = _action_status("attention_notifications_enabled", root=root, ctx=ctx)
+            return {"ok": True, "kind": "attention" if attention_allowed else "disabled"}
+        return {"ok": False, "reason": reason if isinstance(reason, str) else "classification_unavailable"}
+    completion_allowed, _ = _action_status("completion_notifications_enabled", root=root, ctx=ctx)
+    return {"ok": True, "kind": "completion" if completion_allowed else "disabled"}
 
 
 def deliver(req, *, root=ROOT, state=STATE, api=telegram, test=False, ctx=None):
@@ -548,10 +1018,11 @@ def deliver(req, *, root=ROOT, state=STATE, api=telegram, test=False, ctx=None):
     profile, lineage = checked["profile"], checked["lineage"]
     # One claim per fully settled final response, not the session lifetime.
     # Preserve legacy installation-test identity and all prior ledger rows.
-    identity = [str(root.resolve()), profile, lineage]
-    if not test:
-        identity += ["completion-v2", req["session_key"], checked["final_row_id"]]
-    key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    if test:
+        identity = [str(root.resolve()), profile, lineage]
+        key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    else:
+        key = completion_dedupe_key(root, profile, lineage, req["session_key"], checked["final_row_id"])
     if test:
         text = "🔔 Hermes Desktop 완료 알림 설치 확인\n\n모든 기존·신규 프로필에 적용됩니다.\n중간 턴은 제외하고, 요청 작업이 끝나고 대기 작업 없이 60초간 멈출 때마다 한 번 알립니다.\n이 메시지는 전송 경로 확인용 테스트입니다."
     else:
@@ -617,6 +1088,55 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             result = deliver(req, root=root, state=state, test=True, ctx=ctx)
         elif action == "send":
             result = deliver(req, root=root, state=state, ctx=ctx)
+        elif action == "completion_recovery_policy":
+            result = _policy_action_result(_completion_recovery_policy(state, root=root, ctx=ctx))
+        elif action == "completion_recovery_classify":
+            result = classify_completion_recovery(req, root=root, ctx=ctx)
+        elif action == "completion_recovery_record":
+            policy = _completion_recovery_policy(state, root=root, ctx=ctx)
+            if policy.get("ok") is not True:
+                result = _policy_action_result(policy)
+            elif policy.get("enabled") is not True:
+                result = {"ok": False, "feature_ready": False, "reason": "completion_notifications_disabled",
+                          "generation": policy.get("generation")}
+            else:
+                recovery = _sibling_module("completion_recovery")
+                result = recovery.record(state, root, req.get("candidate"))
+        elif action == "completion_recovery_list":
+            policy = _completion_recovery_policy(state, root=root, ctx=ctx)
+            if policy.get("ok") is not True:
+                result = {**_policy_action_result(policy), "items": [], "cursor": None}
+            elif policy.get("enabled") is not True:
+                result = {"ok": False, "feature_ready": False, "reason": "completion_notifications_disabled",
+                          "items": [], "cursor": None}
+            else:
+                recovery = _sibling_module("completion_recovery")
+                result = recovery.list_candidates(state, root, req.get("route"),
+                    cursor=req.get("cursor"), result_budget=result_budget if native else 24 * 1024)
+        elif action == "completion_recovery_get":
+            recovery = _sibling_module("completion_recovery")
+            result = recovery.get_candidate(state, root, req.get("candidate_id"), req.get("route"))
+        elif action == "completion_recovery_cancel":
+            recovery = _sibling_module("completion_recovery")
+            result = recovery.cancel(state, root, req.get("identity"), reason=req.get("reason", "new_work"))
+        elif action == "completion_recovery_touch":
+            recovery = _sibling_module("completion_recovery")
+            result = recovery.touch(state, req.get("candidate"), bookkeeping_seq=req.get("bookkeeping_seq"),
+                                   quiet_at=req.get("quiet_at"))
+        elif action == "completion_recovery_read_blocked":
+            recovery = _sibling_module("completion_recovery")
+            result = recovery.mark_read_blocked(state, req.get("candidate"), reason=req.get("reason", "snapshot_unavailable"))
+        elif action == "completion_recovery_claim":
+            policy = _completion_recovery_policy(state, root=root, ctx=ctx)
+            if policy.get("ok") is not True:
+                result = _policy_action_result(policy)
+            elif policy.get("enabled") is not True:
+                result = {"ok": False, "feature_ready": False, "reason": "completion_notifications_disabled"}
+            else:
+                recovery = _sibling_module("completion_recovery")
+                result = recovery.claim(state, root, req.get("candidate"), req.get("route"))
+        elif action == "completion_recovery_send":
+            result = deliver_completion_recovery(req, root=root, state=state, ctx=ctx)
         elif action == "attention":
             result = deliver_attention(req, root=root, state=state, ctx=ctx)
         elif action in ("reply_register", "reply_poll", "reply_settle", "reply_fragment", "reply_claim_valid"):
@@ -634,12 +1154,14 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             else:
                 result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                              result_budget=result_budget if native else None)
-        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle", "approval_notice", "approval_claim_valid"}:
+        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
+                        "approval_notice", "approval_claim_valid", "canonical_approval_observe",
+                        "approval_native_observe", "approval_native_apply"}:
             gateway = _sibling_module("telegram_integration")
             gate = ("attention_notifications_enabled" if action == "approval_notice"
                     else "approvals_enabled")
             allowed, reason = gateway.feature_status(gate, root=root, ctx=ctx)
-            if not allowed and action not in {"approval_settle"}:
+            if not allowed and action not in {"approval_settle", "approval_native_apply"}:
                 if action == "approval_poll":
                     return {"ok": False, "feature_ready": False, "reason": reason, "items": []}
                 if action == "approval_claim_valid":
@@ -696,16 +1218,18 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
                 gateway = _sibling_module("telegram_integration")
                 approval_enabled, approval_reason = gateway.feature_status("approvals_enabled", root=root)
                 approval_bridge = _sibling_module("approval_bridge")
-                # Code/protocol support is stable across feature toggles. The
-                # renderer caches this handshake; action authority is checked
-                # afresh by owner heartbeat/register/poll/claim-validity gates.
-                if (approval_bridge.VERSION == VERSION and
-                        approval_bridge.CAPABILITY == "desktop-command-approval-v4"):
+                if (approval_bridge.VERSION == APPROVAL_COMPAT_VERSION and
+                        approval_bridge.CAPABILITY == APPROVAL_CAPABILITY):
                     capabilities.append(approval_bridge.CAPABILITY)
+                recovery = _sibling_module("completion_recovery")
+                if (recovery.VERSION == VERSION and recovery.SCHEMA_VERSION == 1):
+                    capabilities.append(RECOVERY_CAPABILITY)
             except Exception:
                 approval_enabled = False
-            result = {"ok": True, "version": VERSION, "capabilities": capabilities,
-                      "approval_feature_reason": approval_reason}
+            result = {"ok": True, "version": APPROVAL_COMPAT_VERSION,
+                      "package_version": VERSION, "capabilities": capabilities,
+                      "approval_feature_reason": approval_reason,
+                      "completion_policy": _completion_recovery_policy(state, root=root, ctx=ctx)}
             # A disabled feature/migration block is not a missing code protocol;
             # it never authorizes intake or an approval decision.
         elif action == "diagnostic":
@@ -716,7 +1240,31 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             result = {"ok": False, "reason": "unknown_action"}
     except Exception as exc:
         # Exception text is intentionally omitted; it may contain credential URLs.
-        result = {"ok": False, "reason": type(exc).__name__}
+        action = req.get("action") if isinstance(req, dict) else None
+        recovery_actions = {"completion_recovery_policy", "completion_recovery_classify",
+            "completion_recovery_record", "completion_recovery_list", "completion_recovery_get",
+            "completion_recovery_cancel", "completion_recovery_touch", "completion_recovery_read_blocked",
+            "completion_recovery_claim"}
+        if action in recovery_actions:
+            recovery = _sibling_module("completion_recovery")
+            if isinstance(exc, recovery.RecoveryError):
+                code = str(exc)
+                if code in {"credentials_unavailable", "source_storage_unavailable",
+                            "recovery_database_unavailable", "recovery_schema_unavailable"}:
+                    reason = "credentials_unavailable" if code == "credentials_unavailable" else (
+                        "source_storage_unavailable" if code == "source_storage_unavailable" else
+                        "recovery_storage_unavailable")
+                    result = _pre_dispatch_retry(reason)
+                else:
+                    result = {"ok": False, "reason": code if code in recovery.REASONS else "recovery_action_failed"}
+            elif isinstance(exc, (sqlite3.Error, OSError)):
+                result = _pre_dispatch_retry("recovery_storage_unavailable")
+            else:
+                result = {"ok": False, "reason": "recovery_action_failed"}
+        elif action == "completion_recovery_send":
+            result = {"ok": False, "status": "unknown", "reason": "dispatch_state_unavailable"}
+        else:
+            result = {"ok": False, "reason": type(exc).__name__}
     return result
 
 

@@ -1,10 +1,34 @@
 # Session Completion → Telegram
 
-## Modular settings (1.8.0 candidate)
+## Modular settings (public v1.8.0; 1.8.1 source candidate)
 
 Open the dedicated **Telegram Bridge** settings page while the Desktop plugin is enabled. The common service switch preserves individual choices; completion notices, input-needed notices, question answers, completion-card followups and one-time approvals have separate settings. Existing `replies_enabled` and `approvals_enabled` consent remains default-off and is never enabled by installation. Parent-notification switches and exact live authorization still apply. Writes use the captured public native settings API, one known boolean at a time, with readback and no retry after an unknown result. See [`../../docs/modular-settings.md`](../../docs/modular-settings.md) for defaults, revocation, all-profile scope and distinct activation gates.
 
-The current source uses 1.8.0 / `desktop-command-approval-v4`; the immutable public 1.7.0 release remains historical. Receiver heartbeats and saved settings are not proof of a Telegram roundtrip or command completion.
+The current unpublished source candidate uses package/helper/renderer 1.8.1 with `desktop-completion-recovery-v1` and `desktop-command-approval-v6`. The public 1.8.0 release and its immutable receiver remain on approval-v4; this candidate does not move that pin. The v6 authority modes are explicit: legacy queue-backed, legacy server-request-backed, and canonical native-session approvals. Canonical approvals use the actual opaque `prompt_id` and `execution_generation`, a fresh read-only subscription/snapshot through a ready owner, and one fixed-CLI backend write from the stored review binding. Old/cached v4/v5 halves fail closed. Receiver heartbeat and saved settings are not proof of a Telegram roundtrip or command completion.
+
+## Completion notification recovery (1.8.1 source candidate only)
+
+A candidate is recorded only from a fresh successful persisted Desktop completion—not from historical replay or a session-history scan. If Desktop reconnects within 30 minutes, the candidate can be rechecked only against the same already-live local connection/session and complete event replay. It does not start, resume, or create a profile/session. Unreadable or incomplete snapshots stay unverified; changed identity or new work cancels the candidate. The candidate table stores bounded metadata only, never the card text, title, preview, token, or destination.
+
+Durable recovery currently applies to the active local profile's live runtime. Fresh completions from other profiles retain the ordinary notification path rather than losing alerts; they do not gain durable recovery. A temporary disconnect or profile-view switch does not itself prove the recorded runtime changed. Ordinary question/attention cards keep their original classification and no-replay policy.
+
+The existing completion dedupe identity is shared with older send paths and multiple windows. Only a durable proof that the exact attempt failed before the Telegram request began allows another attempt; timeouts, helper/result loss, read/write/protocol failures, explicit rejections and any unknown result are not automatically replayed. A send accepted by Telegram remains sent even if the follow-up verification edit fails. Turning service/completion notifications off retires unexecuted candidates; it cannot cancel a write already dispatched. The settings page shows sender counters separately from receiver heartbeat. These behaviors are source-candidate documentation, not release or activation status.
+
+## Telegram command approvals (1.8.1 source candidate only)
+
+**Version fence:** the public 1.8.0 package and immutable receiver remain on `desktop-command-approval-v4`. This unpublished source candidate keeps package/recovery 1.8.1 and the approval compatibility value 1.8.0, but the renderer/helper/receiver capability is now `desktop-command-approval-v6`; cached v4/v5 halves do not enable approval actions. `approvals_enabled` remains default-off, and no saved setting is changed.
+
+**Three frozen authority modes:**
+
+- `legacyqueue`: a healthy parent `approval.pending` snapshot has exactly one full matching queue row. The existing frozen dispatcher remains `approval.respond {session_id, request_id:queue_id, choice, all:false}`.
+- `legacyserver_request`: a healthy, well-formed parent queue snapshot proves no matching or conflicting row. The existing frozen dispatcher remains `request.answer {id:srq_id, result:{choice, all:false}}`. `status:"ok"` is only Gateway acceptance and remains terminal uncertainty; it does not prove child settlement or command completion.
+- `canonical_native`: the actual session authority's `approval.request` prompt is captured from its native `prompts` snapshot, retaining its opaque `prompt_id`, exact execution generation, full provided review fields, native instance/authority epoch/replay epoch, session/profile/root route, Desktop owner, Telegram destination/card, receiver boot, TTL and claim. It is never converted to a fake `srq` or queue row. Before registration and immediately before application, the fixed native CLI performs one read-only subscription to the already-ready, explicitly discovered local owner using the current exported `GatewayClient`/discovery utilities; it verifies a fresh full `session.resume` snapshot and detaches only its own acknowledged subscription with no `end_reason`. A reaped-session metadata-only mount is not new execution and cannot validate an old card unless every frozen binding still matches. The full transcript/history is neither returned to Desktop nor stored in the approval inbox; snapshot receive size follows the public client's 8 MiB ceiling, so ordinary multi-megabyte history remains allowed while closed/oversized snapshots fail closed.
+
+Canonical decisions are dispatched by the fixed CLI from the SQLite row as authority, not by browser-supplied RPC arguments. After a durable `dispatching` CAS, it sends exactly one `approval.respond {session_id, execution_generation, prompt_id, choice}` with the stored opaque ID and generation. Only `once` or `deny` is possible. A typed `resolved` plus the matching prompt ID means the Gateway handled that decision; it does not prove a remote child request settled or command execution completed. Typed `already_resolved` is expired; stale-generation, owner/profile, and permission refusals are denied; transport errors, malformed receipts, helper loss after dispatch, or other ambiguous post-write outcomes are terminal unknown and never replayed. The legacy `approval_claim_valid`/`approval_settle` path cannot authorize a `canonical_native` row.
+
+Canonical compatibility is limited to the current canonical wire protocol and feature-detected exported utilities. Catalog lint currently flags the native client/discovery imports as undocumented plugin imports (warnings, not automatic admission failure); this candidate does not claim those utilities are a stable documented plugin API. Missing/incompatible APIs return safe unsupported status. The local integration uses the actual current core `AuthorityConnection`, session authority, pending controls/waiter, public `GatewayClient.rpc`, and actual PTB `Application.process_update`; the loopback identity gate and Telegram Bot API are fixture-stubbed. Separate live native-owner authentication qualification and the 36-check technical pilot are not production GO, API-stability certification, or a human Telegram roundtrip. Completion recovery retains its original no-resume contract.
+
+Only fully provided, redacted fields are reviewed. Omitted producer arguments/diffs are never invented. Unsafe or over-4,096 UTF-16-unit cards receive command-free Desktop guidance, never truncated approval buttons. No schema migration or inbox reset is introduced.
 
 ## Optional replies (1.7.0 candidate; unreleased)
 
@@ -69,14 +93,13 @@ The bridge's live authorization checks remain mandatory, but it does not control
   Markdown-to-plain previews, literal code, redaction and reply authorization stay unchanged.
 - Explicitly detached services and satisfied non-completion readiness watches
   do not block. Unclassified running background commands conservatively block.
-- Desktop must remain open/connected through the quiet window. Closing the app,
-  losing the connection or a missing state contract fails closed (no notification).
-  Remote SSH/cloud profiles are outside this local installation's scope.
+- Desktop must be open for the fresh event and initial identity capture. The 1.8.1 source candidate can recheck a durably recorded completion after a temporary interruption only when the same local route/runtime remains live and unchanged before the original 30-minute TTL. Desktop/backend restarts, changed runtime/connection/epoch, missing metadata or incomplete replay are not recovered; no backend is started to inspect a candidate. Remote SSH/cloud profiles remain outside this local route boundary.
 - Delivery claims persist in
   `plugin-data/session-complete-telegram/notifications.sqlite3`.
-  A network timeout is recorded as `unknown` and is not automatically resent;
-  Telegram's send API has no idempotency key. Explicit rejected sends are also
-  retained for inspection rather than retried noisily.
+  A read/write/protocol timeout or otherwise uncertain send is recorded as unknown
+  and is never automatically resent; Telegram's send API has no idempotency key.
+  The source candidate retries only a durable exact-attempt proof of a pre-request
+  connection failure. Explicit API rejection is terminal.
 
 ## Disable / remove
 
@@ -88,25 +111,30 @@ for audit/deduplication. For migration from the historical two-package release, 
 
 - `desktop/plugin.js`: app lifecycle, scoped profile routing, quiet-state gate and native `cli.exec` helper.
 - `__init__.py` / `runtime.py`: fixed CLI registration and package-home validation.
-- `notifier.py`: read-only durable-state checks, SQLite at-most-once claims,
-  existing Telegram credentials, fixed-destination sender and shared action dispatcher.
+- `notifier.py` / `completion_recovery.py`: read-only durable-state checks, shared completion-v2 dedupe, bounded metadata-only recovery, revision/claim/send CAS and recovery-only proven-connect-failure classification.
 - `followup_bridge.py`: completion-card reply lifecycle and isolated followup inbox.
 - `approval_bridge.py`: separate command-approval inbox, full literal review, receiver lease, and one-shot tap claim; Telegram never answers the core queue directly.
-- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`, `approval.test.mjs`: Node behavior/race tests (Node built-in runner).
-- `test_notifier.py`, `test_reply_bridge.py`, `test_followup_bridge.py`, `test_approval_bridge.py`: Python bridge tests using the actual pinned Hermes redactor/approval contract and real PTB `Application.process_update`; Telegram transport is mocked only where a unit scenario requires it.
-- `test_native_install.py`, `test_registration.py`, `test_feature_gates.py`: real Hermes install/Doctor/PluginContext fake-home contracts, one-package registration, strict default-off settings, migration refusal and runtime home guards.
+- `plugin.test.mjs`, `reply.test.mjs`, `followup.test.mjs`, `approval.test.mjs`, `settings.test.mjs`, `completion_recovery.test.mjs`: Node behavior/race tests (Node built-in runner).
+- `test_notifier.py`, `test_reply_bridge.py`, `test_followup_bridge.py`, `test_approval_bridge.py`, `test_completion_recovery.py`: Python bridge/recovery tests use real Hermes schemas and native CLI/result frames from the core environment selected for that run; `test_approval_bridge.py` also characterizes native approval producers, both response methods, queue settlement, and actual PTB dispatch. Telegram transport is mocked only where a unit scenario requires it.
+- `test_native_install.py`, `test_registration.py`, `test_feature_gates.py`, `test_settings_control.py`: real Hermes install/Doctor/PluginContext fake-home contracts, one-package registration, strict default-off settings, migration refusal, recovery cleanup and runtime home guards.
 
-From this folder, in the pinned-core environment described by `docs/operations.md`:
+The native CLI dispatches `notifier.py` through the registered in-process handler; no standalone launcher is used. The old `launch.py` bootstrap had no live source references and is retired. `docs/source-manifest.json` deliberately remains the exact historical 2026-10-10 source snapshot and still lists that earlier file; it is not a current package inventory.
+
+`notifier.credentials(root)` obtains `TELEGRAM_BOT_TOKEN` and `TELEGRAM_HOME_CHANNEL` through Hermes' public `agent.secret_scope.get_secret` API. Hermes loads the default-home credentials before its CLI/factory boundary; `root` remains the caller's state/authority context, not a second credential-file source. The reply and followup inbox directories/SQLite files are restricted to `0700`/`0600` on POSIX. Windows inherits the existing parent ACL; these `chmod` calls are not an NTFS ACL verification.
+
+From this folder, in the pinned-core environment described by `docs/operations.md`, run the Python campaign only through the repository-owned guarded entrypoint. It starts with pure-stdlib isolation tests in a fresh child process, then installs the DB fence before adding the exact core checkout and dependencies. Directly importing `test_canonical_integration` intentionally fails before its Hermes imports.
+
+Set `HERMES_TEST_ISOLATION_BASE` to an existing permitted runner-owned scratch root (profile scratch locally; `.ci-scratch` in CI), and set `HERMES_CORE_ROOT`, exact `HERMES_CORE_REF`, and `HERMES_CORE_GENERATION` to the selected immutable checkout.
 
 ```
 node --check desktop/plugin.js
-node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs
-python -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_native_install test_registration test_feature_gates -v
+node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
+python -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_canonical_backend test_db_isolation test_canonical_integration test_native_install test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review
 ```
 
 The test dependencies are declared in `requirements-test.txt`. Do not run the native installer against a production home as part of source tests.
 
-## Telegram command approvals (1.7.0 candidate; unreleased)
+## Historical Telegram command approval baseline (1.7.0 candidate; superseded by the 1.8.1 source candidate above)
 
 - `Allow Once` and `Deny` buttons are available only for the pinned core's real dangerous-command gate when the current Desktop `approval` request exactly matches its `approval.pending` queue entry, runtime session, queue ID, command, description, and producer pattern key. The helper re-runs the actual pinned `tools.approval_detection` classifier; no copied classifier is used.
 - The Telegram card displays the complete redacted command and description literally (no Markdown parsing, previews, or truncation). If redaction is unstable/ambiguous, suspicious credential text survives, Unicode/control characters are unsafe, the card exceeds Telegram's one-message bound, or the configured timeout is unavailable/expired, no buttons are sent; a notification-only card directs the user to Desktop.

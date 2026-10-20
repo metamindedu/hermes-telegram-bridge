@@ -37,7 +37,7 @@ class FinalBoundaryTests(LightCorrectionFixture):
             from gateway.platforms.base import BasePlatformAdapter
             app, Update = await self.make_application()
             baseline=set(asyncio.all_tasks());later=[];failed=[False];original=type(app).add_handler
-            adapter=SimpleNamespace(platform=SimpleNamespace(value='telegram'),name='fixture',_plugin_handler_native=None,_plugin_handlers_wired=None)
+            adapter=self.native_adapter
             self.add_approval_tombstone();self.add_clarify_tombstone()
             def add_once(target,handler,group=0):
                 if target is app and group==-10000 and not failed[0]:
@@ -70,7 +70,7 @@ class FinalBoundaryTests(LightCorrectionFixture):
             # Use the real native add_handler (super registration -> admission wrapping).
             old_app, Update = await self.make_application()
             bot = old_app.bot
-            adapter = SimpleNamespace(_update_admission=None)
+            adapter = self.native_adapter
             app = Application.builder().bot(bot).application_class(TelegramApplication, {'adapter': adapter}).build()
             await app.initialize()
             baseline = set(asyncio.all_tasks()); failed = [False]; later = []
@@ -85,12 +85,12 @@ class FinalBoundaryTests(LightCorrectionFixture):
             try:
                 with patch.object(self.notifier, 'credentials', return_value=(TOKEN, CHAT, None)), patch.object(self.notifier, 'telegram', return_value={'ok': False}):
                     with patch.object(TelegramApplication, '_admit_callbacks', new=fail_after_add):
-                        self.factory(app, object())
+                        self.factory(app, self.native_adapter)
                     app.add_handler(MessageHandler(filters.ALL, downstream), group=1)
                     # Base dispatch exercises the real installed native consumers
                     # without replacing the native wrapper or needing disk receipts.
                     await Application.process_update(app, self.approval_text_update(Update, app, 110, 890))
-                    self.factory(app, object())
+                    self.factory(app, self.native_adapter)
                     self.assertEqual(len(app.handlers[-10000]), 1)
                 self.assertTrue(failed[0]); self.assertEqual(later, [])
             finally:
@@ -108,7 +108,7 @@ class FinalBoundaryTests(LightCorrectionFixture):
             app,Update=await self.make_application();baseline=set(asyncio.all_tasks());later=[]
             self.add_approval_tombstone();self.add_clarify_tombstone()
             (self.managed/'config.yaml').write_text('plugins: [',encoding='utf-8')
-            adapter=SimpleNamespace(platform=SimpleNamespace(value='telegram'),name='fixture',_plugin_handler_native=None,_plugin_handlers_wired=None)
+            adapter=self.native_adapter
             async def downstream(update,ctx):later.append(update.update_id)
             try:
                 with patch.object(self.notifier,'credentials',return_value=(TOKEN,CHAT,None)),patch.object(self.notifier,'telegram',return_value={'ok':False}),patch('hermes_cli.plugins.get_plugin_manager',return_value=self.manager):
@@ -133,7 +133,7 @@ class FinalBoundaryTests(LightCorrectionFixture):
             app,Update=await self.make_application();baseline=set(asyncio.all_tasks());later=[];attempts=[]
             original=type(app).add_handler
             self.add_approval_tombstone()
-            adapter=SimpleNamespace(platform=SimpleNamespace(value='telegram'),name='fixture',_plugin_handler_native=None,_plugin_handlers_wired=None)
+            adapter=self.native_adapter
             def fail_guard(target,handler,group=0):
                 if target is app and group==-10000:
                     attempts.append(1);raise RuntimeError('persistent attach refusal')
@@ -176,7 +176,7 @@ class FinalBoundaryTests(LightCorrectionFixture):
             async def downstream(update,ctx):later.append(update.update_id)
             try:
                 with patch.object(self.notifier,'credentials',return_value=(TOKEN,CHAT,None)),patch.object(self.notifier,'telegram',return_value={'ok':False}):
-                    self.factory(app,object())
+                    self.factory(app,self.native_adapter)
                     self.write_config(replies=False,approvals=False)
                     app.add_handler(TypeHandler(Update,downstream),group=1)
                     update=self.clarify_text_update(Update,app,102,882)

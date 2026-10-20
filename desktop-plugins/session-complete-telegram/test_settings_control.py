@@ -82,7 +82,7 @@ class SettingsControlTests(unittest.TestCase):
     def test_default_selection_and_split_true_do_not_grant_legacy_consent(self):
         status = self.control.settings_status(self.ctx, root=self.home, state=self.state)
         self.assertTrue(status["ok"], status)
-        self.assertEqual(status["version"], "1.8.0")
+        self.assertEqual(status["version"], "1.8.1")
         self.assertEqual(status["settings"], {
             "service_enabled": True,
             "completion_notifications_enabled": True,
@@ -102,9 +102,11 @@ class SettingsControlTests(unittest.TestCase):
         self.assertIs(status["read_only"], True)
         self.assertEqual(status["selection_reason"], "ready")
         self.assertEqual(set(status), {"ok", "version", "settings", "effective", "read_only",
-            "selection_reason", "receiver"})
+            "selection_reason", "receiver", "sender"})
         self.assertEqual(set(status["receiver"]), {"version", "heartbeat_ready"})
         self.assertIs(status["receiver"]["heartbeat_ready"], False)
+        self.assertEqual(status["sender"], {"version":"1.8.1", "available":True,
+            "awaiting_recovery":0, "uncertain_delivery":0, "sent":0, "expired":0})
         self.assertFalse(self.state.exists(), "status must not create bridge state")
         self.assertFalse(self.ctx.writes, "status must not write config")
         self.assertFalse(self.gateway.feature_enabled("clarify_replies_enabled", root=self.home, ctx=self.ctx))
@@ -450,7 +452,7 @@ class SettingsControlTests(unittest.TestCase):
         before = {path: path.read_bytes() for path in files}
         status = self.control.settings_status(self.ctx, root=self.home, state=self.state)
         self.assertTrue(status["ok"], status)
-        self.assertEqual(status["receiver"], {"version": "1.8.0", "heartbeat_ready": True})
+        self.assertEqual(status["receiver"], {"version": "1.8.1", "heartbeat_ready": True})
         serialized = str(status)
         for private in ("77", "99", "boot-reply", "boot-followup", "boot-approval"):
             self.assertNotIn(private, serialized)

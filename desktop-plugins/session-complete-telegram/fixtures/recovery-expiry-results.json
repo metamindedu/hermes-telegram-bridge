@@ -1,0 +1,26 @@
+{
+  "claim": {
+    "ok": false,
+    "phase": "pre_dispatch",
+    "retryable": true,
+    "reason": "claim_expired"
+  },
+  "claim_retry": {
+    "ok": false,
+    "phase": "pre_dispatch",
+    "retryable": true,
+    "reason": "claim_expired"
+  },
+  "ttl": {
+    "ok": false,
+    "phase": "pre_dispatch",
+    "retryable": false,
+    "reason": "candidate_expired"
+  },
+  "ttl_retry": {
+    "ok": false,
+    "phase": "pre_dispatch",
+    "retryable": false,
+    "reason": "candidate_expired"
+  }
+}
