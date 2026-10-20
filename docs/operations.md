@@ -2,7 +2,9 @@
 
 > **Current release:** public v1.8.0 at `4874276f519f68fdbacb9767f70c5ed760b5c6fb`. Use [current public installation](public-install.md) and [modular settings](modular-settings.md) for current controls/v4 handshake. The phase-3 candidate descriptions below preserve historical 1.7.0 preparation and are not current publication status. This catalog/docs update does not install code, change user settings or restart a Gateway.
 
-## Ownership and current state
+For the current personal-use 1.8.1 source, withdrawn catalog status and source-integration evidence, read [PLAN.md](../PLAN.md). Earlier phase/task authorization statements below are historical, not the current delivery checklist. The verification section uses the current guarded test paths; never run canonical/session tests directly against an operational home.
+
+## Historical v1.7.0 preparation
 
 The repository is the source of truth. The unreleased v1.7.0 candidate has one installable package directory:
 
@@ -92,7 +94,9 @@ This migration and a packaged update/rollback after adoption are tested only wit
 
 Installing a package is not activation. Python command registration/ingress enablement, Desktop renderer enablement, Desktop hot reload, and Gateway handler loading are distinct. Any production enablement or restart needs a separate approval and readback. Ingress disablement must leave the completion package and ordinary Desktop completion notifications independently enabled. No plugin-enable, profile/config write, Desktop hot reload, Gateway restart, or live Telegram round trip was done here.
 
-## Completion notification recovery — 1.8.1 source candidate (unreleased)
+## Completion notification recovery — original 1.8.1 step (2026-10-14)
+
+The version/receiver description in the next paragraph records the original recovery-only step. The combined current source uses approval-v6 as documented in the approval-coverage section below; it does not keep the old v4 receiver.
 
 This scoped source candidate does not move the public 1.8.0 pin and does not authorize install, enablement, renderer materialization, Gateway restart, or live delivery. Package/helper/renderer use 1.8.1 and the separate `desktop-completion-recovery-v1` capability. The `loaded.version` compatibility field stays `1.8.0`; the installed `approval_bridge.py` and receiver keep `1.8.0` + `desktop-command-approval-v4` unchanged. The new renderer requires both the 1.8.1 package marker and recovery capability; old 1.8.0 helpers therefore do not activate recovery, while 1.8.0 approval-v4 remains independently compatible.
 
@@ -124,8 +128,9 @@ The v6 renderer, receiver and helper use only the current exported non-underscor
 
 ## Verification
 
-- Node: `node --check desktop/plugin.js` and `node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs`.
-- Python: `python -m unittest test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_canonical_backend test_canonical_integration test_native_install test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review -v`. Canonical tests use actual current core `297552a9d646119871391d202509822cd86330df` for `AuthorityConnection`, live native waiters, `GatewayClient.rpc`, fixed registered CLI and PTB dispatch. They also replay an actual `approval.request` event through the Desktop `onEvent` callback and fixed CLI observe/register branch. Telegram transport and loopback identity/endpoint discovery remain fixture-stubbed. The legacy-core test pins `74306c1d1b080837744faca3e371267dd09dda4b` and asserts canonical API absence/fail-closed behavior rather than namespace fallback. These are local fake-home tests, not native-ticket/production authentication or a human Telegram roundtrip.
+- Node (from the package directory): `node --check desktop/plugin.js` and `node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs approval_concurrency.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs`.
+- Python (from the package directory, using the locked core interpreter): `python -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_approval_concurrency test_canonical_backend test_db_isolation test_canonical_integration test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review`. First configure `HERMES_CORE_ROOT` and `HERMES_TEST_ISOLATION_BASE` exactly as in the workflow, with a task-owned scratch base and no operational home. The guard must precede Hermes imports and every database constructor. Canonical tests use actual current core `297552a9d646119871391d202509822cd86330df` for `AuthorityConnection`, live native waiters, `GatewayClient.rpc`, fixed registered CLI and PTB dispatch. They also replay an actual `approval.request` event through the Desktop `onEvent` callback and fixed CLI observe/register branch. Telegram transport and loopback identity/endpoint discovery remain fixture-stubbed. The legacy-core test pins `74306c1d1b080837744faca3e371267dd09dda4b` and asserts canonical API absence/fail-closed behavior rather than namespace fallback. These are local fake-home tests, not native-ticket/production authentication or a human Telegram roundtrip.
+- Native PM: run the separate `native-pm-container` workflow path (`prepare_native_container.py`, image build, `run_native_container.py`) for the complete `test_native_install` module. Do not add that module back to a direct unittest/guarded bridge aggregate or mount operational config, credentials or databases. Local focused install/CLI passes do not stand in for a complete container run.
 - CI: `.github/workflows/tests.yml` runs those explicit suites on Windows and Ubuntu with pinned immutable Hermes sources. It does not deploy, restart, upload secrets, or claim GUI verification on another PC. Independent Heavy review and commit-bound CI remain separate release gates.
 
 - Fake-home native-install tests use only a mock for Git transport. They exercise Hermes' actual install/publication/manifest/Doctor/context contracts and preserve sentinels/IDs. No live Telegram calls occur.

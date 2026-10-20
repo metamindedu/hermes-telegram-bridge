@@ -1,7 +1,7 @@
 ---
 title: Source and runtime boundaries
 created: 2026-10-10
-updated: 2026-10-16
+updated: 2026-10-20
 type: concept
 tags: [operations, ownership, deployment, privacy]
 ---
@@ -71,5 +71,9 @@ A temporary `sessions` directory is not a temporary session DB. `SessionStore` p
 Keep arbitrary-code test launchers outside the installable package rather than override the native scanner. Qualify cold native dependency imports before a timed publication oracle; do not stretch or waive a missing-request assertion to conceal setup work. Actual SDK event transformations are a separate boundary from raw canonical replay: remove only a verified same-ID `request_id` alias on a detached plugin copy, retain the exact native ID/generation and unknown fields, and reject an alias mismatch.
 
 The resumed user scope prohibits shared-Gateway restart and other-profile interruption. Source/fixture success does not activate cached production handlers or authorize operational DB/epoch changes. See [[../../PLAN|current plan]] and [[../operations|operations]] for the separate release and activation gates.
+
+## Source consolidation is not a release or activation
+
+Maintain one personal-use source line. Catalog registration was withdrawn; the two closed, unmerged submissions are historical records, not pending admission. The existing public release pins remain immutable. A squash integration may give main a clean feature commit while the original working branch retains WIP checkpoints and failed/NO-GO evidence. An old WIP title describes its checkpoint, not the current descendant's acceptance; later CI cannot retroactively turn an old failed run green. Current source/CI scope belongs in [[../../PLAN|PLAN]], while historical release installation stays in [[../public-install|public setup]]. Main integration does not authorize a new tag, catalog submission, installed-byte change, shared restart or human interaction claim.
 
 Knowledge rules follow [[SCHEMA]], and navigation is maintained in [[index]].
