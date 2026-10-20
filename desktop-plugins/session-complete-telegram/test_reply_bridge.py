@@ -14,6 +14,58 @@ import test_support
 import reply_bridge as b
 
 
+class NativeRegistrationRecoveryTests(unittest.TestCase):
+    def test_registered_cli_register_lost_receipt_lookup_renew_and_settle_without_resend(self):
+        # Reuse the qualified, fake-home native PluginContext/CLI fixture. No
+        # installer, operational home, session authority or Telegram transport.
+        import importlib
+        import time
+        fixture_module=importlib.import_module('test_completion_recovery')
+        native=fixture_module.CompletionRecoveryTests()
+        self.addCleanup(native.doCleanups)
+        native.setUp()
+        (native.home/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        replies_enabled: true\n',encoding='utf-8')
+        bridge=importlib.import_module(native.name+'.reply_bridge')
+        now=time.time()
+        bridge.bind_receiver(123456,99,None,'registered-boot',state=native.state,now=now)
+        ask={'id':'srq-aabbcc112233','method':'clarify','params':{'session_id':'runtime-native',
+             'questions':[{'qid':'q0','question':'Synthetic native question?','choices':['A','B'],'multi_select':False}]}}
+        descriptor={'owner':'same-desktop-owner','connectionId':'local','profile':'default','targetProfile':'default',
+                    'sid':'runtime-native','session_key':native.sid,'epoch':'native-epoch','request_id':ask['id'],
+                    'fingerprint':bridge.canonical(ask)}
+        sent=[]
+        def telegram(_token,method,payload):
+            if method=='sendMessage':sent.append(1)
+            return {'ok':True,'result':{'message_id':123,'chat':{'id':99},'text':payload['text']}}
+        with patch.object(native.notifier,'credentials',return_value=(fixture_module.TOKEN,99,None)),patch.object(native.notifier,'telegram',side_effect=telegram):
+            registered=native.invoke({'action':'reply_register','descriptor':descriptor,'ask':ask})
+            self.assertTrue(registered.get('new'),registered)
+            fid=registered['id'];original=bridge.read_form(fid,native.state)
+            self.assertEqual(original['status'],'open')
+            native.invoke({'action':'reply_poll','owner':descriptor['owner'],'observations':[],'unverified':[],'absent':[]})
+            held=bridge.read_form(fid,native.state)
+            self.assertEqual(held['status'],'open')
+            self.assertEqual(held['seen'],bridge.STALE_SEEN)
+            self.assertEqual(held['expires'],original['expires'])
+            path=native.state/'reply-inbox/replies.sqlite3';before=path.read_bytes()
+            found=native.invoke({'action':'reply_registration_lookup','descriptor':descriptor,'ask':ask})
+            self.assertEqual(found,{'ok':True,'found':True,'id':fid,'status':'open','expires':original['expires']})
+            self.assertEqual(path.read_bytes(),before,'native lookup must not run flush/prune/renew')
+            native.invoke({'action':'reply_poll','owner':descriptor['owner'],'observations':[{'id':fid}],'unverified':[],'absent':[]})
+            identity=dict(bot=123456,boot='registered-boot',chat=99,user=99,topic=None,mid=123,private=True,
+                          human=True,bot_author=True,forwarded=False,edited=False,event='native-one-answer')
+            self.assertEqual(bridge.intake(fid,0,'c',1,identity,state=native.state)['status'],'queued')
+            polled=native.invoke({'action':'reply_poll','owner':descriptor['owner'],'observations':[{'id':fid}],'unverified':[],'absent':[]})
+            self.assertEqual(len(polled['items']),1)
+            item=polled['items'][0]
+            self.assertEqual(item['descriptor'],descriptor)
+            self.assertEqual(item['result'],{'answers':{'q0':'B'}})
+            native.invoke({'action':'reply_settle','id':fid,'claim':item['claim'],'status':'applied'})
+            self.assertIs(native.invoke({'action':'reply_registration_lookup','descriptor':descriptor,'ask':ask})['found'],False)
+            self.assertEqual(sent,[1])
+            self.assertEqual(bridge.read_form(fid,native.state)['expires'],original['expires'])
+
+
 class BridgeTests(unittest.TestCase):
     def setUp(self):
         self.tmp=test_support.temporary_directory(prefix='reply-test-');self.addCleanup(self.tmp.cleanup)
@@ -61,7 +113,84 @@ class BridgeTests(unittest.TestCase):
     def take(self,action='c',value=0,index=0,identity=None,now=None):
         return b.intake(self.fid,index,action,value,identity or self.ident(),state=self.state,now=now or self.now)
     def claim(self,observations=None,owner='desktop1',now=None):
-        return b.poll(owner,observations if observations is not None else [{'id':self.fid,'descriptor':self.d}],state=self.state,now=now or self.now)
+        return b.poll(owner,observations if observations is not None else [{'id':self.fid,'descriptor':self.d}],absent=[self.fid] if observations == [] else [],state=self.state,now=now or self.now)
+    def test_unmentioned_registration_is_unknown_not_absent_and_can_renew_without_ttl_reset(self):
+        for queued in (False, True):
+            with self.subTest(queued=queued):
+                ask=copy.deepcopy(self.ask);ask['id']='srq-unknown-'+str(queued)
+                self.d['request_id']=ask['id'];self.create(ask,ttl=3600)
+                if queued:self.take()
+                before=b.read_form(self.fid,self.state)
+                held=b.poll('desktop1',[],state=self.state,now=self.now+1)
+                after=b.read_form(self.fid,self.state)
+                self.assertEqual(held['items'],[])
+                self.assertEqual(after['status'],before['status'])
+                self.assertEqual(after['expires'],before['expires'])
+                self.assertEqual(after['seen'],b.STALE_SEEN)
+                self.assertEqual(after['answer'],before['answer'])
+                if not queued:self.assertEqual(self.take(now=self.now+2)['reason'],'lease_stale')
+                renewed=b.poll('desktop1',[{'id':self.fid}],state=self.state,now=self.now+3)
+                self.assertEqual(len(renewed['items']),int(queued))
+                self.assertEqual(b.read_form(self.fid,self.state)['expires'],before['expires'])
+                if queued:
+                    self.assertEqual(b.poll('desktop1',[{'id':self.fid}],state=self.state,now=self.now+4)['items'],[])
+
+    def test_explicit_absence_is_validated_before_writes_and_never_retires_other_owner(self):
+        self.create(ttl=3600)
+        path=self.state/'reply-inbox/replies.sqlite3';before=path.read_bytes()
+        for absent in ('not-a-list',[None],[self.fid]):
+            with self.assertRaises(ValueError):
+                b.poll('desktop1',[{'id':self.fid}],state=self.state,now=self.now+1,absent=absent)
+            self.assertEqual(path.read_bytes(),before)
+        b.poll('other-owner',[],state=self.state,now=self.now+1,absent=[self.fid])
+        self.assertEqual(b.read_form(self.fid,self.state)['status'],'open')
+        b.poll('desktop1',[],state=self.state,now=self.now+2,absent=[self.fid])
+        self.assertEqual(b.read_form(self.fid,self.state)['status'],'expired')
+
+    def test_registration_lookup_refuses_stale_receiver_or_incomplete_publication(self):
+        self.create(ttl=3600)
+        request={'descriptor':self.d,'ask':self.ask}
+        self.assertIs(b.lookup_registration(request,state=self.state,now=self.now+b.LEASE+1)['found'],False)
+        for field,value in [('mids','{}'),('texts','{}'),('boot','changed-boot')]:
+            with self.subTest(field=field):
+                c=b.connect(self.state)
+                original=c.execute('SELECT '+field+' FROM forms WHERE id=?',(self.fid,)).fetchone()[0]
+                with c:c.execute('UPDATE forms SET '+field+'=? WHERE id=?',(value,self.fid))
+                c.close()
+                before=(self.state/'reply-inbox/replies.sqlite3').read_bytes()
+                self.assertIs(b.lookup_registration(request,state=self.state,now=self.now+1)['found'],False)
+                self.assertEqual((self.state/'reply-inbox/replies.sqlite3').read_bytes(),before)
+                c=b.connect(self.state)
+                with c:c.execute('UPDATE forms SET '+field+'=? WHERE id=?',(original,self.fid))
+                c.close()
+
+    def test_registration_lookup_is_exact_owner_read_only_and_never_revives_terminal_or_applying(self):
+        self.create(ttl=3600)
+        path=self.state/'reply-inbox/replies.sqlite3'
+        before=path.read_bytes()
+        request={'descriptor':self.d,'ask':self.ask}
+        found=b.lookup_registration(request,state=self.state,now=self.now+1)
+        self.assertEqual(found,{'ok':True,'found':True,'id':self.fid,'status':'open','expires':self.now+3600})
+        self.assertEqual(path.read_bytes(),before)
+        for key in self.d:
+            changed=copy.deepcopy(request);changed['descriptor'][key]='foreign'
+            self.assertIs(b.lookup_registration(changed,state=self.state,now=self.now+1)['found'],False)
+        self.assertEqual(path.read_bytes(),before)
+        for status in ('posting','applying','applied','unknown','expired','rejected'):
+            c=b.connect(self.state)
+            with c:c.execute('UPDATE forms SET status=? WHERE id=?',(status,self.fid))
+            c.close();before=path.read_bytes()
+            self.assertIs(b.lookup_registration(request,state=self.state,now=self.now+1)['found'],False)
+            self.assertEqual(path.read_bytes(),before)
+        c=b.connect(self.state)
+        with c:c.execute("UPDATE forms SET status='open' WHERE id=?",(self.fid,))
+        c.close();before=path.read_bytes()
+        self.assertIs(b.lookup_registration(request,state=self.state,now=self.now+3600)['found'],False)
+        self.assertEqual(path.read_bytes(),before)
+        missing=self.state/'missing-lookup'
+        self.assertIs(b.lookup_registration(request,state=missing,now=self.now)['found'],False)
+        self.assertFalse(missing.exists())
+
     def test_single_batch_choice_and_purge(self):
         self.create();self.assertEqual(self.take()['status'],'queued')
         item=self.claim()['items'][0];self.assertEqual(item['result'],{'answers':{'q1':'첫 번째'}})
@@ -99,7 +228,7 @@ class BridgeTests(unittest.TestCase):
                         self.assertTrue(answer(first,index,'😊'*2000 if fragmented else 'A answer',100+index,self.now+1.5)['ok'])
                     if mode in ('unverified','absent'):observations=[{'id':first}]
                     result=b.poll('desktop1',observations,state=state,now=self.now+2,
-                                  unverified=[later] if mode=='unverified' else [],result_budget=24*1024)
+                                  unverified=[later] if mode=='unverified' else [],absent=[later] if mode=='absent' else [],result_budget=24*1024)
                     self.assertEqual(len(result['items']),1)
                     self.assertEqual(result['items'][0]['id'],first)
                     self.assertEqual('fragment' in result['items'][0],fragmented)
@@ -397,7 +526,7 @@ class BridgeTests(unittest.TestCase):
                 c=b.connect(self.state)
                 with c:c.execute('UPDATE forms SET status=?,seen=? WHERE id=?',(status,self.now+40,self.fid))
                 c.close()
-                absent=b.poll('desktop1',[],state=self.state,now=self.now+46)
+                absent=b.poll('desktop1',[],state=self.state,now=self.now+46,absent=[self.fid])
                 self.assertEqual(absent['items'],[])
                 expected='unknown' if status=='applying' else 'expired'
                 self.assertEqual(b.read_form(self.fid,self.state)['status'],expected)

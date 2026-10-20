@@ -1139,7 +1139,7 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             result = deliver_completion_recovery(req, root=root, state=state, ctx=ctx)
         elif action == "attention":
             result = deliver_attention(req, root=root, state=state, ctx=ctx)
-        elif action in ("reply_register", "reply_poll", "reply_settle", "reply_fragment", "reply_claim_valid"):
+        elif action in ("reply_register", "reply_registration_lookup", "reply_poll", "reply_settle", "reply_fragment", "reply_claim_valid"):
             gateway = _sibling_module("telegram_integration")
             allowed, reason = gateway.feature_status("clarify_replies_enabled", root=root, ctx=ctx)
             if not allowed and action not in {"reply_settle"}:

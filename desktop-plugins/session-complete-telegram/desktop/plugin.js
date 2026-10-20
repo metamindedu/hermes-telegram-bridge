@@ -680,9 +680,13 @@ export class CompletionMonitor {
     let result
     try {
       // cli.exec's child budget is seconds; SDK's outer deadline is milliseconds.
-      const recoveryBudget = recoveryAction || action === 'loaded'
-      result = await requestCLI('cli.exec', {argv, timeout: recoveryBudget ? 60 : 25},
-        recoveryBudget ? 75_000 : 35_000)
+      // Clarify registration includes native startup plus the confirmed card
+      // send/readback. A 25s cutoff can orphan a sent card before r.reply binds;
+      // the next owner poll then retires it as absent. Use the existing bounded
+      // startup budget, without retrying any ambiguous write or changing TTL.
+      const startupBudget = recoveryAction || action === 'loaded' || action === 'reply_register'
+      result = await requestCLI('cli.exec', {argv, timeout: startupBudget ? 60 : 25},
+        startupBudget ? 75_000 : 35_000)
     } catch {
       throw new NativeHelperError('Notification helper did not complete', ambiguousWrite)
     }
@@ -2220,6 +2224,7 @@ export class CompletionMonitor {
     let currentAskId = null
     let currentAskFingerprint = null
     let currentAskMethod = null
+    let attemptedRegistration = null
     try {
       validateSessionRow(row)
       if (row.id !== r.sid) throw new Error('Clarify session identity changed')
@@ -2304,6 +2309,7 @@ export class CompletionMonitor {
         const descriptor = { owner: this.replyOwner, connectionId: route.connectionId, profile: route.profile,
           targetProfile: route.targetProfile, sid: r.sid, session_key: row.session_key,
           epoch: String(since.epoch), request_id: ask.id, fingerprint: currentAskFingerprint }
+        if (r.replyRegistration?.descriptor.request_id === ask.id) return
         const previous = r.reply
         if (previous && !['connectionId','profile','targetProfile','sid','session_key','epoch','request_id']
           .every(key => previous.descriptor[key] === descriptor[key])) {
@@ -2312,8 +2318,10 @@ export class CompletionMonitor {
           this.replySweepAbsent.add(previous.id)
           return
         }
+        attemptedRegistration = {descriptor, route:{...route}, ask:structuredClone(ask)}
         const reply = await this.helper({action:'reply_register', descriptor, ask})
-        if (reply.ok && reply.new === true && reply.id) {
+        if (reply?.ok === true && reply.new === true && reply.id) {
+          r.replyRegistration = null
           r.reply = {id:reply.id, descriptor, route:{...route}, ask}
           this.hadReplies = true
           r.ask = {id:ask.id}
@@ -2334,8 +2342,12 @@ export class CompletionMonitor {
           } else if (previous && previous.id === reply.id && !REPLY_ACTIVE_STATUSES.has(reply.status)) {
             r.reply = null
           }
-          // A duplicate is evidence of a permanent prior send claim, not
-          // authority to bind this monitor to terminal or prior-owner data.
+          // A duplicate alone grants no binding. Only a separate read-only
+          // exact-owner lookup plus fresh native snapshot may recover it.
+          if (!previous && ['open','queued'].includes(reply.status)) {
+            r.replyRegistration = attemptedRegistration
+            this.hadReplies = true
+          }
           r.ask = {id:ask.id}
           return
         }
@@ -2347,6 +2359,12 @@ export class CompletionMonitor {
           // Transport/receiver failure does not discard the existing bridge.
           r.ask = {id:ask.id}
           return
+        }
+        if (!['receiver_unavailable','capacity'].includes(reply?.reason) && reply?.feature_ready !== false) {
+          r.replyRegistration = attemptedRegistration
+          this.hadReplies = true
+          r.ask = {id:ask.id}
+          return // a post-registration structured error must not resend/fall back
         }
       }
       if (!ask || (r.ask && r.ask.id === ask.id)) return
@@ -2370,6 +2388,10 @@ export class CompletionMonitor {
         r.ask = {id: currentAskId}
         this.api.notify({kind: 'warning', title: '질문 응답 전송 제한', message: '질문이 로컬 전송 크기 제한을 초과해 텔레그램 연결을 시작하지 않았습니다. 질문을 짧게 줄여 다시 요청해 주세요.'})
       } else if (currentAskId && error instanceof NativeHelperError && error.ambiguousWrite) {
+        if (attemptedRegistration) {
+          r.replyRegistration = attemptedRegistration
+          this.hadReplies = true
+        }
         r.helperWriteBlockedAskId = currentAskId
         r.ask = {id: currentAskId}
         this.api.notify({kind: 'warning', title: '입력 대기 알림', message: '결과를 확인하지 못했습니다. 중복 방지를 위해 다시 시도하지 않습니다.'})
@@ -2711,9 +2733,41 @@ export class CompletionMonitor {
     return payload.result
   }
 
+  async recoverReplyRegistration(record) {
+    const pending = record.replyRegistration
+    if (!pending || record.reply || this.stopped) return
+    try {
+      const found = await this.helper({action:'reply_registration_lookup',
+        descriptor:pending.descriptor, ask:pending.ask})
+      if (this.stopped || record.replyRegistration !== pending || record.reply) return
+      if (!exactKeys(found, ['ok','found','id','status','expires']) || found.ok !== true || found.found !== true ||
+          typeof found.id !== 'string' || !found.id || !['open','queued'].includes(found.status) ||
+          !Number.isFinite(found.expires) || Date.now() >= found.expires * 1000) return
+      const bridge = {id:found.id, ...pending}
+      let valid
+      try { valid = await this.replySnapshot(bridge) }
+      catch {
+        if (!this.stopped && record.replyRegistration === pending) this.replySweepUnverified.add(found.id)
+        return
+      }
+      if (this.stopped || record.replyRegistration !== pending || record.reply) return
+      if (!valid) {
+        this.replySweepAbsent.add(found.id)
+        record.replyRegistration = null
+        return
+      }
+      record.reply = bridge
+      record.replyRegistration = null
+      // Never clear the write fence: this operation only rediscovers an
+      // already-published, exact-owner form and cannot resend a registration.
+    } catch { /* repeat only this read-only lookup after a transport gap */ }
+  }
+
   async pumpReplies() {
     this.lastReplyPollSucceeded = false
     if (!this.hadReplies || this.stopped) return
+    for (const record of this.records.values()) await this.recoverReplyRegistration(record)
+    if (this.stopped) return
     const bridges = new Map()
     const unverified = [...this.replySweepUnverified]
     const definitiveAbsent = new Set(this.replySweepAbsent)
@@ -2728,7 +2782,7 @@ export class CompletionMonitor {
     }
     let polled
     try { polled = await this.helper({action:'reply_poll', owner:this.replyOwner,
-      observations:[...bridges.values()].map(b => ({id:b.id})), unverified}) } catch { return }
+      observations:[...bridges.values()].map(b => ({id:b.id})), unverified, absent:[...definitiveAbsent]}) } catch { return }
     if (polled?.ok !== true || !Array.isArray(polled.items)) return
     this.lastReplyPollSucceeded = true
     for (const item of polled.items || []) {

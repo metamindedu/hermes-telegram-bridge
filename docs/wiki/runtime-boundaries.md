@@ -76,4 +76,10 @@ The resumed user scope prohibits shared-Gateway restart and other-profile interr
 
 Maintain one personal-use source line. Catalog registration was withdrawn; the two closed, unmerged submissions are historical records, not pending admission. The existing public release pins remain immutable. A squash integration may give main a clean feature commit while the original working branch retains WIP checkpoints and failed/NO-GO evidence. An old WIP title describes its checkpoint, not the current descendant's acceptance; later CI cannot retroactively turn an old failed run green. Current source/CI scope belongs in [[../../PLAN|PLAN]], while historical release installation stays in [[../public-install|public setup]]. Main integration does not authorize a new tag, catalog submission, installed-byte change, shared restart or human interaction claim.
 
+## Clarify lifetime versus registration budget
+
+A card can be retired before its advertised TTL because its Desktop registration never completed, not because the TTL was calculated incorrectly. Separate the original absolute expiry, native helper deadline, owner/receiver transport leases and authoritative live-question state when diagnosing this symptom. An exact still-waiting question is evidence against genuine question closure, but a later healthy snapshot does not establish which historical timeout or absence caused retirement. Keep that attribution unconfirmed unless original evidence exists.
+
+The registration receipt-loss contract and injected-delay/native-CLI regressions live in [[../operations|operations]]. Treat an unmentioned card as unverified, not confirmed absent; same-owner read-only lookup and a fresh exact native question can rebind only a fully published nonterminal card without sending again. No terminal revival, TTL extension, cross-owner adoption or replay of an uncertain answer is allowed. A helper-deadline increase is only mitigation, never a substitute for this distinction. Keep source acceptance and live activation separate as in [[completion-recovery]].
+
 Knowledge rules follow [[SCHEMA]], and navigation is maintained in [[index]].

@@ -454,16 +454,73 @@ def _frozen_reply_bytes(descriptor, result):
     return canonical({'descriptor': descriptor, 'result': result}).encode('utf-8')
 
 
-def poll(owner, observations, *, state=STATE, now=None, unverified=None, result_budget=None):
+def lookup_registration(req, *, state=STATE, now=None):
+    """Read only an exact same-owner published registration; never send or renew.
+
+    Losing the registration receipt is not losing the question. A live renderer
+    may rediscover only its original open/queued card, then must independently
+    validate the native question before the ordinary observation/claim gates.
+    """
+    missing = {'ok': True, 'found': False}
+    now = time.time() if now is None else now
+    try:
+        if not isinstance(req,dict):
+            return missing
+        d = req.get('descriptor'); ask = req.get('ask')
+        keys = ('owner','connectionId','profile','targetProfile','sid','session_key','epoch','request_id','fingerprint')
+        if not isinstance(d,dict) or any(not isinstance(d.get(k),str) or not d[k] for k in keys):
+            return missing
+        qs, _batch, locks = shape(ask)
+        if (len(canonical(d)) > 30000 or d['sid'] != ask['params']['session_id'] or
+                d['request_id'] != ask.get('id') or d['fingerprint'] != canonical(ask)):
+            return missing
+        immutable = {k:d[k] for k in keys if k not in ('owner','fingerprint')}
+        identity = hashlib.sha256(canonical(immutable).encode()).hexdigest()
+        path = Path(state)/'reply-inbox/replies.sqlite3'
+        if not path.is_file():
+            return missing
+        c = sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=5)
+        c.row_factory = sqlite3.Row
+        try:
+            c.execute('PRAGMA query_only=ON')
+            row = c.execute('SELECT f.* FROM forms f JOIN send_claims s ON s.identity=f.identity AND s.form_id=f.id WHERE f.identity=? AND f.owner=?',
+                            (identity,d['owner'])).fetchone()
+            live = receiver(c,now)
+            if (not row or row['status'] not in ('open','queued') or row['expires'] <= now or
+                    not live or row['boot'] != live['boot'] or
+                    (row['bot'],row['chat'],row['topic']) != (live['bot'],live['chat'],live['topic']) or
+                    row['claim'] is not None or
+                    canonical(json.loads(row['descriptor'])) != canonical(d) or
+                    canonical(json.loads(row['params'])) != canonical(ask) or
+                    canonical(json.loads(row['questions'])) != canonical(qs)):
+                return missing
+            mids=json.loads(row['mids']); texts=json.loads(row['texts'])
+            expected={str(i) for i,q in enumerate(qs) if q['qid'] not in locks}
+            if (not expected or not isinstance(mids,dict) or not isinstance(texts,dict) or set(mids)!=expected or set(texts)!=expected or
+                    any(type(mids[i]) is not int or mids[i]<=0 or not isinstance(texts[i],str) or not texts[i] for i in expected)):
+                return missing
+            return {'ok':True,'found':True,'id':row['id'],'status':row['status'],'expires':row['expires']}
+        finally:
+            c.close()
+    except (KeyError, TypeError, ValueError):
+        return missing
+
+
+def poll(owner, observations, *, state=STATE, now=None, unverified=None, absent=None, result_budget=None):
     now=time.time() if now is None else now
     if not isinstance(owner,str) or not owner or not isinstance(observations,list) or len(observations)>50:
         raise ValueError('invalid_poll')
     if unverified is not None and (not isinstance(unverified,list) or len(unverified)>50):
         raise ValueError('invalid_poll')
+    if absent is not None and (not isinstance(absent,list) or len(absent)>50 or any(not isinstance(x,str) or not x for x in absent)):
+        raise ValueError('invalid_poll')
     if result_budget is not None and (type(result_budget) is not int or result_budget <= 0):
         raise ValueError('invalid_poll')
     allowed={x['id'] for x in observations if isinstance(x,dict) and isinstance(x.get('id'),str)}
     unverifiable={x for x in (unverified or []) if isinstance(x,str)}
+    definitive_absent=set(absent or [])
+    if definitive_absent & (allowed | unverifiable):
+        raise ValueError('conflicting_poll')
     c=connect(state)
     try:
         c.execute('BEGIN IMMEDIATE');_prune(c,now); live=receiver(c,now)
@@ -486,8 +543,15 @@ def poll(owner, observations, *, state=STATE, now=None, unverified=None, result_
             # even when the receiver heartbeat itself is stale.
             if receiver_boot is not None and row['boot']!=receiver_boot:
                 _retire(c,row['id'],'unknown' if row['status']=='applying' else 'expired');continue
-            if row['id'] not in allowed:
+            if row['id'] in definitive_absent:
                 _retire(c,row['id'],'unknown' if row['status']=='applying' else 'expired');continue
+            if row['id'] not in allowed:
+                # A lost registration receipt leaves an owned row the renderer
+                # cannot yet enumerate. Unknown is not definitive absence; revoke
+                # freshness without renewing TTL or allowing intake/claims.
+                if row['status'] in ('open','queued'):
+                    c.execute('UPDATE forms SET seen=? WHERE id=?',(STALE_SEEN,row['id']))
+                continue
             # Observed rows survive a temporary receiver lease gap. They are
             # not renewed until the receiver is live again.
             if not live:
@@ -735,12 +799,14 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     allowed, reason = _feature_status(root)
     if not allowed and action != 'reply_settle':
         return {'ok': False, 'feature_ready': False, 'reason': reason}
+    if action=='reply_registration_lookup':
+        return lookup_registration(req,state=state)
     if action=='reply_register':
         checked=notifier.inspect_ask({'ask_method':'clarify','ask_id':req.get('ask',{}).get('id'),'ask_params':req.get('ask',{}).get('params',{}),'profile':req.get('descriptor',{}).get('targetProfile'),'session_key':req.get('descriptor',{}).get('session_key'),'desktop_observed':True},root=root)
         if not checked.get('ok'):return checked
         result=register(req,state=state,root=root)
         if result.get('new'):publish(result['id'],notifier,state=state,root=root)
-    elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'),state=state,result_budget=result_budget)
+    elif action=='reply_poll':result=poll(req.get('owner'),req.get('observations'),unverified=req.get('unverified'),absent=req.get('absent'),state=state,result_budget=result_budget)
     elif action=='reply_fragment':
         return read_fragment(req.get('owner'),req.get('id'),req.get('claim'),req.get('sha256'),req.get('index'),state=state)
     elif action=='reply_settle':result=settle(req.get('id'),req.get('claim'),req.get('status'),state=state)

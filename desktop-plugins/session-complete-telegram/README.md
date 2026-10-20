@@ -185,6 +185,13 @@ The test dependencies are declared in `requirements-test.txt`. Do not run the na
   Incomplete active-session/question snapshots never imply absence; a healthy empty
   `sessions` list and a definitive identity/boot change remain terminal. Only an in-flight
   delivery claim lapses terminally (`unknown`, never replayed).
+- An uncertain registration receipt does not mean the question disappeared. In
+  the current unreleased source, owner polling sends explicit confirmed-absence
+  IDs; unmentioned forms are blocked as unverified without resetting their TTL.
+  The same still-live renderer may read back only its exact fully published
+  open/queued registration and revalidate the native question before binding it.
+  This performs no card resend, lease renewal or answer write. Terminal,
+  posting/applying, foreign-owner and reloaded-window cards are not adopted.
 - A send or answer with an ambiguous outcome is never automatically retried.
   Telegram shows applied only after Desktop's authoritative response receipt.
 - `reply_bridge.py` owns clarify ingress/store/helper logic; `telegram_integration.py` is the primary package's internal Gateway integration. `plugins/desktop-clarify-telegram/` is a deprecated inert/no-factory compatibility stub. `reply.test.mjs` and `test_reply_bridge.py`

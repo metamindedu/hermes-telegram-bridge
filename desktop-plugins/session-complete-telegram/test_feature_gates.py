@@ -172,6 +172,9 @@ class NativeFeatureGateTests(unittest.TestCase):
             notifier = importlib.import_module(f"{self.module_name}.notifier")
             reply = notifier.dispatch_request({"action": "reply_poll", "owner": "fixture",
                 "observations": [], "unverified": []}, root=self.root, state=state)
+            lookup = notifier.dispatch_request({"action": "reply_registration_lookup", "descriptor": {}, "ask": {}},
+                root=self.root, state=state)
+            self.assertEqual(lookup["reason"], "replies_disabled")
             reply_claim = notifier.dispatch_request({"action": "reply_claim_valid", "id": "fixture-form",
                 "claim": "fixture-claim", "descriptor": {}, "authority": "0" * 64, "deadline": 1},
                 root=self.root, state=state)

@@ -6,7 +6,7 @@ registerHooks({resolve(s,c,n){
   if(s==='react/jsx-runtime')return{url:'data:text/javascript,export const jsx=(type,props,key)=>({type,props,key})',shortCircuit:true}
   return n(s,c)
 }})
-const {CompletionMonitor,stableJSON,validReplySnapshot}=await import('./desktop/plugin.js')
+const {CompletionMonitor,NativeHelperError,stableJSON,validReplySnapshot}=await import('./desktop/plugin.js')
 function fixture() {
   const route={mode:'local',connectionId:'local',profile:'default',targetProfile:'default'}
   const row={id:'sid1',session_key:'stored1',status:'waiting'}
@@ -27,8 +27,9 @@ function fixture() {
   mon.helper=async r=>{
     if(r.action==='reply_register'){
       registrations.push(r)
+      registered=r
       if(registerHandler)return registerHandler(r)
-      registered=r;return {ok:true,id:'form1',new:true}
+      return {ok:true,id:'form1',new:true}
     }
     if(r.action==='reply_poll'){
       polls.push(structuredClone(r))
@@ -107,6 +108,7 @@ for(const mutation of ['epoch','method','sid','stored','route','locks','choices'
   if(mutation==='choices')f.ask.params.questions[0].choices=['C','D']
   if(mutation==='closed')f.snapshot.open_requests=[]
   await f.mon.pumpReplies();assert.equal(f.writes.length,0)
+  if(mutation!=='route')assert.deepEqual(f.polls.at(-1).absent,['form1'])
 })
 test('timeout after write is unknown, not successful or retryable',async()=>{
   const f=fixture();await f.register();f.queue();const orig=f.api.requestProfile
@@ -351,6 +353,76 @@ for(const prior of [{ok:true,duplicate:true,id:'prior-form',status:'open'},
   const f=fixture();f.setRegisterHandler(async()=>prior)
   await f.register()
   assert.equal(f.record.reply,undefined)
+})
+for(const mode of ['lost receipt','structured failure','malformed success','same-owner duplicate']) test('read-only recovery binds an existing registration after '+mode+' without resending',async()=>{
+  const f=fixture();let lookups=0
+  f.setRegisterHandler(async()=>{
+    if(mode==='lost receipt')throw new NativeHelperError('lost registration receipt',true)
+    if(mode==='structured failure')return {ok:false,reason:'RuntimeError'}
+    if(mode==='malformed success')return {ok:true}
+    return {ok:true,duplicate:true,id:'form1',status:'open'}
+  })
+  const original=f.mon.helper
+  f.mon.helper=async request=>{
+    if(request.action==='reply_registration_lookup'){
+      lookups++
+      assert.deepEqual(request.descriptor,f.registrations[0].descriptor)
+      return {ok:true,found:true,id:'form1',status:'open',expires:Date.now()/1000+3600}
+    }
+    return original(request)
+  }
+  await f.register()
+  assert.equal(f.record.reply,undefined)
+  await f.mon.sweep()
+  assert.equal(f.record.reply?.id,'form1')
+  assert.equal(f.registrations.length,1)
+  assert.equal(lookups,1)
+  assert.deepEqual(f.polls.at(-1).observations,[{id:'form1'}])
+  assert.deepEqual(f.polls.at(-1).absent,[])
+  f.queue();await f.mon.sweep()
+  assert.equal(f.writes.length,1)
+  assert.equal(f.settles[0].status,'applied')
+  assert.equal(f.registrations.length,1)
+})
+test('a failed read-only registration lookup can recover later without another registration',async()=>{
+  const f=fixture();let reads=0
+  f.setRegisterHandler(async()=>{throw new NativeHelperError('lost receipt',true)})
+  const original=f.mon.helper
+  f.mon.helper=async request=>{
+    if(request.action==='reply_registration_lookup'){
+      if(++reads===1)throw Error('temporary read failure')
+      return {ok:true,found:true,id:'form1',status:'open',expires:Date.now()/1000+3600}
+    }
+    return original(request)
+  }
+  await f.register();await f.mon.pumpReplies()
+  assert.equal(f.record.reply,undefined)
+  assert.deepEqual(f.polls.at(-1).absent,[])
+  await f.mon.pumpReplies()
+  assert.equal(f.record.reply?.id,'form1')
+  assert.equal(f.registrations.length,1)
+  assert.equal(reads,2)
+})
+for(const mode of ['missing','terminal','malformed','changed request','lookup failure','disposed']) test('registration recovery stays fail-closed on '+mode,async()=>{
+  const f=fixture();f.setRegisterHandler(async()=>{throw new NativeHelperError('lost receipt',true)})
+  const original=f.mon.helper
+  f.mon.helper=async request=>{
+    if(request.action==='reply_registration_lookup'){
+      if(mode==='lookup failure')throw Error('read-only transport gap')
+      if(mode==='missing')return {ok:true,found:false}
+      if(mode==='malformed')return {ok:true,found:true,id:'form1'}
+      if(mode==='disposed')f.mon.dispose()
+      return {ok:true,found:true,id:'form1',status:mode==='terminal'?'expired':'open',expires:Date.now()/1000+3600}
+    }
+    return original(request)
+  }
+  await f.register()
+  if(mode==='changed request')f.snapshot.open_requests=[]
+  await f.mon.pumpReplies()
+  assert.equal(f.record.reply,undefined)
+  assert.equal(f.writes.length,0)
+  assert.equal(f.registrations.length,1)
+  if(mode==='changed request')assert.deepEqual(f.polls.at(-1).absent,['form1'])
 })
 test('canonical serialization preserves arrays and Korean',()=>{
   assert.equal(stableJSON({z:['나','가'],a:1}),'{'+'"a":1,"z":["나","가"]}')
