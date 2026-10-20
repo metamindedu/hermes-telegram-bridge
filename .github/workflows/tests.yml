@@ -88,7 +88,7 @@ jobs:
         working-directory: desktop-plugins/session-complete-telegram
         run: |
           node --check desktop/plugin.js
-          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
+          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs approval_concurrency.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
 
       - name: Full Python bridge and native-install tests
         shell: bash
@@ -99,7 +99,7 @@ jobs:
           else
             CORE_PY="$GITHUB_WORKSPACE/hermes-agent/.venv/bin/python"
           fi
-          "$CORE_PY" -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_canonical_backend test_db_isolation test_canonical_integration test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review
+          "$CORE_PY" -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_approval_concurrency test_canonical_backend test_db_isolation test_canonical_integration test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review
 
   native-pm-container:
     runs-on: ubuntu-latest

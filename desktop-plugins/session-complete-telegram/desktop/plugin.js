@@ -1922,7 +1922,9 @@ export class CompletionMonitor {
         (r.candidate.recoveryId || r.candidate.recoveryGeneration || r.candidate.recoveryRetired))
       const unverified = r => {
         if (r.reply) this.replySweepUnverified.add(r.reply.id)
-        if (r.approval) this.approvalSweepUnverified.add(r.approval.id)
+        for (const slot of this.approvalRecords(r)) {
+          if (slot.approval) this.approvalSweepUnverified.add(slot.approval.id)
+        }
       }
       for (const r of [...this.records.values()]) {
         try {
@@ -1978,16 +1980,20 @@ export class CompletionMonitor {
             // or malformed read. Retire completion recovery before pruning it.
             if (r.candidate && this.recoveryCapable) this.invalidate(r)
             if (r.reply) this.replySweepAbsent.add(r.reply.id)
-            if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+            for (const slot of this.approvalRecords(r)) {
+              if (slot.approval) this.approvalSweepAbsent.add(slot.approval.id)
+            }
             r.sweepAbsent = true
-            if (!r.reply && !r.approval) this.records.delete(r.key)
+            if (!r.reply && !this.hasApprovals(r)) this.records.delete(r.key)
             continue
           }
           r.sweepAbsent = false
           if (row.status !== 'waiting') {
             r.ask = null
             r.canonicalAsk = null
-            if (r.approval) this.approvalSweepAbsent.add(r.approval.id)
+            for (const slot of this.approvalRecords(r)) {
+              if (slot.approval) this.approvalSweepAbsent.add(slot.approval.id)
+            }
             continue
           }
           if (r.canonicalSettled) {
@@ -2004,13 +2010,13 @@ export class CompletionMonitor {
       await this.pumpReplies()
       if (this.lastReplyPollSucceeded) {
         for (const r of [...this.records.values()]) {
-          if (r.sweepAbsent && !r.approval) this.records.delete(r.key)
+          if (r.sweepAbsent && !this.hasApprovals(r)) this.records.delete(r.key)
         }
       }
       await this.pumpApprovals()
       if (this.lastApprovalPollSucceeded) {
         for (const r of [...this.records.values()]) {
-          if (r.sweepAbsent && !r.reply) this.records.delete(r.key)
+          if (r.sweepAbsent && !r.reply && !this.hasApprovals(r)) this.records.delete(r.key)
         }
       }
       await this.pumpFollowups()
@@ -2229,8 +2235,64 @@ export class CompletionMonitor {
       currentAskId = ask?.id || null
       currentAskMethod = ask?.method || null
       if (ask?.method === 'approval') currentAskFingerprint = stableJSON(ask)
-      if (ask?.method === 'approval' && route.connectionId && ask.params?.session_id === r.sid) {
-        if (await this.checkApproval(r, route, row, since, ask)) return
+      // Parallel tools can leave several native approvals open in one session.
+      // Per-SRQ slots change bookkeeping only, never native authority or IDs.
+      const approvals = open.filter(q => q.method === 'approval')
+      if (approvals.length > 100 || new Set(open.map(q => q.id)).size !== open.length) {
+        for (const slot of this.approvalRecords(r)) {
+          if (slot.approval) this.approvalSweepUnverified.add(slot.approval.id)
+        }
+        return
+      }
+      r.approvalSlots ??= new Map()
+      const liveIds = new Set(approvals.map(q => q.id))
+      for (const slot of this.approvalRecords(r)) {
+        if (slot.approval && !liveIds.has(slot.approval.descriptor.request_id)) {
+          this.approvalSweepAbsent.add(slot.approval.id)
+        }
+      }
+      for (const [id, slot] of r.approvalSlots) {
+        if (!slot.approval && !liveIds.has(id)) r.approvalSlots.delete(id)
+      }
+      let firstHandled = false
+      for (const approval of approvals) {
+        if (this.stopped) return
+        if (!route.connectionId || approval.params?.session_id !== r.sid) continue
+        let slot = r.approvalSlots.get(approval.id)
+        if (!slot) {
+          // Even the first request owns its own slot before registration can
+          // fail. Never share clarify/attention ask or transport-fence state.
+          slot = {sid:r.sid, profile:r.profile, connectionId:r.connectionId, ask:null}
+          r.approvalSlots.set(approval.id, slot)
+        }
+        const fingerprint = stableJSON(approval)
+        if (slot.helperWriteBlockedFingerprint === fingerprint || slot.helperWriteBlockedAskId === approval.id) {
+          if (approval === ask) firstHandled = true
+          continue
+        }
+        try {
+          const handled = await this.checkApproval(slot, route, row, since, approval)
+          if (approval === ask) firstHandled = handled
+        } catch (error) {
+          // One oversized/failed request must not hide independent siblings.
+          // Only pre-write reads may retry; unknown writes retain the exact SRQ
+          // fence, and permanent local failures retain their full fingerprint.
+          if (error instanceof NativeHelperError && error.permanent) {
+            slot.helperWriteBlockedFingerprint = fingerprint
+            this.api.notify({kind:'warning', title:'명령 승인 전송 제한',
+              message:'이 승인 요청이 로컬 전송 제한을 초과했습니다. 해당 명령은 Desktop에서 확인해 주세요. 다른 승인 요청은 별도로 처리합니다.'})
+          } else if (error instanceof NativeHelperError && error.ambiguousWrite) {
+            slot.helperWriteBlockedAskId = approval.id
+            this.api.notify({kind:'warning', title:'명령 승인 전송 확인 필요',
+              message:'이 승인 카드의 전송 결과를 확인하지 못해 다시 보내지 않습니다. 해당 요청은 Desktop에서 확인해 주세요.'})
+          }
+          if (slot.approval) this.approvalSweepUnverified.add(slot.approval.id)
+          if (approval === ask) firstHandled = true
+        }
+      }
+      if (firstHandled) {
+        r.ask = {id:ask.id, method:ask.method}
+        return
       }
       if (ask?.method === 'clarify' && route.connectionId && ask.params?.session_id === r.sid) {
         validateReplySnapshot(since)
@@ -2357,8 +2419,16 @@ export class CompletionMonitor {
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
-    const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
-      capability:APPROVAL_CAPABILITY})
+    let heartbeat
+    try {
+      heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
+        capability:APPROVAL_CAPABILITY})
+    } catch {
+      // This admission-only lease operation cannot post a new card. Losing its
+      // receipt must defer registration, not create a card-send no-replay fence.
+      // Registration/notice ambiguity below still propagates to the SRQ slot.
+      return true
+    }
     let registered = {ok:false, reason:'receiver_unavailable'}
     if (heartbeat?.feature_ready === true && heartbeat.version === APPROVAL_COMPAT_VERSION && heartbeat.capability === APPROVAL_CAPABILITY) {
       registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
@@ -2443,12 +2513,21 @@ export class CompletionMonitor {
     return {route,row,snapshot,request:currentRequest,pending:authority.pending,dispatchMode:authority.mode}
   }
 
+  approvalRecords(record = null) {
+    const parents = record ? [record] : [...this.records.values()]
+    return parents.flatMap(parent => [parent, ...(parent.approvalSlots?.values() || [])])
+  }
+
+  hasApprovals(record) {
+    return this.approvalRecords(record).some(slot => slot.approval)
+  }
+
   async pumpApprovals() {
     this.lastApprovalPollSucceeded = false
     // No owned approval means there is no input to deliver. Registration owns
     // its own capability/receiver heartbeat; do not launch idle helper RPCs on
     // every ordinary completion/clarify sweep.
-    if (this.stopped || ![...this.records.values()].some(record => record.approval)) return
+    if (this.stopped || !this.approvalRecords().some(record => record.approval)) return
     try {
       const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
         capability:APPROVAL_CAPABILITY})
@@ -2458,7 +2537,7 @@ export class CompletionMonitor {
     const observations = []
     const unverified = [...this.approvalSweepUnverified]
     const absent = [...this.approvalSweepAbsent]
-    for (const record of this.records.values()) {
+    for (const record of this.approvalRecords()) {
       const bridge = record.approval
       if (!bridge || unverified.includes(bridge.id) || absent.includes(bridge.id)) continue
       try {
@@ -2488,7 +2567,7 @@ export class CompletionMonitor {
     this.lastApprovalPollSucceeded = true
     for (const terminal of polled.terminal || []) {
       if (typeof terminal !== 'string') continue
-      for (const record of this.records.values()) if (record.approval?.id === terminal) record.approval = null
+      for (const record of this.approvalRecords()) if (record.approval?.id === terminal) record.approval = null
     }
     for (const item of polled.items) {
       const bridge = bridges.get(item?.id)
@@ -2512,7 +2591,7 @@ export class CompletionMonitor {
                 receipt.receipt === 'decision_resolved') status = 'applied'
             else if (['expired','rejected','unknown'].includes(receipt?.status)) status = receipt.status
           } catch { /* write boundary is ambiguous; the stored claim is never replayed */ }
-          for (const record of this.records.values()) if (record.approval?.id === item.id) record.approval = null
+          for (const record of this.approvalRecords()) if (record.approval?.id === item.id) record.approval = null
           continue
         }
         // The legacy queue modes retain their original SDK dispatch semantics.
@@ -2567,7 +2646,7 @@ export class CompletionMonitor {
         const settled = await this.helper({action:'approval_settle', capability:APPROVAL_CAPABILITY,
           id:item.id, claim:item.claim, status})
         if (settled?.ok) {
-          for (const record of this.records.values()) if (record.approval?.id === item.id) record.approval = null
+          for (const record of this.approvalRecords()) if (record.approval?.id === item.id) record.approval = null
         }
       } catch { /* applying lease becomes unknown; never replay */ }
     }

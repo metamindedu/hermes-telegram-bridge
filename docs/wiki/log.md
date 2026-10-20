@@ -1,5 +1,11 @@
 # Wiki Log
 
+## 2026-10-20 update | Concurrent native approval diagnosis
+
+- Recorded the session-versus-request identity trap: selecting the first human request and keeping one card state per session masks parallel native approvals. Preserve every original SRQ/queue binding and no-replay boundary while tracking sibling cards independently.
+- Added real simultaneous protected-write producer coverage with mocked Telegram, renderer snapshot/receipt comparison, sibling fault/absence/reconnection tests, and explicit CI selection.
+- Historical terminal rows do not establish how many prompts were missed or reconstruct erased review bodies. Source tests, receiver health, installation/renderer activation and a human Telegram roundtrip remain separate evidence; see [[approval-concurrency]].
+
 ## 2026-10-10 create | Source-management boundaries
 
 - 원격 소스 관리와 운영 반영을 분리하는 결정 및 상주 handler 활성화 함정을 기록했다.

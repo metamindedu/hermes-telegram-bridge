@@ -447,8 +447,10 @@ test('generic native approval producers can register only from a healthy empty p
     const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
     await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
     assert.deepEqual(calls.map(call=>call.action),['approval_owner_heartbeat','approval_register'],key)
-    assert.equal(record.approval?.descriptor.dispatch_mode,'legacyserver_request',key)
-    assert.equal(record.approval?.request.params.pattern_key,key)
+    const slot=record.approvalSlots.get(f.request.id)
+    assert.equal(slot.approval?.descriptor.dispatch_mode,'legacyserver_request',key)
+    assert.equal(slot.approval?.request.params.pattern_key,key)
+    assert.equal(record.approval,null,'approval state must not share the human-question record')
   }
 })
 
