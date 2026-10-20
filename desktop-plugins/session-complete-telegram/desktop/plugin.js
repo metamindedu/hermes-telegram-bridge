@@ -9,6 +9,7 @@ export const APPROVAL_CAPABILITY = 'desktop-command-approval-v6'
 export const COMPLETION_RECOVERY_CAPABILITY = 'desktop-completion-recovery-v1'
 export const COMPLETION_RECOVERY_TTL_MS = 30 * 60_000
 export const APPROVAL_LEASE_MS = 45_000
+const APPROVAL_REGISTRATION_RECOVERY_MS = 120_000
 
 export function stableJSON(value) {
   if (Array.isArray(value)) return '[' + value.map(stableJSON).join(',') + ']'
@@ -1986,6 +1987,7 @@ export class CompletionMonitor {
             if (r.reply) this.replySweepAbsent.add(r.reply.id)
             for (const slot of this.approvalRecords(r)) {
               if (slot.approval) this.approvalSweepAbsent.add(slot.approval.id)
+              this.discardApprovalRegistration(slot)
             }
             r.sweepAbsent = true
             if (!r.reply && !this.hasApprovals(r)) this.records.delete(r.key)
@@ -1997,6 +1999,7 @@ export class CompletionMonitor {
             r.canonicalAsk = null
             for (const slot of this.approvalRecords(r)) {
               if (slot.approval) this.approvalSweepAbsent.add(slot.approval.id)
+              this.discardApprovalRegistration(slot)
             }
             continue
           }
@@ -2252,12 +2255,15 @@ export class CompletionMonitor {
       r.approvalSlots ??= new Map()
       const liveIds = new Set(approvals.map(q => q.id))
       for (const slot of this.approvalRecords(r)) {
+        if (slot.approvalRegistration && !liveIds.has(slot.approvalRegistration.descriptor.request_id)) {
+          this.discardApprovalRegistration(slot)
+        }
         if (slot.approval && !liveIds.has(slot.approval.descriptor.request_id)) {
           this.approvalSweepAbsent.add(slot.approval.id)
         }
       }
       for (const [id, slot] of r.approvalSlots) {
-        if (!slot.approval && !liveIds.has(id)) r.approvalSlots.delete(id)
+        if (!slot.approval && !slot.approvalRegistration && !liveIds.has(id)) r.approvalSlots.delete(id)
       }
       let firstHandled = false
       for (const approval of approvals) {
@@ -2441,6 +2447,7 @@ export class CompletionMonitor {
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
+    if (r.approvalRegistration) return true
     let heartbeat
     try {
       heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
@@ -2453,23 +2460,46 @@ export class CompletionMonitor {
     }
     let registered = {ok:false, reason:'receiver_unavailable'}
     if (heartbeat?.feature_ready === true && heartbeat.version === APPROVAL_COMPAT_VERSION && heartbeat.capability === APPROVAL_CAPABILITY) {
-      registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
+      const started = this.now()
+      r.approvalRegistration = {descriptor:structuredClone(descriptor), request:structuredClone(ask),
+        pending:structuredClone(pending), requestFingerprint, pendingFingerprint, route:{...route},
+        recoveryStarted:started, recoveryDeadline:started + APPROVAL_REGISTRATION_RECOVERY_MS}
+      try { registered = await this.helper({action:'approval_register', capability:APPROVAL_CAPABILITY,
         owner:this.replyOwner, descriptor, request:ask, pending, route:{
           mode:route.mode, connectionId:route.connectionId, profile:route.profile, targetProfile:route.targetProfile
-        }, session:{id:row.id, session_key:row.session_key, status:row.status}, epoch:since.epoch})
+        }, session:{id:row.id, session_key:row.session_key, status:row.status}, epoch:since.epoch}) }
+      catch (error) {
+        if (!(error instanceof NativeHelperError) || !error.ambiguousWrite || error.permanent) r.approvalRegistration = null
+        throw error
+      }
     }
-    if (registered?.ok === true && typeof registered.id === 'string' &&
+    if (registered?.ok === true && !registered.duplicate && typeof registered.id === 'string' &&
         ['posting','open','queued','applying'].includes(registered.status)) {
+      r.approvalRegistration = null
       r.approval = {id:registered.id, descriptor, request:ask, pending,
         requestFingerprint, pendingFingerprint, route:{...route}}
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
-    if (registered?.reason === 'prior_owner' || registered?.duplicate || registered?.status &&
+    if (registered?.reason === 'prior_owner' || registered?.status &&
         ['expired','rejected','unknown','applied'].includes(registered.status)) {
+      r.approvalRegistration = null
+      r.helperWriteBlockedAskId = ask.id
       r.ask = {id:ask.id, method:'approval'}
       return true
     }
+    const prewrite = registered?.feature_ready === false ||
+      ['receiver_unavailable','owner_unavailable','capacity','destination_mismatch','invalid_descriptor',
+        'stale_snapshot','fingerprint_mismatch','timeout_unavailable','approval_expired',
+        'approval_result_too_large','immutable_mismatch','invalid_review_text','disabled'].includes(registered?.reason) ||
+      /^(review_|redaction_)/u.test(registered?.reason || '')
+    if (r.approvalRegistration && !prewrite) {
+      // The card may already exist. Retry only its read-only exact binding lookup.
+      r.helperWriteBlockedAskId = ask.id
+      r.ask = {id:ask.id, method:'approval'}
+      return true
+    }
+    r.approvalRegistration = null
     // Once the pair is supported, no failure category may re-enter generic
     // attention with command text. Unknown/malformed failures are guidance-only.
     const notice = await this.helper({action:'approval_notice', capability:APPROVAL_CAPABILITY,
@@ -2541,20 +2571,73 @@ export class CompletionMonitor {
   }
 
   hasApprovals(record) {
-    return this.approvalRecords(record).some(slot => slot.approval)
+    return this.approvalRecords(record).some(slot => slot.approval || slot.approvalRegistration)
+  }
+
+  discardApprovalRegistration(record) {
+    const pending = record.approvalRegistration
+    if (!pending) return
+    record.helperWriteBlockedAskId = pending.descriptor.request_id
+    record.approvalRegistration = null
+  }
+
+  approvalRegistrationExpired(pending) {
+    return !Number.isFinite(pending.recoveryStarted) || !Number.isFinite(pending.recoveryDeadline) ||
+      this.now() < pending.recoveryStarted || this.now() >= pending.recoveryDeadline
+  }
+
+  async recoverApprovalRegistration(record) {
+    const pending = record.approvalRegistration
+    if (!pending || record.approval || this.stopped) return
+    const expired = () => this.approvalRegistrationExpired(pending)
+    if (expired()) { this.discardApprovalRegistration(record); return }
+    try {
+      const found = await this.helper({action:'approval_registration_lookup', capability:APPROVAL_CAPABILITY,
+        owner:this.replyOwner, descriptor:pending.descriptor, request:pending.request, pending:pending.pending})
+      if (this.stopped || record.approvalRegistration !== pending || record.approval) return
+      if (expired()) { this.discardApprovalRegistration(record); return }
+      if (!exactKeys(found, ['ok','found','id','status','expires']) || found.ok !== true || found.found !== true ||
+          typeof found.id !== 'string' || !/^[0-9a-f]{32}$/u.test(found.id) ||
+          !['open','queued'].includes(found.status) || !Number.isFinite(found.expires) || Date.now() >= found.expires * 1000) return
+      const bridge = {id:found.id, ...pending}
+      let current
+      try { current = await this.approvalSnapshot(bridge) }
+      catch {
+        if (!this.stopped && record.approvalRegistration === pending) this.approvalSweepUnverified.add(found.id)
+        return
+      }
+      if (this.stopped || record.approvalRegistration !== pending || record.approval) return
+      if (expired()) { this.discardApprovalRegistration(record); return }
+      if (!current) {
+        this.approvalSweepAbsent.add(found.id)
+        this.discardApprovalRegistration(record)
+        return
+      }
+      record.approval = bridge
+      record.approvalRegistration = null
+      // Do not clear any registration/application write fence or send again.
+    } catch { /* only the read-only lookup may retry */ }
   }
 
   async pumpApprovals() {
     this.lastApprovalPollSucceeded = false
+    // Local payload retention is bounded even while receiver/heartbeat reads fail.
+    for (const record of this.approvalRecords()) {
+      if (record.approvalRegistration && this.approvalRegistrationExpired(record.approvalRegistration)) {
+        this.discardApprovalRegistration(record)
+      }
+    }
     // No owned approval means there is no input to deliver. Registration owns
     // its own capability/receiver heartbeat; do not launch idle helper RPCs on
     // every ordinary completion/clarify sweep.
-    if (this.stopped || !this.approvalRecords().some(record => record.approval)) return
+    if (this.stopped || !this.approvalRecords().some(record => record.approval || record.approvalRegistration)) return
     try {
       const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
         capability:APPROVAL_CAPABILITY})
       if (heartbeat?.feature_ready !== true || heartbeat.version !== APPROVAL_COMPAT_VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) return
     } catch { return }
+    for (const record of this.approvalRecords()) await this.recoverApprovalRegistration(record)
+    if (this.stopped) return
     const bridges = new Map()
     const observations = []
     const unverified = [...this.approvalSweepUnverified]

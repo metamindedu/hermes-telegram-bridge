@@ -16,13 +16,14 @@ function fixture() {
     description:'synthetic protected edit '+char,pattern_key:'protected_instruction_file',
     pattern_keys:['protected_instruction_file'],allow_session:false,allow_permanent:false,choices:['once','deny']}}))
   let open=asks
+  let active=[row]
   const queue=asks.map(ask=>Object.fromEntries(Object.entries(ask.params).filter(([key])=>!['session_id','choices'].includes(key))))
   const calls=[]
   const monitor=new CompletionMonitor({state:{profile:{get:()=>route.profile}},profileRoutes:async()=>[route],
     requestProfile:async(_route,method)=>{
       if(method==='session.events.since')return {epoch:'fixture-epoch',open_requests:open}
       if(method==='approval.pending')return {approvals:queue.filter(q=>open.some(a=>a.params.request_id===q.request_id))}
-      if(method==='session.active_list')return {sessions:[row]}
+      if(method==='session.active_list')return {sessions:active}
       throw new Error('unexpected RPC '+method)
     },notify:()=>{}},{setTimeout:()=>()=>{}})
   monitor.approvalCapable=true
@@ -35,8 +36,108 @@ function fixture() {
   }
   const record={key:'parent',sid:row.id,profile:route.profile,connectionId:route.connectionId,seq:0,ask:null,askChecking:false}
   monitor.records.set(record.key,record)
-  return {monitor,record,route,row,asks,calls,setOpen:value=>{open=value}}
+  return {monitor,record,route,row,asks,calls,setOpen:value=>{open=value},setActive:value=>{active=value}}
 }
+
+for (const mode of ['lost receipt','structured failure','post-publication store failure','malformed success','unbound duplicate']) test('approval registration bookkeeping recovers after '+mode+' without a second send',async()=>{
+  const f=fixture(),helper=f.monitor.helper
+  f.setOpen([f.asks[0]])
+  let writes=0,reads=0
+  f.monitor.helper=async req=>{
+    if(req.action==='approval_register'){
+      writes++
+      f.calls.push(req)
+      if(mode==='lost receipt')throw new NativeHelperError('lost receipt',true)
+      if(mode==='post-publication store failure')return {ok:false,reason:'approval_store_unavailable'}
+      if(mode==='unbound duplicate')return {ok:true,duplicate:true,id:'1'.repeat(32),status:'open'}
+      return mode==='structured failure'?{ok:false,reason:'RuntimeError'}:{ok:true}
+    }
+    if(req.action==='approval_registration_lookup'){
+      reads++
+      return {ok:true,found:true,id:'1'.repeat(32),status:'open',expires:Date.now()/1000+300}
+    }
+    return helper(req)
+  }
+  await f.monitor.checkAsk(f.record,f.route,f.row)
+  assert.equal(f.monitor.approvalRecords().filter(r=>r.approval).length,0)
+  await f.monitor.pumpApprovals()
+  assert.equal(f.monitor.approvalRecords().filter(r=>r.approval).length,1)
+  assert.equal(writes,1)
+  assert.equal(reads,1)
+  assert.deepEqual(f.calls.find(c=>c.action==='approval_poll').observations.map(x=>x.id),['1'.repeat(32)])
+  await f.monitor.checkAsk(f.record,f.route,f.row)
+  assert.equal(writes,1)
+})
+
+for(const mode of ['read failure','changed request','terminal','malformed','disposed']) test('approval registration recovery stays fenced on '+mode,async()=>{
+  const f=fixture(),helper=f.monitor.helper
+  f.setOpen([f.asks[0]])
+  let writes=0,reads=0
+  f.monitor.helper=async req=>{
+    if(req.action==='approval_register'){writes++;throw new NativeHelperError('lost receipt',true)}
+    if(req.action==='approval_registration_lookup'){
+      reads++
+      if(mode==='read failure'&&reads===1)throw Error('read gap')
+      if(mode==='disposed')f.monitor.dispose()
+      if(mode==='malformed')return {ok:true,found:true,id:'bad'}
+      return {ok:true,found:true,id:'1'.repeat(32),status:mode==='terminal'?'expired':'open',expires:Date.now()/1000+300}
+    }
+    return helper(req)
+  }
+  await f.monitor.checkAsk(f.record,f.route,f.row)
+  if(mode==='changed request')f.setOpen([])
+  await f.monitor.pumpApprovals()
+  assert.equal(f.monitor.approvalRecords().filter(r=>r.approval).length,0)
+  assert.equal(writes,1)
+  if(mode==='read failure'){
+    await f.monitor.pumpApprovals()
+    assert.equal(f.monitor.approvalRecords().filter(r=>r.approval).length,1)
+    assert.equal(writes,1)
+    assert.equal(reads,2)
+  }
+  if(mode==='changed request')assert.deepEqual(f.calls.find(c=>c.action==='approval_poll').absent,['1'.repeat(32)])
+})
+
+for(const mode of ['deadline','receiver unavailable','native absence','parent absence','parent no longer waiting']) test('unrecoverable approval registration payload is bounded on '+mode,async()=>{
+  const f=fixture(),helper=f.monitor.helper
+  f.setOpen([f.asks[0]])
+  let clock=1000,writes=0,reads=0
+  f.monitor.now=()=>clock
+  f.monitor.helper=async req=>{
+    if(req.action==='approval_register'){writes++;throw new NativeHelperError('lost receipt',true)}
+    if(req.action==='approval_registration_lookup'){reads++;return {ok:true,found:false}}
+    return helper(req)
+  }
+  await f.monitor.checkAsk(f.record,f.route,f.row)
+  const slot=f.record.approvalSlots.get(f.asks[0].id)
+  await f.monitor.pumpApprovals()
+  assert.ok(slot.approvalRegistration,'a transient miss alone is not native absence')
+  if(mode==='deadline'||mode==='receiver unavailable'){
+    clock+=120_001
+    if(mode==='receiver unavailable'){
+      const current=f.monitor.helper
+      f.monitor.helper=async req=>req.action==='approval_owner_heartbeat'?{ok:false,feature_ready:false}:current(req)
+    }
+    await f.monitor.pumpApprovals()
+  }else if(mode==='native absence'){
+    f.setOpen([]);await f.monitor.checkAsk(f.record,f.route,f.row)
+  }else{
+    if(mode==='parent absence')f.setActive([])
+    else f.row.status='idle'
+    await f.monitor.sweep()
+  }
+  assert.equal(slot.approvalRegistration,null)
+  const oldReads=reads
+  await f.monitor.pumpApprovals()
+  assert.equal(reads,oldReads,'terminal bookkeeping must not keep querying')
+  if(mode==='deadline'){
+    f.setOpen([f.asks[0]])
+    await f.monitor.checkAsk(f.record,f.route,f.row)
+    assert.equal(slot.helperWriteBlockedAskId,f.asks[0].id)
+  }
+  if(mode==='parent absence')assert.equal(f.monitor.records.size,0)
+  assert.equal(writes,1,'cleanup must not permit a second registration write')
+})
 
 test('parallel native approvals each register before either request is settled',async()=>{
   const f=fixture()

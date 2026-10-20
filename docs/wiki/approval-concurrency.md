@@ -1,7 +1,7 @@
 ---
 title: Concurrent native approval cards
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 type: gotcha
 tags: [operations, testing, ownership]
 ---
@@ -17,5 +17,11 @@ Test at the actual producer boundary: open two real protected-write requests tog
 Do not infer the complete historical count from terminal inbox rows: terminal cleanup removes request/review bodies, and cards settled from Desktop are edited to a command-free terminal status. A healthy configuration, fresh receiver heartbeat, successful Telegram send, renderer activation and human acceptance are separate facts.
 
 The supported suite splits guarded bridge tests from native PM container tests. Running native installation inside the canonical child-process guard can correctly fail on a different managed uv executable; preserve that failed run rather than weakening the guard. The PM container uses a read-only root, no host profile/auth/DB mounts and an owned scratch volume.
+
+An unknown card is not a proven native absence. Preserve an unverified **open** card inert under its original absolute lifetime and the same live owner/receiver; ensure the freshness-denial marker survives the next housekeeping pass instead of accidentally becoming immediate expiry. Never rescue a queued decision after observation/lease failure or an ambiguous application write through this mechanism. Lost registration bookkeeping may be recovered only through an exact same-owner read-only lookup followed by a fresh native snapshot; this is not retransmission, owner transfer, terminal revival or canonical-registration recovery. Existing CLI deadlines remain separate.
+
+A failed flush can overwrite an already-published registration result with a generic store error: the reason alone is not proof of prewrite failure. Retain the no-replay fence and read-only recovery path. Bound raw recovery bookkeeping to two minutes from the original attempt, with cleanup before receiver I/O and on verified native request/session absence; retain only the minimal same-request write fence afterward. Do not treat a transient lookup miss as proven absence.
+
+The inbox's last-seen timestamp is not a terminal-transition timestamp. Compare current native request/queue/epoch fingerprints read-only, but do not calculate a historical expiry interval from last-seen or claim that a later healthy snapshot proves an unrecorded timeout.
 
 See [[runtime-boundaries]] and [[completion-recovery]].

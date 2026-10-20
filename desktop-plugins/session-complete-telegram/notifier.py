@@ -1154,7 +1154,7 @@ def dispatch_request(req, *, root=ROOT, state=STATE, native=False, result_budget
             else:
                 result = reply_bridge.helper(req, sys.modules[__name__], root=root, state=state,
                                              result_budget=result_budget if native else None)
-        elif action in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
+        elif action in {"approval_owner_heartbeat", "approval_register", "approval_registration_lookup", "approval_poll", "approval_settle",
                         "approval_notice", "approval_claim_valid", "canonical_approval_observe",
                         "approval_native_observe", "approval_native_apply"}:
             gateway = _sibling_module("telegram_integration")

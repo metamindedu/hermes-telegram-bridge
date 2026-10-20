@@ -180,8 +180,8 @@ def _prune(c, now):
         status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
         _retire(c, row, status, now)
-    for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching') AND seen<?",
-                         (now - LEASE,)).fetchall():
+    for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching') AND seen<? AND NOT(status='open' AND seen=?)",
+                         (now - LEASE, STALE_SEEN)).fetchall():
         status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
         _retire(c, row, status, now)
@@ -1030,6 +1030,53 @@ def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=N
     return {**result, "id": approval_id, "status": result.get("status", "unknown"), "expires": expires}
 
 
+def lookup_registration(req, notifier, *, root=ROOT, state=STATE, now=None):
+    """Read only: recover bookkeeping for this exact owner's published card.
+
+    This never observes native authority, renews freshness, flushes or sends.
+    A caller must validate its live request before the ordinary poll gates.
+    """
+    missing = {"ok": True, "found": False}
+    now = time.time() if now is None else now
+    descriptor, request, pending = req.get("descriptor"), req.get("request"), req.get("pending")
+    try:
+        if (not _validate_descriptor(descriptor) or req.get("owner") != descriptor["owner"] or
+                _digest(request) != descriptor["request_fingerprint"] or
+                _digest(pending) != descriptor["pending_fingerprint"] or
+                not notifier.action_enabled("approvals_enabled", root=root)):
+            return missing
+        c = connect_readonly(state)
+        if c is None:
+            return missing
+        try:
+            c.execute("BEGIN")
+            row = c.execute("SELECT * FROM approvals WHERE identity=?", (_digest(_identity_base(descriptor)),)).fetchone()
+            live = _receiver(c, now)
+            if (not row or row["status"] not in {"open", "queued"} or row["expires"] <= now or
+                    row["created"] > now or row["owner"] != descriptor["owner"] or
+                    not _owner_live(c, descriptor["owner"], now) or not live or
+                    row["boot"] != live["boot"] or row["claim"] is not None or row["deadline"] is not None or
+                    type(row["message_id"]) is not int or row["message_id"] <= 0 or not row["review_text"] or
+                    (row["bot"], row["chat"], row["topic"]) != (live["bot"], live["chat"], live["topic"]) or
+                    canonical(json.loads(row["descriptor"])) != canonical(descriptor) or
+                    canonical(json.loads(row["request_json"])) != canonical(request) or
+                    canonical(json.loads(row["pending_json"])) != canonical(pending) or
+                    row["request_fingerprint"] != descriptor["request_fingerprint"] or
+                    row["pending_fingerprint"] != descriptor["pending_fingerprint"]):
+                return missing
+            if not ((row["status"] == "open" and row["seen"] == STALE_SEEN) or
+                    0 <= now - row["seen"] <= LEASE):
+                return missing
+            token, chat, topic = notifier.credentials(root)
+            if (int(token.split(":", 1)[0]), chat, topic) != (row["bot"], row["chat"], row["topic"]):
+                return missing
+            return {"ok": True, "found": True, "id": row["id"], "status": row["status"], "expires": row["expires"]}
+        finally:
+            c.close()
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, RecursionError):
+        return missing
+
+
 def _keyboard(row):
     return {"inline_keyboard": [[
         {"text": "Allow Once", "callback_data": PREFIX + row["token"] + ":o"},
@@ -1267,10 +1314,21 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
                 elif row["status"] == "open":
                     c.execute("UPDATE approvals SET seen=? WHERE id=?", (STALE_SEEN, row["id"]))
                 continue
-            if row["id"] in definitive_absent or row["id"] not in by_id:
+            if row["id"] in definitive_absent:
                 status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
                 _retire(c, row, status, now)
+                continue
+            if row["id"] not in by_id:
+                # An in-flight/lost registration receipt is not native absence.
+                # Open cards are inert until a full fresh observation; accepted
+                # choices and ambiguous application writes remain terminal.
+                if row["status"] == "open":
+                    c.execute("UPDATE approvals SET seen=? WHERE id=?", (STALE_SEEN, row["id"]))
+                elif row["status"] == "queued":
+                    _retire(c, row, "rejected", now)
+                elif row["status"] in {"applying", "dispatching"}:
+                    _retire(c, row, "unknown", now)
                 continue
             if not _observation_matches(row, by_id[row["id"]]):
                 if row["status"] == "queued":
@@ -1732,7 +1790,7 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
         return {"ok": False, "reason": "capability_mismatch"}
     if action == "approval_notice":
         return approval_notice(req, notifier, root=root, state=state)
-    if action not in {"approval_owner_heartbeat", "approval_register", "approval_poll", "approval_settle",
+    if action not in {"approval_owner_heartbeat", "approval_register", "approval_registration_lookup", "approval_poll", "approval_settle",
                       "approval_claim_valid", "canonical_approval_observe", "approval_native_observe",
                       "approval_native_apply"}:
         return {"ok": False, "reason": "unknown_approval_action"}
@@ -1765,6 +1823,8 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
                                req.get("authority"), req.get("deadline"), root=root, state=state)
         if action == "approval_owner_heartbeat":
             return owner_heartbeat(req.get("owner"), state=state)
+        if action == "approval_registration_lookup":
+            return lookup_registration(req, notifier, root=root, state=state)
         if action == "approval_register":
             result = register(req, notifier, root=root, state=state, result_budget=result_budget)
             if result.get("status") in ("open", "queued", "applying", *TERMINAL):

@@ -13,6 +13,63 @@ CORE_GENERATION_REFS={
     'installed':'d923a5eb487a17c0a68801bba9ef0f56c81040a8',
 }
 
+class NativeApprovalRegistrationRecoveryTests(unittest.TestCase):
+    def test_registered_cli_lost_registration_lookup_observe_choose_and_settle_once(self):
+        self._run_native_registration_recovery()
+
+    def test_post_publication_flush_failure_is_recovered_without_another_registration(self):
+        self._run_native_registration_recovery(fail_flush=True)
+
+    def _run_native_registration_recovery(self,fail_flush=False):
+        fixture_module=importlib.import_module('test_completion_recovery')
+        native=fixture_module.CompletionRecoveryTests();self.addCleanup(native.doCleanups);native.setUp()
+        (native.home/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: true\napprovals:\n  timeout: 300\n',encoding='utf-8')
+        bridge=importlib.import_module(native.name+'.approval_bridge')
+        now=time.time();owner='native-registration-owner'
+        bridge.bind_receiver(123456,99,None,'native-boot',private_verified=True,state=native.state,now=now)
+        bridge.owner_heartbeat(owner,state=native.state,now=now)
+        request,pending=ApprovalBridgeTests.pair(sid='native-runtime')
+        route={'mode':'local','connectionId':'local','profile':'default','targetProfile':'default'}
+        session={'id':'native-runtime','session_key':native.sid,'status':'waiting'}
+        descriptor={'owner':owner,'connectionId':'local','profile':'default','targetProfile':'default',
+                    'sid':session['id'],'session_key':session['session_key'],'epoch':'native-epoch',
+                    'request_id':request['id'],'queue_id':pending['request_id'],'dispatch_mode':'legacyqueue',
+                    'request_fingerprint':bridge._digest(request),'pending_fingerprint':bridge._digest(pending)}
+        sent=[]
+        def telegram(_token,method,payload):
+            if method=='sendMessage':sent.append(1)
+            return {'ok':True,'result':{'message_id':801,'chat':{'id':99,'type':'private'},
+                    'text':payload['text'],'from':{'id':123456,'is_bot':True}}}
+        def invoke(action,**fields):
+            return native.invoke({'action':action,'capability':bridge.CAPABILITY,'owner':owner,**fields})
+        with patch.object(native.notifier,'credentials',return_value=(fixture_module.TOKEN,99,None)),patch.object(native.notifier,'telegram',side_effect=telegram):
+            # Discard the caller receipt after the real native handler published.
+            with patch.object(bridge,'flush',side_effect=RuntimeError('synthetic post-publication failure')) if fail_flush else patch.object(bridge,'flush',wraps=bridge.flush):
+                receipt=invoke('approval_register',descriptor=descriptor,request=request,pending=pending,route=route,session=session,epoch='native-epoch')
+            if fail_flush:self.assertEqual(receipt,{'ok':False,'reason':'approval_store_unavailable'})
+            with bridge.connect(native.state) as c:
+                row=dict(c.execute('SELECT * FROM approvals').fetchone())
+            self.assertEqual(row['status'],'open');fid=row['id']
+            invoke('approval_poll',observations=[],unverified=[],absent=[])
+            invoke('approval_owner_heartbeat')
+            path=native.state/'approval-inbox/approvals.sqlite3';before=path.read_bytes()
+            found=invoke('approval_registration_lookup',descriptor=descriptor,request=request,pending=pending)
+            self.assertEqual(found,{'ok':True,'found':True,'id':fid,'status':'open','expires':row['expires']})
+            self.assertEqual(path.read_bytes(),before)
+            observation={'id':fid,'request_fingerprint':descriptor['request_fingerprint'],
+                         'pending_fingerprint':descriptor['pending_fingerprint'],'authority':bridge._digest(descriptor)}
+            invoke('approval_poll',observations=[observation],unverified=[],absent=[])
+            identity={'bot':123456,'boot':'native-boot','chat':99,'user':99,'topic':None,'mid':801,
+                      'private':True,'human':True,'bot_author':True,'forwarded':False,'edited':False,
+                      'inline':False,'inaccessible':False,'message_text':row['review_text'],'event':'native-choice-once'}
+            self.assertTrue(bridge.choose(row['token'],'once',identity,state=native.state)['ok'])
+            item=invoke('approval_poll',observations=[observation],unverified=[],absent=[])['items'][0]
+            self.assertEqual(item['descriptor'],descriptor)
+            self.assertTrue(invoke('approval_settle',id=fid,claim=item['claim'],status='applied')['ok'])
+            self.assertFalse(invoke('approval_registration_lookup',descriptor=descriptor,request=request,pending=pending)['found'])
+            self.assertEqual(sent,[1])
+
+
 class ApprovalBridgeTests(unittest.TestCase):
     def setUp(self):
         self.temp=test_support.temporary_directory(prefix='approval-bridge-');self.addCleanup(self.temp.cleanup)
@@ -140,6 +197,52 @@ class ApprovalBridgeTests(unittest.TestCase):
         result=self.register();self.assertTrue(result.get('ok'),result);self.assertEqual(result['status'],'open')
         self.now=time.time()+.01
         return result
+
+    def test_unmentioned_open_card_is_unknown_and_heartbeat_does_not_expire_it(self):
+        result=self.register();fid=result['id'];before=self.row(fid)
+        held=b.poll(self.owner,[],state=self.state,now=self.now+1)
+        self.assertEqual(held['items'],[])
+        self.assertEqual(self.row(fid)['status'],'open')
+        self.assertEqual(self.row(fid)['seen'],b.STALE_SEEN)
+        self.assertFalse(b.choose(before['token'],'once',self.identity(fid),state=self.state,now=self.now+2)['ok'])
+        b.owner_heartbeat(self.owner,state=self.state,now=self.now+3)
+        self.assertEqual(self.row(fid)['status'],'open')
+        renewed=b.poll(self.owner,[self.observe(fid)],state=self.state,now=self.now+4)
+        self.assertEqual(renewed['items'],[])
+        self.assertEqual(self.row(fid)['expires'],before['expires'])
+        self.assertEqual(self.row(fid)['seen'],self.now+4)
+        self.assertEqual(len([x for x in self.calls if x[0]=='sendMessage']),1)
+
+    def test_unverified_open_card_survives_next_heartbeat_but_not_explicit_absence(self):
+        result=self.register();fid=result['id'];before=self.row(fid)
+        b.poll(self.owner,[],unverified=[fid],state=self.state,now=self.now+1)
+        b.owner_heartbeat(self.owner,state=self.state,now=self.now+2)
+        self.assertEqual(self.row(fid)['status'],'open')
+        self.assertEqual(self.row(fid)['expires'],before['expires'])
+        b.poll(self.owner,[],absent=[fid],state=self.state,now=self.now+3)
+        self.assertEqual(self.row(fid)['status'],'expired')
+
+    def test_registration_lookup_is_read_only_exact_owner_and_never_revives(self):
+        fid=self.register()['id'];before=self.row(fid)
+        req={'owner':self.owner,'descriptor':self.descriptor,'request':self.request,'pending':self.pending}
+        path=self.state/'approval-inbox/approvals.sqlite3';original=path.read_bytes()
+        found=b.lookup_registration(req,notifier,root=self.root,state=self.state,now=self.now+1)
+        self.assertEqual(found,{'ok':True,'found':True,'id':fid,'status':'open','expires':before['expires']})
+        self.assertEqual(path.read_bytes(),original)
+        for field in self.descriptor:
+            changed=copy.deepcopy(req);changed['descriptor'][field]='foreign'
+            self.assertFalse(b.lookup_registration(changed,notifier,root=self.root,state=self.state,now=self.now+1)['found'])
+        self.assertEqual(path.read_bytes(),original)
+        for field,value in [('status','posting'),('status','applying'),('status','dispatching'),
+                            ('status','expired'),('status','unknown'),('message_id',None),('boot','foreign')]:
+            with b.connect(self.state) as c:c.execute('UPDATE approvals SET '+field+'=? WHERE id=?',(value,fid))
+            original=path.read_bytes()
+            self.assertFalse(b.lookup_registration(req,notifier,root=self.root,state=self.state,now=self.now+1)['found'])
+            self.assertEqual(path.read_bytes(),original)
+            with b.connect(self.state) as c:c.execute('UPDATE approvals SET '+field+'=? WHERE id=?',(before[field],fid))
+        self.assertFalse(b.lookup_registration(req,notifier,root=self.root,state=self.state,now=self.now+b.LEASE+1)['found'])
+        self.assertFalse(b.lookup_registration(req,notifier,root=self.root,state=self.state/'missing',now=self.now)['found'])
+        self.assertFalse((self.state/'missing').exists())
 
     def test_native_approval_pair_uses_live_request_and_queue_not_detector_membership(self):
         from tools.approval_detection import detect_dangerous_command

@@ -399,9 +399,12 @@ test('unsafe approval registration reasons from checkAsk only reach notification
     const r={sid:f.row.id,ask:null,approval:null,askChecking:false}
     await monitor.checkAsk(r,f.route,{...f.row,status:'waiting'},
       {epoch:'epoch-1',open_requests:[request]},request)
-    assert.deepEqual(calls.map(call=>call.action),['approval_owner_heartbeat','approval_register','approval_notice'],reason)
+    const uncertain=['approval_store_unavailable','AttributeError','unexpected_failure'].includes(reason)
+    assert.deepEqual(calls.map(call=>call.action),uncertain ? ['approval_owner_heartbeat','approval_register'] :
+      ['approval_owner_heartbeat','approval_register','approval_notice'],reason)
     assert.equal(calls.some(call=>call.action==='attention'),false,reason)
-    assert.equal(calls.find(call=>call.action==='approval_notice').reason,reason)
+    if(!uncertain)assert.equal(calls.find(call=>call.action==='approval_notice').reason,reason)
+    else assert.ok(r.approvalSlots.get(request.id).approvalRegistration,reason)
     assert.equal(JSON.stringify(notices).includes(command),false,reason)
     assert.equal(JSON.stringify(notices).includes('synthetic-secret-value-739102'),false,reason)
     assert.equal(r.ask.id,request.id,reason)
@@ -425,7 +428,8 @@ test('supported approval failures never fall into attention even without a typed
     const record={sid:f.row.id,ask:null,approval:null,askChecking:false}
     await monitor.checkAsk(record,f.route,f.row,f.snapshot,f.request)
     assert.deepEqual(calls,variant==='receiver-unready' ? ['approval_owner_heartbeat','approval_notice'] :
-      ['approval_owner_heartbeat','approval_register','approval_notice'],variant)
+      ['approval_owner_heartbeat','approval_register'],variant)
+    if(variant!=='receiver-unready')assert.ok(record.approvalSlots.get(f.request.id).approvalRegistration)
     assert.equal(record.approval,null);assert.equal(record.ask.id,f.request.id)
     assert.equal(JSON.stringify(notices).includes(f.request.params.command),false)
   }
