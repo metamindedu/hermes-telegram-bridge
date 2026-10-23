@@ -1,7 +1,7 @@
 ---
 title: Completion notification recovery boundary
 created: 2026-10-14
-updated: 2026-10-15
+updated: 2026-10-24
 type: decision
 tags: [operations, testing, privacy, ownership]
 ---
@@ -18,6 +18,8 @@ Keep the active target route separate from the default credential owner: the pub
 
 The recovery-only 2026-10-14 source step kept the receiver and approval-v4 protocol at v1.8.0 while package/helper/renderer recovery was independently versioned at 1.8.1. Keep `loaded.version` as the approval compatibility value and require an explicit new recovery capability; the package version alone must never grant the new path. That historical step preserved old 1.8.0 approval-v4 behavior without changing receiver modules. The separate 2026-10-15 approval-coverage candidate retained the recovery capability/state logic and public v1.8.0 fixture while moving the source handshake to v5; the 2026-10-16 plugin-only canonical follow-on moved helper/renderer/receiver together to v6 without changing recovery. See [[runtime-boundaries]] for the three frozen modes, subscription/write boundary and consent gate.
 
+The later local helper-conduit candidate reuses that verified same-source active socket for ordinary fixed helper calls as well. It keeps the explicit-default CLI/native home guards and preserves ordinary local-default fallback when no eligible active socket exists; it does not transfer recovery's foreground-only/no-warm policy to background notifications. A possibly dispatched write never falls back to a second conduit. The unchanged 45-second leases and cold-start/RPC budgets require their own real latency acceptance, and source RED/GREEN transport coverage is not human interaction proof. See [[../operations|operations]] for this separate candidate contract.
+
 Only an exact attempt's durable pre-request connection failure is retryable. Dispatching, unknown, malformed/lost helper receipts, read/write/protocol errors, and explicit Bot API rejection are not. Existing `sending`, `unknown`, `failed` and `sent` delivery rows are never reset; the same completion-v2 dedupe key arbitrates old and new helper paths. Sender counters are separate from receiver heartbeat and are not delivery proof.
 
-Service/completion OFF retires only unexecuted candidates, and ON waits for cleanup. An in-flight Telegram write cannot be revoked; an external OFF→ON configuration edit that was never observed cannot be retroactively detected. Keep the recovery-only transport policy and operational test recipe in [[../operations|operations]], and do not broaden it to replies, followups or approvals.
+Service/completion OFF retires only unexecuted candidates, and ON waits for cleanup. An in-flight Telegram write cannot be revoked; an external OFF→ON configuration edit that was never observed cannot be retroactively detected. Keep recovery's captured-target/no-cold-dial restrictions and operational test recipe in [[../operations|operations]] separate from ordinary helper conduit selection; the later conduit candidate does not grant recovery authority to replies, followups or approvals.

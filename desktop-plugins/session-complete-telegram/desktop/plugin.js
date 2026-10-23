@@ -656,7 +656,12 @@ export class CompletionMonitor {
     const action = payload && typeof payload.action === 'string' ? payload.action : ''
     const recoveryAction = action.startsWith('completion_recovery_')
     const activeRoute = this.activeLocalRoute(routes)
-    const useActiveSocket = recoveryAction || (action === 'loaded' && activeRoute !== null)
+    // The credential owner stays the explicit --profile default CLI below.
+    // Reuse its already-open same-local-source conduit for ordinary helpers as
+    // well as loaded/recovery; inventory alone does not prove a pooled default
+    // backend is connected. Recovery keeps its stricter target binding below.
+    const useActiveSocket = recoveryAction || (activeRoute !== null &&
+      (action === 'loaded' || typeof this.api.getGateway === 'function'))
     let requestCLI
     if (useActiveSocket) {
       if (!activeRoute || activeRoute.connectionId !== sender[0].connectionId) {

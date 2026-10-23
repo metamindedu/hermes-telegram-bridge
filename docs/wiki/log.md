@@ -1,5 +1,11 @@
 # Wiki Log
 
+## 2026-10-24 local candidate | Fixed helper conduit
+
+- Distinguished route inventory, pooled-profile readiness and the captured already-open local socket. The existing explicit-default native CLI remains the credential owner; local transport reuse does not authorize a different home, source or response replay.
+- Added a transport-mechanism RED/GREEN oracle for ordinary settings/approval helper calls while the default pooled route is unavailable, with unchanged argv/deadlines and foreign/closed/ambiguous/no-fallback negatives. This is not actual SDK or human Telegram acceptance.
+- Kept the recovery-only target/no-warm constraints separate from ordinary helper fallback. Recorded the independent CLI-startup/45-second-lease gate in [[completion-recovery]] and [[../operations|operations]]. Candidate is local; installation and functional signoff require separate evidence.
+
 ## 2026-10-20 update | Concurrent native approval diagnosis
 
 - Recorded the session-versus-request identity trap: selecting the first human request and keeping one card state per session masks parallel native approvals. Preserve every original SRQ/queue binding and no-replay boundary while tracking sibling cards independently.
