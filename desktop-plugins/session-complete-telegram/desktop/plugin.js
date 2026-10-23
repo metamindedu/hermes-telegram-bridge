@@ -2677,6 +2677,8 @@ export class CompletionMonitor {
     for (const item of polled.items) {
       const bridge = bridges.get(item?.id)
       let status = 'rejected'
+      // Fixed diagnostic enums only; never forward exceptions or request payloads.
+      let diagnosticReason = 'renderer_binding'
       try {
         if (!bridge || this.stopped || !['once','deny'].includes(item.choice) ||
             bridge.id !== item.id || typeof item.claim !== 'string' || !/^[0-9a-f]{32}$/u.test(item.claim) ||
@@ -2700,11 +2702,13 @@ export class CompletionMonitor {
           continue
         }
         // The legacy queue modes retain their original SDK dispatch semantics.
+        diagnosticReason = 'renderer_snapshot'
         const fresh = await this.approvalSnapshot(bridge)
         if (!fresh || fresh.dispatchMode !== bridge.descriptor.dispatch_mode || this.stopped || Date.now() >= item.deadline * 1000 ||
             stableJSON(item.request) !== stableJSON(fresh.request) ||
             stableJSON(item.pending) !== stableJSON(fresh.pending)) throw new Error('approval snapshot changed')
         const authority = await approvalFingerprint(bridge.descriptor)
+        diagnosticReason = 'renderer_claim_gate'
         const gate = await this.helper({action:'approval_claim_valid', capability:APPROVAL_CAPABILITY,
           owner:this.replyOwner, id:item.id, claim:item.claim, descriptor:bridge.descriptor,
           authority, deadline:item.deadline})
@@ -2715,8 +2719,10 @@ export class CompletionMonitor {
         }
         // This is the last fresh read, not atomic server-side fingerprint CAS.
         // Recheck local lifetime immediately before starting the one-way RPC.
+        diagnosticReason = 'renderer_lifetime'
         if (this.stopped || Date.now() >= item.deadline * 1000) throw new Error('approval claim expired')
         status = 'unknown'
+        diagnosticReason = 'native_receipt_invalid'
         let receipt
         try {
           if (bridge.descriptor.dispatch_mode === 'legacyqueue') {
@@ -2729,8 +2735,10 @@ export class CompletionMonitor {
               status = 'unknown'
             } else if (receipt.resolved === 1) {
               status = 'applied'
+              diagnosticReason = 'native_resolved'
             } else if (receipt.resolved === 0) {
               status = 'expired'
+              diagnosticReason = 'native_expired'
             } else {
               status = 'unknown'
             }
@@ -2738,18 +2746,27 @@ export class CompletionMonitor {
             receipt = await this.api.requestProfile(fresh.route, 'request.answer', {
               id:bridge.descriptor.request_id, result:{choice:item.choice, all:false}
             }, 15_000)
-            if (exactKeys(receipt, ['status']) && receipt.status === 'expired') status = 'expired'
-            else status = 'unknown' // Gateway acceptance is not child queue settlement or command completion.
+            if (exactKeys(receipt, ['status']) && receipt.status === 'expired') {
+              status = 'expired'
+              diagnosticReason = 'native_expired'
+            }
+            else {
+              status = 'unknown' // Gateway acceptance is not child queue settlement or command completion.
+              if (exactKeys(receipt, ['status']) && receipt.status === 'ok') diagnosticReason = 'native_ack_unconfirmed'
+            }
           } else {
             throw new Error('approval dispatch mode invalid')
           }
-        } catch { throw new Error('approval response unknown') }
+        } catch {
+          diagnosticReason = 'native_rpc_unknown'
+          throw new Error('approval response unknown')
+        }
       } catch {
         if (status !== 'unknown') status = 'rejected'
       }
       try {
         const settled = await this.helper({action:'approval_settle', capability:APPROVAL_CAPABILITY,
-          id:item.id, claim:item.claim, status})
+          id:item.id, claim:item.claim, status, diagnostic_reason:diagnosticReason})
         if (settled?.ok) {
           for (const record of this.approvalRecords()) if (record.approval?.id === item.id) record.approval = null
         }

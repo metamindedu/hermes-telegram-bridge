@@ -211,6 +211,33 @@ approvals:
             'message_text':row['review_text'],'event':event}
         return self.bridge.choose(row['token'],choice,identity,state=self.state,now=max(time.time(),self.now+.1))
 
+    def test_diagnostic_live_claim_reasons_remain_distinct_without_dispatch_or_replay(self):
+        from unittest.mock import patch
+        import newcanonical_backend as backend
+        b=self.bridge
+        for i,(reason,diagnostic) in enumerate([
+            ('claim_lost','canonical_claim_lost'),('binding_changed','binding_mismatch'),
+            ('invalid_descriptor','canonical_descriptor_invalid'),
+            ('approval_store_unavailable','canonical_store_unavailable')]):
+            with self.subTest(reason=reason),patch.object(b.time,'time',return_value=self.now+1):
+                prompt={**self.prompt,'prompt_id':'diagnostic-prompt-'+str(i)}
+                descriptor,pending=self.binding(prompt)
+                with patch.object(backend,'observe_bound',return_value={'ok':True}):
+                    fid=self.register(descriptor,prompt,pending)['id']
+                self.assertTrue(self.tap(fid,event='diagnostic-'+str(i))['ok'])
+                item=b.poll(self.owner,[self.observation(fid)],state=self.state,now=self.now+1)['items'][0]
+                req={'action':'approval_native_apply','capability':b.CAPABILITY,
+                     'owner':self.owner,'id':fid,'claim':item['claim']}
+                with patch.object(b,'_canonical_live_claim',return_value=(False,reason,None)),patch.object(backend,'apply_bound') as native:
+                    first=b.apply_canonical(req,self.notifier,root=self.root,state=self.state)
+                    second=b.apply_canonical(req,self.notifier,root=self.root,state=self.state)
+                    self.assertEqual(native.call_count,0)
+                self.assertEqual(first['reason'],reason)
+                self.assertEqual(first['status'],'expired' if reason=='claim_lost' else 'rejected')
+                self.assertFalse(second['ok'])
+                terminal=b.diagnostics(fid,state=self.state,now=self.now+1)['events'][-1]
+                self.assertEqual(terminal['reason'],diagnostic);self.assertEqual(terminal['source'],'canonical')
+
     def test_same_native_id_new_generation_and_edit_only_replacement_expire_old_card(self):
         from unittest.mock import patch
         import newcanonical_backend as backend

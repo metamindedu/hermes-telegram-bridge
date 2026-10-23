@@ -1,7 +1,7 @@
 ---
 title: Concurrent native approval cards
 created: 2026-10-20
-updated: 2026-10-21
+updated: 2026-10-23
 type: gotcha
 tags: [operations, testing, ownership]
 ---
@@ -23,5 +23,7 @@ An unknown card is not a proven native absence. Preserve an unverified **open** 
 A failed flush can overwrite an already-published registration result with a generic store error: the reason alone is not proof of prewrite failure. Retain the no-replay fence and read-only recovery path. Bound raw recovery bookkeeping to two minutes from the original attempt, with cleanup before receiver I/O and on verified native request/session absence; retain only the minimal same-request write fence afterward. Do not treat a transient lookup miss as proven absence.
 
 The inbox's last-seen timestamp is not a terminal-transition timestamp. Compare current native request/queue/epoch fingerprints read-only, but do not calculate a historical expiry interval from last-seen or claim that a later healthy snapshot proves an unrecorded timeout.
+
+When a callback was accepted but its decision was discarded, correlate the receiver's own profile logs with the card's first terminal reason/time, not its last-seen value. New bounded content-free diagnostics distinguish callback acceptance, Desktop claim and terminal phase; old rows without events remain historically unexplained. Missing/failed diagnostics do not prove no native write, and renderer-reported reasons are hints rather than authority. Preserve the existing no-replay fence and obtain source/activation evidence separately from readiness. See the operations runbook's content-free diagnostics section for retention, read-only lookup and rollback limits.
 
 See [[runtime-boundaries]] and [[completion-recovery]].

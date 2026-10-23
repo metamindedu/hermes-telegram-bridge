@@ -171,3 +171,9 @@
 - Documented exact same-owner read-only legacy registration bookkeeping recovery and unchanged canonical registration/deadline boundaries. Preserve terminal cards and direct the operator to Desktop rather than reviving or replaying them.
 - Post-publication housekeeping can replace a successful registration receipt with a generic store error; that does not establish prewrite failure. Retain read-only recovery/no-replay, bound raw recovery payload retention separately to two minutes, and release on verified native absence without letting a receiver outage prevent local cleanup.
 - Last-seen is not an expiry timestamp. A currently matching pending native request does not reconstruct the original helper result or exact terminal clock. Keep reproduced mechanisms, original-cause confidence, guarded test receipts, independent review and activation claims separate; no private incident payload belongs in this wiki.
+
+## 2026-10-23 update | Callback acceptance is not native dispatch
+
+- Extended approval-concurrency/index and operations with bounded content-free transition diagnostics, first-terminal versus last-seen clocks, explicit availability/read-error distinction, retention/idle-store limits and no backfill of historical reasons.
+- Correlate the specific receiver profile's outage logs with the decision lifecycle; an accepted callback followed by a terminal card does not prove the native write started or identify the unrecorded failure branch. Preserve fail-closed leases/no-replay and treat renderer reasons as stage hints rather than authority.
+- Journal faults must not produce false committed-decision success: isolate recoverable errors with a savepoint and fail if SQLite aborted the enclosing transaction. Read-only incident queries must not initialize schema, renew ownership, prune, flush or send. Source verification is not resident handler activation or human roundtrip evidence.

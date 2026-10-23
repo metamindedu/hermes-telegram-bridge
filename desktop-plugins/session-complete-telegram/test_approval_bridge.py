@@ -67,6 +67,17 @@ class NativeApprovalRegistrationRecoveryTests(unittest.TestCase):
             self.assertEqual(item['descriptor'],descriptor)
             self.assertTrue(invoke('approval_settle',id=fid,claim=item['claim'],status='applied')['ok'])
             self.assertFalse(invoke('approval_registration_lookup',descriptor=descriptor,request=request,pending=pending)['found'])
+            diagnostic_request={'action':'approval_diagnostics','capability':bridge.CAPABILITY,'id':fid}
+            before=path.read_bytes();calls=len(sent)
+            with patch.object(bridge,'flush',side_effect=AssertionError('diagnostics must not flush')):
+                diagnostic=native.invoke(diagnostic_request)
+            self.assertTrue(diagnostic['ok']);self.assertTrue(diagnostic['read_only'])
+            self.assertEqual([e['stage'] for e in diagnostic['events']],['queued','claimed','terminal'])
+            self.assertEqual(diagnostic['events'][-1]['reason'],'renderer_unspecified')
+            self.assertEqual(path.read_bytes(),before);self.assertEqual(len(sent),calls)
+            # Disabling inputs does not disable this content-free incident read.
+            (native.home/'config.yaml').write_text('plugins:\n  enabled: [session-complete-telegram]\n  entries:\n    session-complete-telegram:\n      settings:\n        approvals_enabled: false\n',encoding='utf-8')
+            self.assertEqual(native.invoke(diagnostic_request),diagnostic)
             self.assertEqual(sent,[1])
 
 
@@ -88,6 +99,126 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.cred=patch.object(notifier,'credentials',side_effect=lambda *a,**k:('77:synthetic-token',99,None));self.cred.start()
         self.net=patch.object(notifier,'telegram',side_effect=self.telegram);self.net.start()
         self.addCleanup(self.net.stop);self.addCleanup(self.cred.stop)
+
+    def test_diagnostics_distinguish_queued_lease_lapse_and_preserve_first_terminal(self):
+        fid=self.register()['id'];row=self.row(fid)
+        self.assertTrue(b.choose(row['token'],'once',self.identity(fid),state=self.state,now=self.now+1)['ok'])
+        b.owner_heartbeat(self.owner,state=self.state,now=self.now+b.LEASE+2)
+        events=b.diagnostics(fid,state=self.state,now=self.now+b.LEASE+3)['events']
+        self.assertEqual([(e['stage'],e['source'],e['reason']) for e in events],
+                         [('queued','callback','choice_accepted'),('terminal','prune','observation_lease_lapsed')])
+        self.assertEqual(events[-1]['at'],self.now+b.LEASE+2)
+        self.assertEqual(events[-1]['previous_status'],'queued')
+        self.assertEqual(events[-1]['status'],'rejected')
+        b.owner_heartbeat(self.owner,state=self.state,now=self.now+b.LEASE+4)
+        self.assertEqual(b.diagnostics(fid,state=self.state,now=self.now+b.LEASE+5)['events'],events)
+        self.assertNotIn(self.request['params']['command'],json.dumps(events))
+        self.assertNotIn(row['token'],json.dumps(events))
+        self.assertNotIn('once',json.dumps(events))
+        self.assertEqual(self.row(fid)['status'],'rejected')
+
+    def test_diagnostics_read_is_side_effect_free_and_old_rows_are_not_backfilled(self):
+        fid=self.register()['id'];path=self.state/'approval-inbox/approvals.sqlite3'
+        with b.connect(self.state) as c:c.execute('DROP TABLE approval_diagnostics')
+        before=path.read_bytes();calls=len(self.calls)
+        result=b.helper({'action':'approval_diagnostics','capability':b.CAPABILITY,'id':fid},
+                        notifier,root=self.root,state=self.state)
+        self.assertTrue(result['ok']);self.assertTrue(result['read_only']);self.assertEqual(result['events'],[])
+        self.assertFalse(result['available']);self.assertEqual(path.read_bytes(),before)
+        self.assertEqual(len(self.calls),calls)
+        for bad in [None,'../invalid','a'*31,'a'*33]:
+            self.assertFalse(b.diagnostics(bad,state=self.state)['ok'])
+        missing=self.state/'missing'
+        self.assertTrue(b.diagnostics('a'*32,state=missing)['read_only']);self.assertFalse(missing.exists())
+
+    def test_diagnostics_allowlist_retention_and_failure_do_not_change_decision(self):
+        fid=self.register()['id'];row=self.row(fid)
+        with b.connect(self.state) as c:
+            for i in range(b.MAX_DIAGNOSTICS+4):
+                b._record_diagnostic(c,str(i).zfill(32),'queued','callback','choice_accepted','open','queued',self.now)
+            self.assertEqual(c.execute('SELECT count(*) FROM approval_diagnostics').fetchone()[0],b.MAX_DIAGNOSTICS)
+            b._record_diagnostic(c,fid,'terminal','settle','secret command/token','applying','rejected',self.now)
+            reason=c.execute('SELECT reason FROM approval_diagnostics WHERE approval_id=?',(fid,)).fetchone()[0]
+            self.assertEqual(reason,'unspecified')
+            c.execute('DELETE FROM approval_diagnostics')
+            b._record_diagnostic(c,'b'*32,'queued','callback','choice_accepted','open','queued',self.now-b.DIAGNOSTIC_RETENTION-1)
+            b._record_diagnostic(c,'c'*32,'queued','callback','choice_accepted','open','queued',self.now)
+            self.assertEqual(c.execute('SELECT count(*) FROM approval_diagnostics').fetchone()[0],1)
+            c.execute("CREATE TRIGGER fail_diagnostic BEFORE INSERT ON approval_diagnostics BEGIN SELECT RAISE(ABORT,'fixture'); END")
+        self.assertTrue(b.choose(row['token'],'once',self.identity(fid),state=self.state,now=self.now+1)['ok'])
+        item=b.poll(self.owner,[self.observe(fid)],state=self.state,now=self.now+2)['items'][0]
+        self.assertTrue(b.settle(fid,item['claim'],'applied',state=self.state,now=self.now+3)['ok'])
+        self.assertEqual(self.row(fid)['status'],'applied')
+
+    def test_diagnostics_report_distinct_poll_failures_without_reclaim(self):
+        for i,(kind,reason) in enumerate([('unknown','native_unverified'),('absent','native_absent'),('mismatch','binding_mismatch')]):
+            with self.subTest(kind=kind):
+                request,pending=self.pair(queue_id=str(i)*32,srq='srq-'+str(i)*12)
+                self.request,self.pending=request,pending;self.descriptor=self.descriptor_for()
+                with patch.object(b.time,'time',return_value=self.now):fid=self.register()['id']
+                row=self.row(fid)
+                self.assertTrue(b.choose(row['token'],'once',self.identity(fid,event='event-'+kind),state=self.state,now=self.now+1)['ok'])
+                observations=[self.observe(fid)]
+                args={}
+                if kind=='unknown':observations=[];args={'unverified':[fid]}
+                if kind=='absent':observations=[];args={'absent':[fid]}
+                if kind=='mismatch':observations[0]['request_fingerprint']='0'*64
+                self.assertEqual(b.poll(self.owner,observations,state=self.state,now=self.now+2,**args)['items'],[])
+                terminal=b.diagnostics(fid,state=self.state,now=self.now+3)['events'][-1]
+                self.assertEqual(terminal['reason'],reason);self.assertEqual(terminal['source'],'poll')
+                self.assertEqual(terminal['status'],'rejected')
+                self.assertEqual(b.poll(self.owner,[self.observe(fid)],state=self.state,now=self.now+4)['items'],[])
+
+    def test_diagnostics_transaction_rollback_cannot_report_uncommitted_choice_as_accepted(self):
+        fid=self.register()['id'];row=self.row(fid)
+        with b.connect(self.state) as c:
+            c.execute("CREATE TRIGGER rollback_diagnostic BEFORE INSERT ON approval_diagnostics BEGIN SELECT RAISE(ROLLBACK,'fixture'); END")
+        result=b.choose(row['token'],'once',self.identity(fid),state=self.state,now=self.now+1)
+        self.assertFalse(result['ok']);self.assertEqual(result['reason'],'store_unavailable')
+        self.assertEqual(self.row(fid)['status'],'open')
+        with b.connect(self.state) as c:self.assertEqual(c.execute('SELECT count(*) FROM receipts').fetchone()[0],0)
+
+    def test_diagnostics_store_fault_is_safe_and_does_not_expose_exception(self):
+        with patch.object(b,'connect_readonly',side_effect=b.sqlite3.OperationalError('secret/token')):
+            self.assertEqual(b.diagnostics('a'*32,state=self.state),
+                             {'ok':False,'read_only':True,'reason':'diagnostics_unavailable'})
+
+    def test_diagnostics_separate_absolute_receiver_and_owner_lease_boundaries(self):
+        for i,(kind,reason,source) in enumerate([
+            ('absolute','absolute_expiry','prune'),('receiver','receiver_lease_lapsed','prune'),
+            ('owner','owner_lease_lapsed','owner')]):
+            with self.subTest(kind=kind):
+                self.request,self.pending=self.pair(queue_id=str(i+3)*32,srq='srq-'+str(i+3)*12)
+                self.descriptor=self.descriptor_for()
+                b.bind_receiver(77,99,None,'boot-fixture',private_verified=True,state=self.state,now=self.now)
+                b.owner_heartbeat(self.owner,state=self.state,now=self.now)
+                with patch.object(b.time,'time',return_value=self.now):fid=self.register()['id']
+                row=self.row(fid)
+                self.assertTrue(b.choose(row['token'],'once',self.identity(fid,event='lease-'+kind),state=self.state,now=self.now+1)['ok'])
+                later=self.now+b.LEASE+2
+                with b.connect(self.state) as c:
+                    c.execute('UPDATE approvals SET seen=? WHERE id=?',(later,fid))
+                    if kind=='absolute':c.execute('UPDATE approvals SET expires=? WHERE id=?',(later,fid))
+                    c.execute('UPDATE owners SET seen=? WHERE owner=?',
+                              (self.now if kind=='owner' else later,self.owner))
+                    live=json.loads(c.execute("SELECT value FROM receiver WHERE key='live'").fetchone()[0])
+                    live['at']=self.now if kind=='receiver' else later
+                    c.execute("UPDATE receiver SET value=? WHERE key='live'",(json.dumps(live),))
+                b.owner_heartbeat(self.owner,state=self.state,now=later)
+                terminal=b.diagnostics(fid,state=self.state,now=later)['events'][-1]
+                self.assertEqual((terminal['source'],terminal['reason'],terminal['status']),
+                                 (source,reason,'rejected'))
+
+    def test_fixture_registration_remains_on_one_clock_when_wall_clock_moves(self):
+        # Simulate slow fixture setup/publication without sleeping or touching runtime clocks.
+        with patch.object(b,'time',wraps=time) as clock:
+            clock.time.return_value=self.now+10
+            fid=self.register()['id']
+        row=self.row(fid)
+        result=b.choose(row['token'],'once',self.identity(fid),state=self.state,now=self.now+1)
+        self.assertTrue(result['ok'],{'created_at':row['created'],'seen_at':row['seen'],
+                                    'decision_at':self.now+1,'reason':result.get('reason')})
+        self.assertEqual(row['created'],self.now);self.assertEqual(row['seen'],self.now)
 
     def _assert_core_generation(self):
         import agent.redact as redact
@@ -163,11 +294,15 @@ class ApprovalBridgeTests(unittest.TestCase):
         if method=='editMessageText': return {'ok':True,'result':{'message_id':payload['message_id'],'chat':{'id':99,'type':'private'}}}
         return {'ok':False,'error_code':400,'description':'not modified'}
 
-    def register(self,**overrides):
+    def register(self,*,publication_now=None,**overrides):
         req={'action':'approval_register','capability':b.CAPABILITY,'owner':self.owner,'descriptor':self.descriptor,
             'request':self.request,'pending':self.pending,'route':self.route,'session':self.session,'epoch':'epoch-fixture'}
         req.update(overrides)
-        return b.register(req,notifier,root=self.root,state=self.state,now=self.now)
+        # Registration and mocked publication use one explicit fixture clock.
+        # Replace only approval_bridge's module reference, never global time.
+        with patch.object(b,'time',wraps=time) as clock:
+            clock.time.return_value=self.now if publication_now is None else publication_now
+            return b.register(req,notifier,root=self.root,state=self.state,now=self.now)
 
     def row(self,fid):
         c=b.connect(self.state)
@@ -223,7 +358,9 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.assertEqual(self.row(fid)['status'],'expired')
 
     def test_registration_lookup_is_read_only_exact_owner_and_never_revives(self):
-        fid=self.register()['id'];before=self.row(fid)
+        # Keep publication on the same fixture clock as the explicit lookup time.
+        with patch.object(b.time,'time',return_value=self.now):fid=self.register()['id']
+        before=self.row(fid)
         req={'owner':self.owner,'descriptor':self.descriptor,'request':self.request,'pending':self.pending}
         path=self.state/'approval-inbox/approvals.sqlite3';original=path.read_bytes()
         found=b.lookup_registration(req,notifier,root=self.root,state=self.state,now=self.now+1)
@@ -243,6 +380,39 @@ class ApprovalBridgeTests(unittest.TestCase):
         self.assertFalse(b.lookup_registration(req,notifier,root=self.root,state=self.state,now=self.now+b.LEASE+1)['found'])
         self.assertFalse(b.lookup_registration(req,notifier,root=self.root,state=self.state/'missing',now=self.now)['found'])
         self.assertFalse((self.state/'missing').exists())
+
+    def test_lookup_rejects_a_future_publication_observation_instead_of_relaxing_authority(self):
+        fid=self.register(publication_now=self.now+2)['id']
+        self.assertGreater(self.row(fid)['seen'],self.now+1)
+        req={'owner':self.owner,'descriptor':self.descriptor,'request':self.request,'pending':self.pending}
+        self.assertEqual(b.lookup_registration(req,notifier,root=self.root,state=self.state,now=self.now+1),
+                         {'ok':True,'found':False})
+
+    def test_diagnostics_same_receiver_lease_lapse_is_not_a_rebind_in_either_order(self):
+        for i,kind in enumerate(['bind-first','prune-first','new-boot']):
+            with self.subTest(kind=kind):
+                b.bind_receiver(77,99,None,'boot-fixture',private_verified=True,state=self.state,now=self.now)
+                b.owner_heartbeat(self.owner,state=self.state,now=self.now)
+                self.request,self.pending=self.pair(queue_id=str(i+6)*32,srq='srq-'+str(i+6)*12)
+                self.descriptor=self.descriptor_for()
+                with patch.object(b.time,'time',return_value=self.now):fid=self.register()['id']
+                row=self.row(fid)
+                self.assertTrue(b.choose(row['token'],'once',self.identity(fid,event=kind),state=self.state,now=self.now+1)['ok'])
+                later=self.now+(2 if kind=='new-boot' else b.LEASE+2)
+                with b.connect(self.state) as c:
+                    c.execute('UPDATE approvals SET seen=? WHERE id=?',(later,fid))
+                    c.execute('UPDATE owners SET seen=? WHERE owner=?',(later,self.owner))
+                    if kind=='prune-first':b._prune(c,later)
+                boot='other-boot' if kind=='new-boot' else 'boot-fixture'
+                b.bind_receiver(77,99,None,boot,private_verified=True,state=self.state,now=later)
+                with b.connect(self.state) as c:b._prune(c,later)
+                events=b.diagnostics(fid,state=self.state,now=later)['events']
+                terminal=events[-1]
+                self.assertEqual(terminal['reason'],'receiver_rebound' if kind=='new-boot' else 'receiver_lease_lapsed')
+                self.assertEqual(terminal['at'],later);self.assertEqual(terminal['status'],'rejected')
+                b.bind_receiver(77,99,None,boot,private_verified=True,state=self.state,now=later+1)
+                self.assertEqual(b.diagnostics(fid,state=self.state,now=later+1)['events'],events)
+                self.assertFalse(b.choose(row['token'],'once',self.identity(fid,event='repeat-'+kind),state=self.state,now=later+1)['ok'])
 
     def test_native_approval_pair_uses_live_request_and_queue_not_detector_membership(self):
         from tools.approval_detection import detect_dangerous_command

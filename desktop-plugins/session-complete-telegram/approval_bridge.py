@@ -30,6 +30,24 @@ ALLOWED_CHOICES = frozenset({"once", "deny"})
 ACTIVE = ("posting", "open", "queued", "applying", "dispatching")
 TERMINAL = ("applied", "expired", "rejected", "unknown")
 STALE_SEEN = -1e30
+MAX_DIAGNOSTICS = 512
+DIAGNOSTIC_RETENTION = 7 * 86400
+# No command, decision, token, exception text, route or native identity is accepted.
+DIAGNOSTIC_STAGES = frozenset({'queued', 'claimed', 'dispatching', 'terminal'})
+DIAGNOSTIC_SOURCES = frozenset({'callback', 'prune', 'owner', 'receiver', 'policy',
+                              'register', 'publish', 'poll', 'settle', 'canonical'})
+DIAGNOSTIC_REASONS = frozenset({
+    'unspecified', 'choice_accepted', 'claim_created', 'dispatch_started',
+    'feature_retired', 'owner_lease_lapsed', 'absolute_expiry',
+    'observation_lease_lapsed', 'receiver_lease_lapsed', 'receiver_rebound',
+    'native_absent', 'native_unverified', 'binding_mismatch', 'publication_failed',
+    'generation_changed', 'claim_deadline_lapsed', 'renderer_unspecified',
+    'renderer_lifetime', 'renderer_snapshot', 'renderer_binding', 'renderer_claim_gate',
+    'native_rpc_unknown', 'native_receipt_invalid', 'native_resolved', 'native_expired', 'result_budget_exceeded',
+    'native_ack_unconfirmed', 'canonical_descriptor_invalid', 'canonical_store_unavailable',
+    'canonical_prewrite_rejected', 'canonical_claim_lost', 'canonical_postwrite',
+    'canonical_policy_disabled', 'canonical_prompt_stale', 'canonical_native_timeout', 'canonical_authority_changed',
+})
 
 
 def _active_hermes_home():
@@ -113,6 +131,14 @@ def connect(state=STATE):
       bot INTEGER NOT NULL, chat INTEGER NOT NULL, mid INTEGER NOT NULL,
       created REAL NOT NULL, PRIMARY KEY(bot, chat, mid));
     """)
+    # Additive, best-effort diagnostics; a failure must not change authority.
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS approval_diagnostics(
+          seq INTEGER PRIMARY KEY, approval_id TEXT NOT NULL, stage TEXT NOT NULL,
+          source TEXT NOT NULL, reason TEXT NOT NULL, previous_status TEXT NOT NULL,
+          status TEXT NOT NULL, at REAL NOT NULL, UNIQUE(approval_id, stage))""")
+    except sqlite3.Error:
+        pass
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -132,7 +158,57 @@ def connect_readonly(state=STATE):
     return c
 
 
-def _retire(c, row, status, now):
+def _record_diagnostic(c, approval_id, stage, source, reason, previous_status, status, now):
+    if (stage not in DIAGNOSTIC_STAGES or source not in DIAGNOSTIC_SOURCES or
+            previous_status not in ACTIVE or status not in (*ACTIVE, *TERMINAL) or
+            not isinstance(approval_id, str) or not re.fullmatch(r'[0-9a-f]{32}', approval_id) or
+            type(now) not in (int, float) or not math.isfinite(now)):
+        return
+    reason = reason if isinstance(reason, str) and reason in DIAGNOSTIC_REASONS else 'unspecified'
+    in_transaction = c.in_transaction
+    try:
+        c.execute('SAVEPOINT approval_diagnostic')
+        c.execute('INSERT OR IGNORE INTO approval_diagnostics(approval_id,stage,source,reason,previous_status,status,at) VALUES(?,?,?,?,?,?,?)',
+                  (approval_id, stage, source, reason, previous_status, status, now))
+        c.execute('DELETE FROM approval_diagnostics WHERE at<? OR seq NOT IN (SELECT seq FROM approval_diagnostics ORDER BY seq DESC LIMIT ?)',
+                  (now - DIAGNOSTIC_RETENTION, MAX_DIAGNOSTICS))
+        c.execute('RELEASE approval_diagnostic')
+    except sqlite3.Error:
+        try:
+            c.execute('ROLLBACK TO approval_diagnostic')
+            c.execute('RELEASE approval_diagnostic')
+        except sqlite3.Error:
+            pass
+        if in_transaction and not c.in_transaction:
+            # SQLite can abort an entire transaction (e.g. RAISE(ROLLBACK) or
+            # certain I/O faults). Never report an uncommitted decision as success.
+            raise sqlite3.OperationalError('approval_transaction_lost') from None
+
+
+def diagnostics(approval_id, *, state=STATE, now=None):
+    """Content-free read only. Never create schema, prune, flush or infer old reasons."""
+    if not isinstance(approval_id, str) or not re.fullmatch(r'[0-9a-f]{32}', approval_id):
+        return {'ok': False, 'read_only': True, 'reason': 'invalid_diagnostic_id'}
+    now = time.time() if now is None else now
+    try:
+        c = connect_readonly(state)
+    except (sqlite3.Error, OSError):
+        return {'ok': False, 'read_only': True, 'reason': 'diagnostics_unavailable'}
+    if c is None:
+        return {'ok': True, 'read_only': True, 'available': False, 'events': []}
+    try:
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_diagnostics'").fetchone():
+            return {'ok': True, 'read_only': True, 'available': False, 'events': []}
+        rows = c.execute('SELECT stage,source,reason,previous_status,status,at FROM approval_diagnostics WHERE approval_id=? AND at>=? AND at<=? ORDER BY seq LIMIT 4',
+                         (approval_id, now - DIAGNOSTIC_RETENTION, now)).fetchall()
+        return {'ok': True, 'read_only': True, 'available': True, 'events': [dict(r) for r in rows]}
+    except sqlite3.Error:
+        return {'ok': False, 'read_only': True, 'reason': 'diagnostics_unavailable'}
+    finally:
+        c.close()
+
+
+def _retire(c, row, status, now, *, source='publish', reason='publication_failed'):
     if status not in TERMINAL:
         raise ValueError("invalid_terminal_status")
     if row["message_id"] is not None:
@@ -141,6 +217,7 @@ def _retire(c, row, status, now):
     c.execute("""UPDATE approvals SET status=?,choice=NULL,claim=NULL,deadline=NULL,
       dirty=CASE WHEN message_id IS NULL THEN dirty ELSE 1 END,
       review_text=NULL,request_json='{}',pending_json='{}' WHERE id=?""", (status, row["id"]))
+    _record_diagnostic(c, row['id'], 'terminal', source, reason, row['status'], status, now)
 
 
 def retire_unexecuted(*, state=STATE, now=None):
@@ -156,7 +233,7 @@ def retire_unexecuted(*, state=STATE, now=None):
         for row in rows:
             status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                 "rejected" if row["status"] == "queued" else "expired")
-            _retire(c, row, status, now)
+            _retire(c, row, status, now, source='policy', reason='feature_retired')
         c.commit()
         return len(rows)
     except Exception:
@@ -171,7 +248,7 @@ def _expire_owner(c, owner, now):
                          (owner,)).fetchall():
         status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
-        _retire(c, row, status, now)
+        _retire(c, row, status, now, source='owner', reason='owner_lease_lapsed')
 
 
 def _prune(c, now):
@@ -179,12 +256,12 @@ def _prune(c, now):
                          (now,)).fetchall():
         status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
-        _retire(c, row, status, now)
+        _retire(c, row, status, now, source='prune', reason='absolute_expiry')
     for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching') AND seen<? AND NOT(status='open' AND seen=?)",
                          (now - LEASE, STALE_SEEN)).fetchall():
         status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
             "rejected" if row["status"] == "queued" else "expired")
-        _retire(c, row, status, now)
+        _retire(c, row, status, now, source='prune', reason='observation_lease_lapsed')
     # A receiver or owner lease gap is terminal for an already queued choice.
     live_row = c.execute("SELECT value FROM receiver WHERE key='live'").fetchone()
     try:
@@ -194,7 +271,8 @@ def _prune(c, now):
         live, gap = None, True
     if gap:
         for row in c.execute("SELECT * FROM approvals WHERE status IN ('queued','applying','dispatching')").fetchall():
-            _retire(c, row, "unknown" if row["status"] in {"applying", "dispatching"} else "rejected", now)
+            _retire(c, row, "unknown" if row["status"] in {"applying", "dispatching"} else "rejected", now,
+                    source='prune', reason='receiver_lease_lapsed')
     for owner_row in c.execute("SELECT owner,seen FROM owners WHERE seen<? OR seen>?", (now - LEASE, now)).fetchall():
         _expire_owner(c, owner_row["owner"], now)
 
@@ -238,10 +316,15 @@ def bind_receiver(bot, chat, topic, boot, *, private_verified, state=STATE, now=
         if old and (old.get("boot") != boot or old.get("bot") != bot or old.get("chat") != chat or
                     old.get("topic") != topic or old.get("version") != VERSION or
                     now - float(old.get("at", now)) > LEASE):
+            # Binding changes take precedence over a simultaneous heartbeat gap;
+            # a pure same-receiver gap is not a rebind or proof of a restart.
+            diagnostic_reason = 'receiver_rebound' if (
+                old.get('boot') != boot or old.get('bot') != bot or old.get('chat') != chat or
+                old.get('topic') != topic or old.get('version') != VERSION) else 'receiver_lease_lapsed'
             for row in c.execute("SELECT * FROM approvals WHERE status IN ('posting','open','queued','applying','dispatching')").fetchall():
                 status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
-                _retire(c, row, status, now)
+                _retire(c, row, status, now, source='receiver', reason=diagnostic_reason)
         c.execute("INSERT OR REPLACE INTO receiver VALUES('live',?)",
                   (canonical({"bot": bot, "chat": chat, "topic": topic, "boot": boot,
                               "at": now, "private_verified": True, "version": VERSION,
@@ -871,7 +954,7 @@ def register_canonical(req, notifier, *, root=ROOT, state=STATE, now=None, resul
                 "root_binding", "target_home_binding", "profile", "targetProfile", "sid", "prompt_id"))
             if same_prompt_scope and prior_generation["status"] in ACTIVE:
                 status = "unknown" if prior_generation["status"] in {"posting", "applying", "dispatching"} else "expired"
-                _retire(c, prior_generation, status, now)
+                _retire(c, prior_generation, status, now, source='register', reason='generation_changed')
 
         if slot_rows:
             # Payload fingerprints detect mutation within a slot; they cannot mint
@@ -882,7 +965,7 @@ def register_canonical(req, notifier, *, root=ROOT, state=STATE, now=None, resul
                 for row, _prior_descriptor in slot_rows:
                     if row["status"] in ACTIVE:
                         status = "unknown" if row["status"] in {"posting", "applying", "dispatching"} else "expired"
-                        _retire(c, row, status, now)
+                        _retire(c, row, status, now, source='register', reason='binding_mismatch')
                 c.commit()
                 return {"ok": False, "reason": "immutable_mismatch"}
             if any(row["owner"] != descriptor["owner"] or
@@ -904,7 +987,7 @@ def register_canonical(req, notifier, *, root=ROOT, state=STATE, now=None, resul
                     prior["pending_fingerprint"] != descriptor["pending_fingerprint"]):
                 if prior["status"] in ACTIVE:
                     status = "unknown" if prior["status"] in {"posting", "applying", "dispatching"} else "expired"
-                    _retire(c, prior, status, now)
+                    _retire(c, prior, status, now, source='register', reason='binding_mismatch')
                 c.commit()
                 return {"ok": False, "reason": "immutable_mismatch"}
             if prior["owner"] != descriptor["owner"]:
@@ -999,7 +1082,7 @@ def register(req, notifier, *, root=ROOT, state=STATE, now=None, result_budget=N
                 if prior["status"] in ACTIVE:
                     status = "unknown" if prior["status"] in ("posting", "applying", "dispatching") else (
                         "rejected" if prior["status"] == "queued" else "expired")
-                    _retire(c, prior, status, now)
+                    _retire(c, prior, status, now, source='register', reason='binding_mismatch')
                 c.commit()
                 return {"ok": False, "reason": "immutable_mismatch"}
             if prior["owner"] != owner:
@@ -1258,6 +1341,7 @@ def choose(token, choice, identity, *, state=STATE, now=None):
         if c.total_changes < 2:
             c.rollback()
             return {"ok": False, "reason": "claim_lost"}
+        _record_diagnostic(c, row['id'], 'queued', 'callback', 'choice_accepted', 'open', 'queued', now)
         c.commit()
         return {"ok": True, "status": "queued", "id": row["id"]}
     except Exception:
@@ -1304,20 +1388,20 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
             if row["boot"] != live["boot"]:
                 status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
-                _retire(c, row, status, now)
+                _retire(c, row, status, now, source='poll', reason='receiver_rebound')
                 continue
             if row["id"] in unverifiable:
                 if row["status"] == "queued":
-                    _retire(c, row, "rejected", now)
+                    _retire(c, row, "rejected", now, source='poll', reason='native_unverified')
                 elif row["status"] in {"applying", "dispatching"}:
-                    _retire(c, row, "unknown", now)
+                    _retire(c, row, "unknown", now, source='poll', reason='native_unverified')
                 elif row["status"] == "open":
                     c.execute("UPDATE approvals SET seen=? WHERE id=?", (STALE_SEEN, row["id"]))
                 continue
             if row["id"] in definitive_absent:
                 status = "unknown" if row["status"] in ("posting", "applying", "dispatching") else (
                     "rejected" if row["status"] == "queued" else "expired")
-                _retire(c, row, status, now)
+                _retire(c, row, status, now, source='poll', reason='native_absent')
                 continue
             if row["id"] not in by_id:
                 # An in-flight/lost registration receipt is not native absence.
@@ -1326,17 +1410,17 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
                 if row["status"] == "open":
                     c.execute("UPDATE approvals SET seen=? WHERE id=?", (STALE_SEEN, row["id"]))
                 elif row["status"] == "queued":
-                    _retire(c, row, "rejected", now)
+                    _retire(c, row, "rejected", now, source='poll', reason='native_unverified')
                 elif row["status"] in {"applying", "dispatching"}:
-                    _retire(c, row, "unknown", now)
+                    _retire(c, row, "unknown", now, source='poll', reason='native_unverified')
                 continue
             if not _observation_matches(row, by_id[row["id"]]):
                 if row["status"] == "queued":
-                    _retire(c, row, "rejected", now)
+                    _retire(c, row, "rejected", now, source='poll', reason='binding_mismatch')
                 elif row["status"] in {"applying", "dispatching"}:
-                    _retire(c, row, "unknown", now)
+                    _retire(c, row, "unknown", now, source='poll', reason='binding_mismatch')
                 else:
-                    _retire(c, row, "expired", now)
+                    _retire(c, row, "expired", now, source='poll', reason='binding_mismatch')
                 continue
             if row["status"] in ("open", "queued"):
                 c.execute("UPDATE approvals SET seen=? WHERE id=?", (now, row["id"]))
@@ -1353,7 +1437,7 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
                 # A single queued row that cannot fit even without terminal IDs
                 # cannot become an actionable button. Retire it explicitly; its
                 # terminal ID is included below whenever it was observed.
-                _retire(c, row, "rejected", now)
+                _retire(c, row, "rejected", now, source='poll', reason='result_budget_exceeded')
                 continue
             candidates.append((row, item))
         known_ids = set(by_id) | unverifiable | definitive_absent
@@ -1384,6 +1468,7 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
                     "UPDATE approvals SET status='applying',claim=?,deadline=?,dirty=1 WHERE id=? AND status='queued'",
                     (candidate["claim"], candidate["deadline"], row["id"]))
                 if updated.rowcount == 1:
+                    _record_diagnostic(c, row['id'], 'claimed', 'poll', 'claim_created', 'queued', 'applying', now)
                     item = candidate
                     break
         c.commit()
@@ -1396,7 +1481,7 @@ def poll(owner, observations, *, unverified=None, absent=None, state=STATE, now=
         c.close()
 
 
-def settle(approval_id, claim, status, *, state=STATE, now=None):
+def settle(approval_id, claim, status, *, state=STATE, now=None, diagnostic_reason='renderer_unspecified'):
     now = time.time() if now is None else now
     if status not in TERMINAL or not isinstance(approval_id, str) or not isinstance(claim, str):
         return {"ok": False, "reason": "invalid_settlement"}
@@ -1415,10 +1500,10 @@ def settle(approval_id, claim, status, *, state=STATE, now=None):
                 return {"ok": False, "reason": "invalid_descriptor"}
         if not row or row["deadline"] is None or row["deadline"] <= now:
             if row:
-                _retire(c, row, "unknown", now)
+                _retire(c, row, "unknown", now, source='settle', reason='claim_deadline_lapsed')
             c.commit()
             return {"ok": False, "reason": "claim_lost"}
-        _retire(c, row, status, now)
+        _retire(c, row, status, now, source='settle', reason=diagnostic_reason)
         c.commit()
         return {"ok": True, "status": status}
     finally:
@@ -1516,7 +1601,7 @@ def observe_canonical(req, notifier, *, root=ROOT, state=STATE):
             "authority": _digest(descriptor)}
 
 
-def _finish_canonical_apply(approval_id, claim, status, *, state=STATE):
+def _finish_canonical_apply(approval_id, claim, status, *, state=STATE, diagnostic_reason='canonical_prewrite_rejected'):
     if status not in TERMINAL:
         status = "unknown"
     c = connect(state)
@@ -1527,7 +1612,7 @@ def _finish_canonical_apply(approval_id, claim, status, *, state=STATE):
         if row is None:
             c.commit()
             return {"ok": False, "reason": "claim_lost"}
-        _retire(c, row, status, time.time())
+        _retire(c, row, status, time.time(), source='canonical', reason=diagnostic_reason)
         c.commit()
         return {"ok": True, "status": status}
     except Exception:
@@ -1550,23 +1635,29 @@ def apply_canonical(req, notifier, *, root=ROOT, state=STATE):
     if (row["status"] != "applying" or row["choice"] not in ALLOWED_CHOICES or
             row["deadline"] is None or float(row["deadline"]) <= now):
         if row["status"] == "applying":
-            _finish_canonical_apply(approval_id, claim, "expired", state=state)
+            _finish_canonical_apply(approval_id, claim, "expired", state=state, diagnostic_reason='claim_deadline_lapsed')
         return {"ok": False, "status": "expired", "reason": "claim_expired"}
     gateway = _sibling("telegram_integration")
     enabled, reason = gateway.feature_status("approvals_enabled", root=root)
     if not enabled:
-        _finish_canonical_apply(approval_id, claim, "rejected", state=state)
+        _finish_canonical_apply(approval_id, claim, "rejected", state=state, diagnostic_reason='canonical_policy_disabled')
         return {"ok": False, "status": "rejected", "reason": reason}
     live, live_reason, owner_seen = _canonical_live_claim(
         row, descriptor, owner, claim, state=state, now=now)
     if not live:
-        _finish_canonical_apply(approval_id, claim, "expired" if live_reason == "claim_lost" else "rejected", state=state)
+        diagnostic_reason = {
+            'claim_lost': 'canonical_claim_lost', 'binding_changed': 'binding_mismatch',
+            'invalid_descriptor': 'canonical_descriptor_invalid',
+            'approval_store_unavailable': 'canonical_store_unavailable',
+        }.get(live_reason, 'canonical_prewrite_rejected')
+        _finish_canonical_apply(approval_id, claim, "expired" if live_reason == "claim_lost" else "rejected", state=state,
+                                diagnostic_reason=diagnostic_reason)
         return {"ok": False, "status": "expired" if live_reason == "claim_lost" else "rejected",
                 "reason": live_reason}
     budget = min(float(row["deadline"]) - now, float(row["expires"]) - now,
                  LEASE - (now - float(row["seen"])), LEASE - (now - float(owner_seen)), 22.0)
     if budget <= 0:
-        _finish_canonical_apply(approval_id, claim, "expired", state=state)
+        _finish_canonical_apply(approval_id, claim, "expired", state=state, diagnostic_reason='claim_deadline_lapsed')
         return {"ok": False, "status": "expired", "reason": "claim_expired"}
     deadline_monotonic = time.monotonic() + budget
 
@@ -1600,6 +1691,7 @@ def apply_canonical(req, notifier, *, root=ROOT, state=STATE):
             if updated.rowcount != 1:
                 c.rollback()
                 return {"ok": False, "reason": "claim_lost"}
+            _record_diagnostic(c, approval_id, 'dispatching', 'canonical', 'dispatch_started', 'applying', 'dispatching', current)
             c.commit()
             return {"ok": True}
         except Exception:
@@ -1619,7 +1711,11 @@ def apply_canonical(req, notifier, *, root=ROOT, state=STATE):
         status = "expired"
     else:
         status = "rejected"
-    settled = _finish_canonical_apply(approval_id, claim, status, state=state)
+    diagnostic_reason = 'canonical_postwrite' if result.get('phase') == 'postwrite' else {
+        'prompt_stale': 'canonical_prompt_stale', 'native_helper_deadline': 'canonical_native_timeout',
+        'authority_changed': 'canonical_authority_changed', 'claim_lost': 'canonical_claim_lost',
+    }.get(result.get('reason'), 'canonical_prewrite_rejected')
+    settled = _finish_canonical_apply(approval_id, claim, status, state=state, diagnostic_reason=diagnostic_reason)
     try:
         flush(notifier, state=state)
     except Exception:
@@ -1788,6 +1884,10 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
     action = req.get("action") if isinstance(req, dict) else None
     if not isinstance(req, dict) or req.get("capability") != CAPABILITY:
         return {"ok": False, "reason": "capability_mismatch"}
+    if action == 'approval_diagnostics':
+        if set(req) != {'action', 'capability', 'id'}:
+            return {'ok': False, 'read_only': True, 'reason': 'invalid_diagnostic_request'}
+        return diagnostics(req.get('id'), state=state)
     if action == "approval_notice":
         return approval_notice(req, notifier, root=root, state=state)
     if action not in {"approval_owner_heartbeat", "approval_register", "approval_registration_lookup", "approval_poll", "approval_settle",
@@ -1835,7 +1935,8 @@ def helper(req, notifier, *, root=ROOT, state=STATE, result_budget=None):
                           absent=req.get("absent"), state=state, result_budget=result_budget)
             flush(notifier, state=state)
             return result
-        result = settle(req.get("id"), req.get("claim"), req.get("status"), state=state)
+        result = settle(req.get("id"), req.get("claim"), req.get("status"), state=state,
+                        diagnostic_reason=req.get('diagnostic_reason', 'renderer_unspecified'))
         if result.get("ok"):
             flush(notifier, state=state)
         return result

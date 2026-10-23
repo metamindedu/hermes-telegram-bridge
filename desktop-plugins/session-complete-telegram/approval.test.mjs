@@ -157,6 +157,22 @@ test('approval registration freezes full fingerprints and binds queue not just s
   assert.equal(actions[1].pending.request_id,f.pending.request_id)
 })
 
+test('approval diagnostic reasons distinguish prewrite gates from unknown native writes without payloads', async () => {
+  for (const [options,reason,status,writes] of [
+    [{changeOnFinal:true},'renderer_snapshot','rejected',0],
+    [{claimValidity:false},'renderer_claim_gate','rejected',0],
+    [{throwRpc:true},'native_rpc_unknown','unknown',1],
+    [{},'native_resolved','applied',1]
+  ]) {
+    const result=await runPump({resolved:1},options)
+    const settlement=result.helperCalls.find(r=>r.action==='approval_settle')
+    assert.equal(settlement.status,status)
+    assert.equal(settlement.diagnostic_reason,reason)
+    assert.equal(result.calls.filter(r=>r.method==='approval.respond').length,writes)
+    assert.deepEqual(Object.keys(settlement).sort(),['action','capability','claim','diagnostic_reason','id','status'])
+  }
+})
+
 async function runPump(resolved, {throwRpc=false, changeOnFinal=false, claimValidity=true,
   gateVariant=null, pausePostClaim=false, runStoppedOnGate=false, expireOnGate=false,
   dispatchMode='legacyqueue', modeChangeOnFinal=false}={}) {
@@ -244,6 +260,7 @@ test('server-request authority sends once to the frozen srq and never treats gat
   assert.deepEqual(writes[0].args,{id:'srq-aabbcc112233',result:{choice:'once',all:false}})
   assert.equal(accepted.calls.some(call=>call.method==='approval.respond'),false)
   assert.equal(accepted.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
+  assert.equal(accepted.helperCalls.find(call=>call.action==='approval_settle').diagnostic_reason,'native_ack_unconfirmed')
   const expired=await runPump({status:'expired'},{dispatchMode:'legacyserver_request'})
   assert.equal(expired.helperCalls.find(call=>call.action==='approval_settle').status,'expired')
   for(const receipt of [{status:'ok',extra:true},{status:'resolved'},{},null]){
@@ -252,11 +269,13 @@ test('server-request authority sends once to the frozen srq and never treats gat
     assert.equal(out.calls.some(call=>call.method==='approval.respond'),false)
     assert.equal(out.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
     assert.equal(out.helperCalls.filter(call=>call.action==='approval_poll').length,1)
+    assert.equal(out.helperCalls.find(call=>call.action==='approval_settle').diagnostic_reason,'native_receipt_invalid')
   }
   const ambiguous=await runPump({}, {dispatchMode:'legacyserver_request',throwRpc:true})
   assert.equal(ambiguous.calls.filter(call=>call.method==='request.answer').length,1)
   assert.equal(ambiguous.calls.some(call=>call.method==='approval.respond'),false)
   assert.equal(ambiguous.helperCalls.find(call=>call.action==='approval_settle').status,'unknown')
+  assert.equal(ambiguous.helperCalls.find(call=>call.action==='approval_settle').diagnostic_reason,'native_rpc_unknown')
 })
 
 test('a frozen server-request card cannot switch to queue dispatch when mode changes after its tap', async () => {
