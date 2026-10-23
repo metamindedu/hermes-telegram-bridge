@@ -584,6 +584,9 @@ export class CompletionMonitor {
     this.approvalSweepUnverified = new Set()
     this.approvalSweepAbsent = new Set()
     this.lastApprovalPollSucceeded = false
+    this.approvalPumping = null
+    this.approvalPublicationEpoch = {}
+    this.approvalLedgerTail = Promise.resolve()
   }
 
   async refreshRoutes(force = false) {
@@ -1912,6 +1915,30 @@ export class CompletionMonitor {
   // "waiting" (an open server→client request). Poll only routes that already
   // have observed records — never every profile — so no backend is launched
   // just to be polled.
+  approvalLedgerPhase(operation) {
+    const task = this.approvalLedgerTail.then(operation)
+    // A failed registration/poll must release this local ordering fence too.
+    this.approvalLedgerTail = task.then(() => undefined, () => undefined)
+    return task
+  }
+
+  approvalPublication(operation) {
+    return this.approvalLedgerPhase(async () => {
+      // This is a local observation token, not native authority/generation.
+      this.approvalPublicationEpoch = {}
+      try { return await operation() }
+      finally { this.approvalPublicationEpoch = {} }
+    })
+  }
+
+  tick() {
+    if (this.stopped) return Promise.resolve([])
+    // Existing owned approvals cannot wait behind completion recovery, other
+    // sessions or reply delivery. Reuse the same interval and owner; the pump
+    // latch joins concurrent callers instead of creating a second consumer.
+    return Promise.allSettled([this.pumpApprovals(), this.sweep()])
+  }
+
   async sweep() {
     if (this.stopped || this.sweeping) return
     this.sweeping = true
@@ -2164,6 +2191,8 @@ export class CompletionMonitor {
         this.approvalSweepAbsent.add(previous.id)
         return
       }
+      return await this.approvalPublication(async () => {
+      if (this.stopped) return
       // A new canonical-only monitor has no owner lease yet. Establish the same
       // exact v6 receiver/owner capability gate used by the legacy registration
       // path before asking the fixed CLI to create the first card. A transient,
@@ -2211,6 +2240,7 @@ export class CompletionMonitor {
       record.canonicalObservedKey = key
       this.api.notify({kind:'warning', title:'명령 승인 검토 제한',
         message:'이 요청은 Telegram에서 안전하게 검토할 수 없습니다. 전체 명령과 현재 승인을 Desktop에서 확인해 주세요.'})
+      })
     } catch {
       // A failed helper invocation is not retried within this approval event.
       record.canonicalObservedKey = key
@@ -2448,6 +2478,10 @@ export class CompletionMonitor {
       return true
     }
     if (r.approvalRegistration) return true
+    return this.approvalPublication(async () => {
+    // Publication plus the caller's binding is one local phase. A deferred
+    // operation cannot overwrite a binding recovered while it was waiting.
+    if (this.stopped || r.approval || r.approvalRegistration) return true
     let heartbeat
     try {
       heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
@@ -2513,6 +2547,7 @@ export class CompletionMonitor {
         message:'알림 전송 결과를 확인하지 못했습니다. 중복 방지를 위해 다시 보내지 않았습니다.'})
     }
     return true
+    })
   }
 
   async approvalSnapshot(bridge) {
@@ -2619,7 +2654,14 @@ export class CompletionMonitor {
     } catch { /* only the read-only lookup may retry */ }
   }
 
-  async pumpApprovals() {
+  pumpApprovals() {
+    if (this.approvalPumping) return this.approvalPumping
+    const task = Promise.resolve().then(() => this.pumpApprovalsOnce())
+    this.approvalPumping = task.finally(() => { this.approvalPumping = null })
+    return this.approvalPumping
+  }
+
+  async pumpApprovalsOnce() {
     this.lastApprovalPollSucceeded = false
     // Local payload retention is bounded even while receiver/heartbeat reads fail.
     for (const record of this.approvalRecords()) {
@@ -2636,6 +2678,7 @@ export class CompletionMonitor {
         capability:APPROVAL_CAPABILITY})
       if (heartbeat?.feature_ready !== true || heartbeat.version !== APPROVAL_COMPAT_VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) return
     } catch { return }
+    const publicationEpoch = this.approvalPublicationEpoch
     for (const record of this.approvalRecords()) await this.recoverApprovalRegistration(record)
     if (this.stopped) return
     const bridges = new Map()
@@ -2662,11 +2705,19 @@ export class CompletionMonitor {
     }
     let polled
     try {
-      const heartbeat = await this.helper({action:'approval_owner_heartbeat', owner:this.replyOwner,
-        capability:APPROVAL_CAPABILITY})
-      if (heartbeat?.feature_ready !== true || heartbeat.version !== APPROVAL_COMPAT_VERSION || heartbeat.capability !== APPROVAL_CAPABILITY) return
-      polled = await this.helper({action:'approval_poll', owner:this.replyOwner, capability:APPROVAL_CAPABILITY,
-        observations, unverified:[...new Set(unverified)], absent:[...new Set(absent)]})
+      polled = await this.approvalLedgerPhase(async () => {
+        // poll evaluates every active row owned by this monitor. Never submit
+        // an older view after a publisher ran, or while an uncertain receipt
+        // has not yet been recovered. Defer without weakening Python's rules.
+        if (this.stopped || publicationEpoch !== this.approvalPublicationEpoch ||
+            this.approvalRecords().some(record => record.approvalRegistration && !record.approval)) return null
+        if (this.stopped) return null
+        // poll atomically rechecks the existing owner/receiver leases itself.
+        // A second cold CLI heartbeat here only delays these fresh observations.
+        // The publication fence stays held through the actual poll receipt.
+        return this.helper({action:'approval_poll', owner:this.replyOwner, capability:APPROVAL_CAPABILITY,
+          observations, unverified:[...new Set(unverified)], absent:[...new Set(absent)]})
+      })
     } catch { return }
     if (polled?.ok !== true || !Array.isArray(polled.items)) return
     this.lastApprovalPollSucceeded = true
@@ -3092,7 +3143,7 @@ export default {
     registerBridgeSettings(ctx, monitor)
     ctx.onEvent('*', event => monitor.onEvent(event))
     ctx.onDispose(() => monitor.dispose())
-    ctx.setInterval(() => void monitor.sweep(), ATTENTION_POLL_MS)
+    ctx.setInterval(() => void monitor.tick(), ATTENTION_POLL_MS)
     void monitor.mounted()
   }
 }

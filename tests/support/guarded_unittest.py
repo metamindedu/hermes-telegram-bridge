@@ -1076,6 +1076,15 @@ def _install_child_process_fence(helper) -> None:
         args = words[1:]
         if args == ["--test", "--test-name-pattern", canonical_event_pattern, "canonical.test.mjs"]:
             return normalized(cwd) == normalized(PACKAGE_DIR.resolve(strict=True))
+        if args == ["--test-isolation=none", "--test",
+                    "--test-name-pattern=approval-publication-epoch-interleaving",
+                    "--test-reporter=tap", "--test-reporter-destination=stderr",
+                    "approval_concurrency.test.mjs"]:
+            # One fixed, DB-free Node peer for the already-fenced Python consumer.
+            # No general Node flags, scripts, cwd or reporter destinations admitted.
+            package = PACKAGE_DIR.resolve(strict=True)
+            script = (package / "approval_concurrency.test.mjs").resolve(strict=True)
+            return normalized(cwd) == normalized(package) and script.parent == package
         if len(args) == 3 and args[0] == "--input-type=module" and args[1] == "-e":
             digest = hashlib_module.sha256(args[2].encode("utf-8", errors="strict")).hexdigest()
             return digest in allowed_node_inline_sha256 and normalized(cwd) in {

@@ -128,11 +128,11 @@ Set `HERMES_TEST_ISOLATION_BASE` to an existing permitted runner-owned scratch r
 
 ```
 node --check desktop/plugin.js
-node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
-python -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_canonical_backend test_db_isolation test_canonical_integration test_native_install test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review
+node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs approval_concurrency.test.mjs approval-scheduling.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
+python -I -S ../../tests/support/guarded_unittest.py --phase suite -v test_notifier test_reply_bridge test_followup_bridge test_approval_bridge test_approval_concurrency test_canonical_backend test_db_isolation test_canonical_integration test_registration test_feature_gates test_light_corrections test_final_boundaries test_settings_control test_review_revocation test_review_notification_boundaries test_producer_epoch test_completion_recovery test_recovery_review
 ```
 
-The test dependencies are declared in `requirements-test.txt`. Do not run the native installer against a production home as part of source tests.
+The test dependencies are declared in `requirements-test.txt`. Run `test_native_install` only through the separate credential-free native-PM container workflow described in `docs/operations.md`, not inside the guarded bridge suite or against a production home.
 
 ## Historical Telegram command approval baseline (1.7.0 candidate; superseded by the 1.8.1 source candidate above)
 

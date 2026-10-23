@@ -88,7 +88,7 @@ jobs:
         working-directory: desktop-plugins/session-complete-telegram
         run: |
           node --check desktop/plugin.js
-          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs approval_concurrency.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
+          node --test plugin.test.mjs reply.test.mjs followup.test.mjs approval.test.mjs approval_concurrency.test.mjs approval-scheduling.test.mjs canonical.test.mjs materialization.test.mjs settings.test.mjs completion_recovery.test.mjs recovery_review.test.mjs helper_budget.test.mjs
 
       - name: Full Python bridge and native-install tests
         shell: bash

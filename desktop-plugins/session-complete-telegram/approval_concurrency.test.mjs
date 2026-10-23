@@ -1,12 +1,29 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {registerHooks} from 'node:module'
+import {createHash} from 'node:crypto'
+import {existsSync,readFileSync,realpathSync,writeSync} from 'node:fs'
+import {dirname,resolve} from 'node:path'
+import {createInterface} from 'node:readline'
+import {fileURLToPath,pathToFileURL} from 'node:url'
 registerHooks({resolve(specifier, context, nextResolve) {
   if (specifier === '@hermes/plugin-sdk') return {url:'data:text/javascript,export const host={}',shortCircuit:true}
   if (specifier === 'react/jsx-runtime') return {url:'data:text/javascript,export const jsx=(type,props)=>({type,props})',shortCircuit:true}
   return nextResolve(specifier,context)
 }})
-const {CompletionMonitor,NativeHelperError,APPROVAL_CAPABILITY,APPROVAL_COMPAT_VERSION}=await import('./desktop/plugin.js')
+const packageDir=dirname(fileURLToPath(import.meta.url))
+const currentPlugin=resolve(packageDir,'desktop/plugin.js')
+const frozenV1Plugin=resolve(packageDir,'../../.private/approval-scheduling-20261023-v1/candidate/desktop-plugins/session-complete-telegram/desktop/plugin.js')
+const sourceKey=value=>process.platform==='win32'?value.toLowerCase():value
+const selectedPlugin=process.env.APPROVAL_CONCURRENCY_PLUGIN_SOURCE
+  ?resolve(process.env.APPROVAL_CONCURRENCY_PLUGIN_SOURCE):currentPlugin
+const allowedPlugins=[currentPlugin,...(existsSync(frozenV1Plugin)?[frozenV1Plugin]:[])]
+if(!allowedPlugins.some(path=>sourceKey(realpathSync(path))===sourceKey(realpathSync(selectedPlugin))))
+  throw new Error('test-only plugin source override is outside the current/frozen fixture allowlist')
+const pluginBytes=readFileSync(selectedPlugin)
+const pluginSourceSha256=createHash('sha256').update(pluginBytes).digest('hex')
+const {CompletionMonitor,NativeHelperError,APPROVAL_CAPABILITY,APPROVAL_COMPAT_VERSION}=await import(pathToFileURL(selectedPlugin).href)
+assert.deepEqual(readFileSync(selectedPlugin),pluginBytes,'selected plugin source changed during import')
 
 function fixture() {
   const route={mode:'local',connectionId:'fixture-connection',profile:'claire',targetProfile:'claire'}
@@ -395,4 +412,197 @@ for(const remaining of [0,1]) test(`remaining slot ${remaining} survives a defer
   defer=false
   await f.monitor.sweep()
   assert.equal(f.monitor.records.has(f.record.key),false)
+})
+
+const PUBLICATION_RACE_PREFIX='approval-publication-epoch-interleaving'
+const parentPending=new Map()
+const parentEvents=new Map()
+const parentEventWaiters=new Map()
+let parentRpcSequence=0
+const scenarioName=process.env.APPROVAL_CONCURRENCY_SCENARIO||''
+const parentInput=scenarioName?createInterface({input:process.stdin,crlfDelay:Infinity}):null
+
+function deferred() {
+  let resolve
+  const promise=new Promise(done=>{resolve=done})
+  return {promise,resolve}
+}
+
+function bounded(promise,label,ms=12_000) {
+  let timer
+  return Promise.race([promise,new Promise((_,reject)=>{
+    timer=setTimeout(()=>reject(new Error(`bounded timeout: ${label}`)),ms)
+  })]).finally(()=>clearTimeout(timer))
+}
+
+function emitParentEvent(name,payload) {
+  const waiters=parentEventWaiters.get(name)
+  if(waiters?.length)waiters.shift()(payload)
+  else {
+    if(!parentEvents.has(name))parentEvents.set(name,[])
+    parentEvents.get(name).push(payload)
+  }
+}
+
+function waitParentEvent(name) {
+  const queued=parentEvents.get(name)
+  if(queued?.length)return Promise.resolve(queued.shift())
+  return new Promise(resolve=>{
+    if(!parentEventWaiters.has(name))parentEventWaiters.set(name,[])
+    parentEventWaiters.get(name).push(resolve)
+  })
+}
+
+function writeProtocol(message) {
+  writeSync(1,Buffer.from(JSON.stringify(message)+'\n','utf8'))
+}
+
+function parentRpc(op,payload={}) {
+  if(!scenarioName)throw new Error('guarded Python RPC parent is required')
+  const id=++parentRpcSequence
+  return bounded(new Promise((resolve,reject)=>{
+    parentPending.set(id,{resolve,reject})
+    writeProtocol({id,op,payload})
+  }),`Python RPC ${op}`)
+}
+
+if(parentInput)parentInput.on('line',line=>{
+  let message
+  try { message=JSON.parse(line) } catch { return }
+  if(typeof message?.event==='string') {
+    emitParentEvent(message.event,message.payload)
+    return
+  }
+  const pending=parentPending.get(message?.id)
+  if(!pending)return
+  parentPending.delete(message.id)
+  if(message.error)pending.reject(new Error(String(message.error)))
+  else pending.resolve(message.result)
+})
+
+test(`${PUBLICATION_RACE_PREFIX}: ${scenarioName||'guarded-parent-required'}`,{
+  skip:scenarioName?false:'driven only by the guarded Python fake-home parent',timeout:60_000
+},async()=>{
+  const pumpSnapshotStarted=deferred(),releasePumpSnapshot=deferred(),releaseSweep=deferred()
+  const bRegistrationStarted=deferred(),bBound=deferred()
+  let monitor=null,holdNextEventSnapshot=false,openRequests=[],activeRows=[]
+  const helperCalls=[],helperResults=[],nativeResponses=[]
+  try {
+    const init=await parentRpc('begin',{plugin_source:selectedPlugin,plugin_source_sha256:pluginSourceSha256,scenario:scenarioName})
+    assert.equal(init.plugin_source_sha256,pluginSourceSha256,'Node imported a different plugin source than the Python receipt')
+    const route=init.route,row=init.session,asks=init.approvals
+    openRequests=[structuredClone(asks.a.request)]
+    activeRows=[structuredClone(row)]
+    const requestProfile=async(_route,method,args={})=>{
+      if(method==='session.active_list')return {sessions:structuredClone(activeRows)}
+      if(method==='session.events.since'){
+        const captured={epoch:'fixture-epoch',open_requests:structuredClone(openRequests)}
+        if(holdNextEventSnapshot){
+          holdNextEventSnapshot=false
+          pumpSnapshotStarted.resolve()
+          await releasePumpSnapshot.promise
+        }
+        return captured
+      }
+      if(method==='approval.pending')return {approvals:Object.values(asks)
+        .filter(value=>openRequests.some(request=>request.id===value.request.id))
+        .map(value=>structuredClone(value.pending))}
+      if(method==='approval.respond'){
+        nativeResponses.push(structuredClone(args))
+        return parentRpc('native_response',args)
+      }
+      throw new Error(`unexpected fixture requestProfile method ${method}`)
+    }
+    monitor=new CompletionMonitor({state:{profile:{get:()=>route.profile}},profileRoutes:async()=>[route],requestProfile,notify:()=>{}},
+      {setTimeout:()=>()=>{}})
+    monitor.approvalCapable=true
+    monitor.replyOwner=init.owner
+    monitor.helper=async request=>{
+      helperCalls.push(structuredClone(request))
+      if(request.action==='approval_register'&&request.request?.id===asks.b.request.id)
+        bRegistrationStarted.resolve(structuredClone(request))
+      const result=await parentRpc('helper',request)
+      helperResults.push({action:request.action,request:structuredClone(request),result:structuredClone(result)})
+      return result
+    }
+    const record={key:'publication-race-parent',sid:row.id,profile:route.profile,connectionId:route.connectionId,
+      seq:0,ask:null,askChecking:false}
+    monitor.records.set(record.key,record)
+    await bounded(monitor.checkAsk(record,route,row),'initial real checkAsk(A)')
+    const aBridge=record.approvalSlots?.get(asks.a.request.id)?.approval
+    assert.ok(aBridge,'A must be bound by a real registration receipt')
+
+    const actualCheckApproval=monitor.checkApproval.bind(monitor)
+    monitor.checkApproval=async(...args)=>{
+      const result=await actualCheckApproval(...args)
+      if(args[4]?.id===asks.b.request.id&&args[0].approval)bBound.resolve()
+      return result
+    }
+    const actualSweep=monitor.sweep.bind(monitor)
+    monitor.sweep=async()=>{await releaseSweep.promise;return actualSweep()}
+    holdNextEventSnapshot=true
+    const firstTick=monitor.tick()
+    await bounded(pumpSnapshotStarted.promise,'A snapshot starts inside actual tick/pump')
+    // The pump has already captured A. Let the actual sweep discover and register B.
+    openRequests=[structuredClone(asks.a.request),structuredClone(asks.b.request)]
+    releaseSweep.resolve()
+    await bounded(bRegistrationStarted.promise,'actual sweep reaches checkApproval(B)')
+
+    if(scenarioName==='publication-choice-before-receipt'){
+      await bounded(waitParentEvent('publication_and_choice_complete'),'real B publication and choose before receipt')
+      await parentRpc('release_registration')
+    }else if(scenarioName==='lookup-before-publication'){
+      await bounded(waitParentEvent('registration_write_waiting'),'B registration is pending before publication')
+      const slot=record.approvalSlots?.get(asks.b.request.id)
+      assert.ok(slot?.approvalRegistration,'B must be in the real registration-recovery state')
+      await bounded(monitor.recoverApprovalRegistration(slot),'real read-only B registration recovery lookup')
+      const miss=helperResults.findLast(value=>value.action==='approval_registration_lookup')
+      assert.deepEqual(miss?.result,{ok:true,found:false},'pre-publication lookup must return a real SQLite found:false')
+      assert.ok(slot.approvalRegistration,'found:false must not erase the pending, non-replayed registration')
+      await parentRpc('publish_registration')
+    }else{
+      assert.equal(scenarioName,'receipt-before-callback')
+    }
+
+    await bounded(bBound.promise,'checkApproval binds B only after its actual receipt')
+    const bId=record.approvalSlots?.get(asks.b.request.id)?.approval?.id
+    assert.ok(bId,'B must keep the registration receipt bound before dispatch')
+    if(scenarioName!=='publication-choice-before-receipt')await parentRpc('choose_b')
+    releasePumpSnapshot.resolve()
+    await bounded(firstTick,'stale interval tick and real sweep finish')
+
+    const afterStale=await parentRpc('inspect')
+    assert.equal(afterStale.b.status,'queued','the stale A-only owner snapshot must not terminally reject queued B')
+    assert.equal(afterStale.polls.length,0,'stale local publication view must defer before the real owner-wide poll')
+
+    await bounded(monitor.tick(),'next eligible actual tick')
+    const final=await parentRpc('inspect')
+    // Successful settlement intentionally removes the active local binding.
+    assert.equal(final.b.status,'applied','the real Python approval consumer must settle B as applied')
+    assert.equal(final.polls.length,1,'B must be claimed by exactly one later owner poll')
+    assert.deepEqual(final.polls[0].observations.map(value=>value.id).sort(),[aBridge.id,bId].sort())
+    assert.equal(final.pollResults[0].items.length,1)
+    assert.equal(final.pollResults[0].items[0].id,bId,'actual Python poll must return B claim')
+    assert.equal(final.claimValid.length,1)
+    assert.equal(final.claimValid[0].request.id,bId)
+    assert.equal(final.claimValid[0].result.valid,true)
+    assert.equal(final.settlements.length,1)
+    assert.equal(final.settlements[0].request.id,bId)
+    assert.equal(final.settlements[0].request.status,'applied')
+    assert.equal(final.callbackResults.length,1,'the real Python callback consumer accepts B exactly once')
+    assert.equal(final.callbackResults[0].status,'queued')
+    assert.equal(nativeResponses.length,1,'the fixture-boundary synthetic native response occurs exactly once')
+    assert.deepEqual(nativeResponses[0],{session_id:row.id,request_id:asks.b.pending.request_id,choice:'once',all:false})
+    assert.equal(final.registers.filter(value=>value.request.id===asks.b.request.id).length,1,
+      'B is published once; a false recovery lookup cannot replay registration')
+    if(scenarioName==='lookup-before-publication')assert.equal(final.lookups.length,1)
+    assert.equal(final.syntheticNativeReceipts.length,1)
+    assert.deepEqual(final.syntheticNativeReceipts[0],{resolved:1})
+    assert.deepEqual(final.pythonConsumerFinalState,{id:bId,status:'applied'})
+  }finally{
+    releaseSweep.resolve();releasePumpSnapshot.resolve()
+    try { monitor?.dispose() } catch {}
+    parentInput.close()
+    process.stdin.pause()
+  }
 })

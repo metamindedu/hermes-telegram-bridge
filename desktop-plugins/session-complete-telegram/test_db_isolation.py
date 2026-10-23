@@ -457,6 +457,45 @@ class ChildProcessFenceTests(unittest.TestCase):
         finally:
             subprocess.Popen = original_popen
 
+    def test_publication_node_operation_is_exact_and_wrong_flags_or_scope_never_launch(self):
+        import importlib
+        import subprocess
+
+        bootstrap = importlib.import_module('guarded_unittest')
+        policy_helper = self._bootstrap_helper(bootstrap)
+        _executable, _site, environment = self._owned_pm_environment()
+        package = Path(__file__).resolve().parent
+        command = ['node', '--test-isolation=none', '--test',
+                   '--test-name-pattern=approval-publication-epoch-interleaving',
+                   '--test-reporter=tap', '--test-reporter-destination=stderr',
+                   'approval_concurrency.test.mjs']
+        calls = []
+
+        class PopenRecorder:
+            def __init__(self, args, *pargs, **kwargs):
+                calls.append((args, kwargs))
+
+        original_popen = subprocess.Popen
+        try:
+            subprocess.Popen = PopenRecorder
+            bootstrap._install_child_process_fence(policy_helper)
+            subprocess.Popen(command, cwd=str(package), env=environment)
+            self.assertEqual(len(calls), 1, 'the one qualified fixture operation must reach Popen')
+            invalid = [
+                (command[:-1] + ['canonical.test.mjs'], package),
+                ([*command[:3], '--test-name-pattern=.*', *command[4:]], package),
+                (command + ['--eval', 'process.exit(0)'], package),
+                ([*command[:5], '--test-reporter-destination=stdout', command[-1]], package),
+                (command, self.work),
+            ]
+            for args, cwd in invalid:
+                with self.subTest(operation=args[1:]):
+                    with self.assertRaises(RuntimeError):
+                        subprocess.Popen(args, cwd=str(cwd), env=environment)
+                    self.assertEqual(len(calls), 1, 'an unqualified Node command reached Popen')
+        finally:
+            subprocess.Popen = original_popen
+
     def test_owned_pm_stage_and_fixed_worker_are_rewritten_without_changing_main_child_path(self):
         import importlib
         import subprocess

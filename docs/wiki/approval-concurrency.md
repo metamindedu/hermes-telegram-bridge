@@ -1,7 +1,7 @@
 ---
 title: Concurrent native approval cards
 created: 2026-10-20
-updated: 2026-10-23
+updated: 2026-10-24
 type: gotcha
 tags: [operations, testing, ownership]
 ---
@@ -25,5 +25,9 @@ A failed flush can overwrite an already-published registration result with a gen
 The inbox's last-seen timestamp is not a terminal-transition timestamp. Compare current native request/queue/epoch fingerprints read-only, but do not calculate a historical expiry interval from last-seen or claim that a later healthy snapshot proves an unrecorded timeout.
 
 When a callback was accepted but its decision was discarded, correlate the receiver's own profile logs with the card's first terminal reason/time, not its last-seen value. New bounded content-free diagnostics distinguish callback acceptance, Desktop claim and terminal phase; old rows without events remain historically unexplained. Missing/failed diagnostics do not prove no native write, and renderer-reported reasons are hints rather than authority. Preserve the existing no-replay fence and obtain source/activation evidence separately from readiness. See the operations runbook's content-free diagnostics section for retention, read-only lookup and rollback limits.
+
+An owner lease can fail while a callback is already queued even though the card's absolute lifetime remains long. Service existing owned approvals independently of ordinary recovery/reply sweeps, coalescing all callers through one in-flight pump so overlap cannot duplicate claim/application writes. Keep fresh snapshots and all existing authority/deadline/no-replay checks; a blocked approval path or suspended renderer must still fail closed. Scheduling coverage is not proof of a human roundtrip or the exact historical operation that consumed the lease. Native client-unsupported text can be a generic interrupted-request withdrawal, so correlate the actual request cancellation rather than prescribing an app update from that text alone.
+
+Pump coalescing alone does not coordinate publication: a normal second card can be published and queued after an older owner-wide observation list was captured. Fence publication/binding against the poll receipt and invalidate older local views on every publication attempt; defer the stale poll without changing the Python consumer's fail-closed rules. Treat the local token as bookkeeping, not authority. A missing registration receipt requires bounded read-only recovery, not inference that the card was never published. Include actual producer/consumer interleavings around publication and receipt delivery, not only a mocked empty poll.
 
 See [[runtime-boundaries]] and [[completion-recovery]].
