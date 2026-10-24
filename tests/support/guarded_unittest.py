@@ -1074,6 +1074,13 @@ def _install_child_process_fence(helper) -> None:
 
     def valid_node_operation(words: list[str], cwd: Path) -> bool:
         args = words[1:]
+        if args == [str(REPO_ROOT / "tests" / "support" / "verify_native_api_wire.mjs")]:
+            # Exact DB-free Node producer + pure pinned Electron routing peer.
+            # No arbitrary script, flag, cwd or changed helper is admitted.
+            peer = REPO_ROOT / "tests" / "support" / "verify_native_api_wire.mjs"
+            return (normalized(cwd) == normalized(PACKAGE_DIR.resolve(strict=True)) and
+                    peer.is_file() and hashlib_module.sha256(peer.read_bytes()).hexdigest() ==
+                    "28901afc4d4d6622034f66a3fff6bb8499554d79e09156f2d3204a0f6c536eb0")
         if args == ["--test", "--test-name-pattern", canonical_event_pattern, "canonical.test.mjs"]:
             return normalized(cwd) == normalized(PACKAGE_DIR.resolve(strict=True))
         if args == ["--test-isolation=none", "--test",

@@ -1,0 +1,9 @@
+{
+  "name": "session-complete-telegram",
+  "label": "Telegram Bridge API",
+  "description": "Native namespace transport for the existing managed Desktop plugin.",
+  "version": "1.8.1",
+  "tab": {"hidden": true},
+  "entry": "api-only.js",
+  "api": "plugin_api.py"
+}

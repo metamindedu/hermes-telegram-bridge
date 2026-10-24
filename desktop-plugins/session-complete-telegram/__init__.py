@@ -96,18 +96,41 @@ def _setup_cli(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--request", required=True, help=argparse.SUPPRESS)
 
 
-def _run_cli(args: argparse.Namespace, *, ctx=None) -> None:
+API_TRANSPORT = "desktop-telegram-api-v1"
+_api_binding = None
+
+
+def _dispatch_encoded(token: object, *, ctx=None) -> dict[str, Any]:
+    """One dispatcher for the fixed CLI and authenticated namespace transport."""
     try:
         home = resolve_package_home(__file__)
-        request = _parse_request(getattr(args, "request", None))
+        request = _parse_request(token)
         from . import notifier
-
-        result = notifier.dispatch_request(request, root=home, native=True, result_budget=MAX_RESULT_BYTES,
-                                          ctx=ctx)
+        return _safe_result(notifier.dispatch_request(
+            request, root=home, native=True, result_budget=MAX_RESULT_BYTES, ctx=ctx))
     except Exception as exc:
         # Exception text is never returned: it may include URLs or credentials.
-        result = {"ok": False, "reason": type(exc).__name__}
-    _write_frame(result)
+        return {"ok": False, "reason": type(exc).__name__}
+
+
+def _run_cli(args: argparse.Namespace, *, ctx=None) -> None:
+    _write_frame(_dispatch_encoded(getattr(args, "request", None), ctx=ctx))
+
+
+def api_context_ready() -> bool:
+    binding = _api_binding
+    return bool(binding is not None and binding[0] == PLUGIN_ID and
+                getattr(binding[1], "plugin_id", None) == PLUGIN_ID)
+
+
+def dispatch_api_request(token: object) -> dict[str, Any]:
+    """Reuse only the real context supplied by native register(); never synthesize one."""
+    binding = _api_binding
+    if binding is None:
+        return {"ok": False, "reason": "native_api_context_unavailable"}
+    if binding[0] != PLUGIN_ID or getattr(binding[1], "plugin_id", None) != PLUGIN_ID:
+        return {"ok": False, "reason": "native_plugin_owner_mismatch"}
+    return _dispatch_encoded(token, ctx=binding[1])
 
 
 def register(ctx) -> None:
@@ -137,6 +160,16 @@ def register(ctx) -> None:
     from .telegram_integration import register as register_gateway
 
     register_gateway(ctx)
+    global _api_binding
+    binding = (owner_id, ctx)
+    _api_binding = binding
+    if callable(getattr(ctx, "on_unload", None)):
+        def retire_api_binding():
+            global _api_binding
+            if _api_binding is binding:
+                _api_binding = None
+        ctx.on_unload(retire_api_binding)
+
 
 
 __all__ = ["register"]

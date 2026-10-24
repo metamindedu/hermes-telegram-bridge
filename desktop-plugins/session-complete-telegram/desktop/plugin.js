@@ -245,6 +245,114 @@ function exactKeys(value, keys) {
     Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
 }
 
+function captureDesktopApi() {
+  let desktop
+  try { desktop = globalThis.window?.hermesDesktop } catch { return {error:true} }
+  if (!desktop || !['object','function'].includes(typeof desktop)) return null
+  let api
+  try { api = desktop.api } catch { return {error:true} }
+  return typeof api === 'function' ? {desktop, api} : null
+}
+
+function sameDesktopApi(identity) {
+  try {
+    return Boolean(identity && globalThis.window?.hermesDesktop === identity.desktop &&
+      identity.desktop.api === identity.api)
+  } catch { return false }
+}
+
+function confirmedApiNotFound(error) {
+  if (error && typeof error === 'object' && error.statusCode === 404) return true
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+  const match = message.match(/^(?:(?:Error invoking remote method '[^']+': )?(?:Error: )?)404:\s*(\{[\s\S]*\})$/u)
+  if (!match) return false
+  try {
+    const body = JSON.parse(match[1])
+    return Boolean(body && typeof body === 'object' && !Array.isArray(body) &&
+      typeof body.detail === 'string' && body.detail.trim())
+  } catch { return false }
+}
+
+function desktopApiJSONValue(value, seen = new Set(), depth = 0) {
+  // Match the native common result sanitizer; transport wrappers do not
+  // consume any of this result-relative budget.
+  if (depth > 64) return false
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (!value || typeof value !== 'object' || seen.has(value)) return false
+  seen.add(value)
+  let valid = false
+  try {
+    if (Array.isArray(value)) {
+      const keys = Reflect.ownKeys(value)
+      valid = keys.length === value.length + 1 && keys.includes('length')
+      for (let index = 0; valid && index < value.length; index++) {
+        if (!Object.hasOwn(value, index)) { valid = false; break }
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+        valid = Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, 'value') &&
+          desktopApiJSONValue(descriptor.value, seen, depth + 1))
+      }
+    } else if ([Object.prototype,null].includes(Object.getPrototypeOf(value))) {
+      const keys = Reflect.ownKeys(value)
+      valid = keys.length === Object.keys(value).length && keys.every(key => typeof key === 'string')
+      for (const key of keys) {
+        if (!valid) break
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        valid = Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, 'value') &&
+          desktopApiJSONValue(descriptor.value, seen, depth + 1))
+      }
+    }
+  } catch { valid = false }
+  seen.delete(value)
+  return valid
+}
+
+function validDesktopHelperCapabilities(value) {
+  try {
+    return desktopApiJSONValue(value) && exactKeys(value, ['ok','transport','plugin','profile']) && value.ok === true &&
+      value.transport === DESKTOP_HELPER_API_TRANSPORT && value.plugin === ID && value.profile === 'default'
+  } catch { return false }
+}
+
+function desktopApiDataRecord(value, keys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      ![Object.prototype,null].includes(Object.getPrototypeOf(value))) return false
+  const own = Reflect.ownKeys(value)
+  if (own.length !== keys.length || own.some(key => typeof key !== 'string' || !keys.includes(key))) return false
+  return own.every(key => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, 'value'))
+  })
+}
+
+function decodeDesktopHelperDispatch(value) {
+  try {
+    if (!desktopApiDataRecord(value, ['transport','dispatched','result']) ||
+        value.transport !== DESKTOP_HELPER_API_TRANSPORT || typeof value.dispatched !== 'boolean') return null
+    const result = value.result
+    if (!desktopApiJSONValue(result) || !result || typeof result !== 'object' || Array.isArray(result) ||
+        ![Object.prototype,null].includes(Object.getPrototypeOf(result)) || !Object.hasOwn(result, 'ok') ||
+        typeof result.ok !== 'boolean') return null
+    const resultJSON = JSON.stringify(result)
+    const envelopeJSON = JSON.stringify(value)
+    if (typeof resultJSON !== 'string' || typeof envelopeJSON !== 'string' ||
+        new TextEncoder().encode(resultJSON).byteLength > MAX_RESULT_BYTES ||
+        new TextEncoder().encode(envelopeJSON).byteLength > MAX_RESULT_BYTES + 512 ||
+        (value.dispatched === false && result.ok !== false)) return null
+    return JSON.parse(resultJSON)
+  } catch { return null }
+}
+
+function sameHelperRoute(a, b) {
+  return Boolean(a && b && a.mode === b.mode && a.connectionId === b.connectionId &&
+    a.profile === b.profile && a.targetProfile === b.targetProfile)
+}
+
+function helperApiRouteKey(activeRoute, senderRoute) {
+  return JSON.stringify([activeRoute.mode, activeRoute.connectionId, activeRoute.profile, activeRoute.targetProfile,
+    senderRoute.mode, senderRoute.connectionId, senderRoute.profile, senderRoute.targetProfile])
+}
+
 function validReplyResult(bridge, result) {
   const questions = bridge.ask.params.questions
   if (Array.isArray(questions) && questions.length) {
@@ -291,6 +399,11 @@ const FRAGMENT_CHUNK_BYTES = 16 * 1024
 const MAX_FRAGMENT_CHUNKS = MAX_FRAGMENT_BYTES / FRAGMENT_CHUNK_BYTES
 const RESULT_FRAME_BEGIN = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_BEGIN'
 const RESULT_FRAME_END = 'HERMES_TELEGRAM_BRIDGE_RESULT_V1_END'
+const DESKTOP_HELPER_API_BASE = '/api/plugins/session-complete-telegram/bridge/v1'
+const DESKTOP_HELPER_API_TRANSPORT = 'desktop-telegram-api-v1'
+const DESKTOP_HELPER_API_CAPABILITY_TTL_MS = 30_000
+const DESKTOP_HELPER_API_CAPABILITY_TIMEOUT_MS = 8_000
+const DESKTOP_HELPER_API_ROUTE = Object.freeze({connectionId:'local', profile:'default', passive:true})
 const HELPER_WRITE_ACTIONS = new Set([
   'send', 'attention', 'completion_recovery_record', 'completion_recovery_cancel',
   'completion_recovery_touch', 'completion_recovery_read_blocked',
@@ -587,6 +700,7 @@ export class CompletionMonitor {
     this.approvalPumping = null
     this.approvalPublicationEpoch = {}
     this.approvalLedgerTail = Promise.resolve()
+    this.helperApiCapabilityCache = new WeakMap()
   }
 
   async refreshRoutes(force = false) {
@@ -649,6 +763,93 @@ export class CompletionMonitor {
     return timeout === undefined ? gateway.request(method, params) : gateway.request(method, params, timeout)
   }
 
+  async helperApiRouteCurrent(identity, activeRoute, senderRoute, gateway) {
+    const bridgeCurrent = () => !this.stopped && sameDesktopApi(identity) &&
+      this.api.getGateway?.() === gateway && this.currentLiveRoute(activeRoute)
+    try {
+      if (!bridgeCurrent()) return false
+      const routes = await this.refreshRoutes(true)
+      if (!bridgeCurrent()) return false
+      const senders = routes.filter(route => route.mode === 'local' && route.profile === 'default' &&
+        route.targetProfile === 'default')
+      const currentActive = this.activeLocalRoute(routes)
+      return senders.length === 1 && senders[0].connectionId === 'local' &&
+        sameHelperRoute(senders[0], senderRoute) && sameHelperRoute(currentActive, activeRoute) &&
+        bridgeCurrent()
+    } catch {
+      return false
+    }
+  }
+
+  async helperApiCapabilities(identity, routeKey, isCurrent) {
+    let routes = this.helperApiCapabilityCache.get(identity.desktop)
+    if (!routes) {
+      routes = new Map()
+      this.helperApiCapabilityCache.set(identity.desktop, routes)
+    }
+    const cached = routes.get(routeKey)
+    for (const [key, entry] of routes) {
+      if (!entry.promise && (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= this.now())) routes.delete(key)
+    }
+    if (!routes.has(routeKey) && routes.size >= 32) {
+      const evictable = [...routes].find(([, entry]) => !entry.promise)
+      if (!evictable) throw new NativeHelperError('Desktop helper capability checks are busy')
+      routes.delete(evictable[0])
+    }
+    if (cached?.api === identity.api) {
+      if (cached.promise) return cached.promise
+      if (Number.isFinite(cached.expiresAt) && cached.expiresAt > this.now()) return true
+    }
+
+    const check = (async () => {
+      if (!await isCurrent()) throw new NativeHelperError('Desktop helper route changed before capability check')
+      let value
+      try {
+        value = await identity.api.call(identity.desktop, {
+          path:`${DESKTOP_HELPER_API_BASE}/capabilities`, method:'GET', timeoutMs:DESKTOP_HELPER_API_CAPABILITY_TIMEOUT_MS,
+          ...DESKTOP_HELPER_API_ROUTE
+        })
+      } catch (error) {
+        if (confirmedApiNotFound(error)) {
+          if (!await isCurrent()) throw new NativeHelperError('Desktop helper route changed during capability check')
+          return false
+        }
+        throw new NativeHelperError('Desktop helper capability could not be verified')
+      }
+      if (!await isCurrent()) throw new NativeHelperError('Desktop helper route changed during capability check')
+      if (!validDesktopHelperCapabilities(value)) throw new NativeHelperError('Desktop helper capability response is invalid')
+      return true
+    })()
+    const entry = {api:identity.api, promise:check}
+    routes.set(routeKey, entry)
+    try {
+      const supported = await check
+      if (routes.get(routeKey) === entry) {
+        if (supported) routes.set(routeKey, {api:identity.api, expiresAt:this.now()+DESKTOP_HELPER_API_CAPABILITY_TTL_MS})
+        else routes.delete(routeKey)
+      }
+      return supported
+    } catch (error) {
+      if (routes.get(routeKey) === entry) routes.delete(routeKey)
+      throw error
+    }
+  }
+
+  async dispatchHelperApi(identity, request, isCurrent, ambiguousWrite) {
+    if (!await isCurrent()) throw new NativeHelperError('Desktop helper route changed before dispatch')
+    let value
+    try {
+      value = await identity.api.call(identity.desktop, request)
+    } catch {
+      throw new NativeHelperError('Desktop helper dispatch result is unavailable', ambiguousWrite)
+    }
+    const result = decodeDesktopHelperDispatch(value)
+    if (result === null) throw new NativeHelperError('Desktop helper dispatch response is invalid', ambiguousWrite)
+    if (!await isCurrent()) throw new NativeHelperError('Desktop helper dispatch result could not be verified',
+      value.dispatched === true && ambiguousWrite)
+    return result
+  }
+
   async helper(payload, expectedRecoveryRoute = null) {
     const routes = await this.refreshRoutes()
     const sender = routes.filter(r => r.mode === 'local' && r.targetProfile === 'default' && r.profile === 'default')
@@ -656,13 +857,13 @@ export class CompletionMonitor {
     const action = payload && typeof payload.action === 'string' ? payload.action : ''
     const recoveryAction = action.startsWith('completion_recovery_')
     const activeRoute = this.activeLocalRoute(routes)
-    // The credential owner stays the explicit --profile default CLI below.
-    // Reuse its already-open same-local-source conduit for ordinary helpers as
-    // well as loaded/recovery; inventory alone does not prove a pooled default
-    // backend is connected. Recovery keeps its stricter target binding below.
+    // The explicit default profile remains the credential owner. An ordinary
+    // helper may use the namespaced Desktop API only on the same already-live
+    // local source; completion recovery retains its stricter captured-target CLI.
     const useActiveSocket = recoveryAction || (activeRoute !== null &&
       (action === 'loaded' || typeof this.api.getGateway === 'function'))
     let requestCLI
+    let capturedGateway = null
     if (useActiveSocket) {
       if (!activeRoute || activeRoute.connectionId !== sender[0].connectionId) {
         throw new NativeHelperError('Recovery requires the already-open local sender connection')
@@ -679,13 +880,34 @@ export class CompletionMonitor {
           this.api.getGateway?.() !== gateway) {
         throw new NativeHelperError('Recovery requires the already-open local gateway')
       }
+      capturedGateway = gateway
       requestCLI = (method, params, timeout) => timeout === undefined
         ? gateway.request(method, params) : gateway.request(method, params, timeout)
     } else {
       requestCLI = (method, params, timeout) => this.api.requestProfile(sender[0], method, params, timeout)
     }
     const ambiguousWrite = HELPER_WRITE_ACTIONS.has(action) && !RECOVERY_PRE_DISPATCH_ACTIONS.has(action)
-    const argv = ['--profile', 'default', 'desktop-telegram-bridge', '--request', encodeRequest(payload)]
+    const encodedRequest = encodeRequest(payload)
+    const argv = ['--profile', 'default', 'desktop-telegram-bridge', '--request', encodedRequest]
+    const startupBudget = recoveryAction || action === 'loaded' || action === 'reply_register'
+
+    if (!recoveryAction && useActiveSocket && activeRoute && sender[0].connectionId === 'local') {
+      const identity = captureDesktopApi()
+      if (identity?.error) throw new NativeHelperError('Desktop helper bridge identity is unavailable')
+      if (identity) {
+        const isCurrent = () => this.helperApiRouteCurrent(identity, activeRoute, sender[0], capturedGateway)
+        if (!await isCurrent()) throw new NativeHelperError('Desktop helper route is not the captured local default scope')
+        const supported = await this.helperApiCapabilities(identity, helperApiRouteKey(activeRoute, sender[0]), isCurrent)
+        if (supported) {
+          return this.dispatchHelperApi(identity, {
+            path:`${DESKTOP_HELPER_API_BASE}/dispatch`, method:'POST', body:{request:encodedRequest},
+            timeoutMs:startupBudget ? 75_000 : 35_000, ...DESKTOP_HELPER_API_ROUTE
+          }, isCurrent, ambiguousWrite)
+        }
+        if (!await isCurrent()) throw new NativeHelperError('Desktop helper route changed before CLI fallback')
+      }
+    }
+
     let result
     try {
       // cli.exec's child budget is seconds; SDK's outer deadline is milliseconds.
@@ -693,7 +915,6 @@ export class CompletionMonitor {
       // send/readback. A 25s cutoff can orphan a sent card before r.reply binds;
       // the next owner poll then retires it as absent. Use the existing bounded
       // startup budget, without retrying any ambiguous write or changing TTL.
-      const startupBudget = recoveryAction || action === 'loaded' || action === 'reply_register'
       result = await requestCLI('cli.exec', {argv, timeout: startupBudget ? 60 : 25},
         startupBudget ? 75_000 : 35_000)
     } catch {

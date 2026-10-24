@@ -1,5 +1,10 @@
 # Wiki Log
 
+## [2026-10-24] update | Native helper startup and namespace ownership
+- Clarified that a live socket does not remove CLI package-manager bootstrap latency; observed stack locations do not establish complete historical causality.
+- Recorded the native namespace alternative's actual registration-context/default-owner requirement and joined producer/routing/consumer qualification boundary, separate from activation and human interaction.
+- Updated `completion-recovery.md`, `index.md`, and the operations transport/verification procedure. No operating configuration, credentials, lease or database change follows from these notes.
+
 ## 2026-10-24 local candidate | Fixed helper conduit
 
 - Distinguished route inventory, pooled-profile readiness and the captured already-open local socket. The existing explicit-default native CLI remains the credential owner; local transport reuse does not authorize a different home, source or response replay.
