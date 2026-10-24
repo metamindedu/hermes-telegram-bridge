@@ -955,6 +955,7 @@ export class CompletionMonitor {
     const task = (async () => {
       try {
         const reply = await this.helper({action:'completion_recovery_policy'})
+        if (this.stopped) return null
         return await this.acceptRecoveryPolicy(reply)
       } catch {
         this.recoveryPolicyAvailable = false
@@ -2174,7 +2175,11 @@ export class CompletionMonitor {
     this.approvalSweepAbsent = new Set()
     for (const record of this.records.values()) record.sweepAbsent = false
     try {
-      if (this.recoveryCapable) await this.refreshRecoveryPolicy()
+      // Optional completion recovery has its own coalesced, fail-closed read.
+      // Its CLI startup must not block discovery of a NEW native input request.
+      // Native active-list, request/queue and publication checks below remain
+      // mandatory; existing-owned approval pumping alone cannot discover it.
+      if (this.recoveryCapable) void this.refreshRecoveryPolicy()
       const byRoute = new Map()
       const recoveryOwned = r => Boolean(r.candidate &&
         (r.candidate.recoveryId || r.candidate.recoveryGeneration || r.candidate.recoveryRetired))

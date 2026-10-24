@@ -1,5 +1,10 @@
 # Wiki Log
 
+## [2026-10-24] update | First-time approval discovery versus optional recovery I/O
+- Distinguished existing-card pumping from admission of a new native approval and documented the policy-read prerequisite trap and its bounded source correction.
+- Preserved native observation/queue/identity gates, Desktop-display versus generic withdrawal evidence, and source/synthetic/activation/human acceptance distinctions.
+- Updated `approval-concurrency.md`, `index.md`, and this log; no runtime activation or withdrawn-request retry follows from these notes.
+
 ## [2026-10-24] update | Native helper startup and namespace ownership
 - Clarified that a live socket does not remove CLI package-manager bootstrap latency; observed stack locations do not establish complete historical causality.
 - Recorded the native namespace alternative's actual registration-context/default-owner requirement and joined producer/routing/consumer qualification boundary, separate from activation and human interaction.
